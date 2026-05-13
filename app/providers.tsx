@@ -29,6 +29,7 @@ export function Providers({ children }: { children: ReactNode }) {
   const pathname = usePathname();
 
   useEffect(() => {
+    // ---- Theme: read stored preference or system ----
     const stored = localStorage.getItem("theme");
     const prefersDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
     if (stored === "light" || (!stored && !prefersDark)) {
@@ -40,6 +41,7 @@ export function Providers({ children }: { children: ReactNode }) {
     let cancelled = false;
     const c = sb();
 
+    // ---- Safety net: never let the spinner show longer than 4s ----
     const failsafe = setTimeout(() => {
       if (!cancelled) {
         console.warn("[Providers] auth bootstrap timed out; falling back");
@@ -47,24 +49,45 @@ export function Providers({ children }: { children: ReactNode }) {
       }
     }, 4000);
 
+    // ---- Primary: rely on the auth listener (fires INITIAL_SESSION on mount) ----
     const { data: sub } = c.auth.onAuthStateChange(async (_event, session) => {
       if (cancelled) return;
-      if (!session) { setProfile(null); setLoading(false); clearTimeout(failsafe); return; }
+      if (!session) {
+        setProfile(null);
+        setLoading(false);
+        clearTimeout(failsafe);
+        return;
+      }
       const prof = await fetchProfile(session.user.id);
       if (cancelled) return;
-      setProfile(prof); setLoading(false); clearTimeout(failsafe);
+      setProfile(prof);
+      setLoading(false);
+      clearTimeout(failsafe);
     });
 
-    c.auth.getSession().then(async ({ data: { session } }) => {
-      if (cancelled) return;
-      if (!session) { setLoading(false); clearTimeout(failsafe); return; }
-      const prof = await fetchProfile(session.user.id);
-      if (cancelled) return;
-      setProfile(prof); setLoading(false); clearTimeout(failsafe);
-    }).catch((e) => {
-      console.warn("[Providers] getSession failed", e);
-      if (!cancelled) { setLoading(false); clearTimeout(failsafe); }
-    });
+    // ---- Belt + braces: explicit getSession in case the listener is slow ----
+    c.auth
+      .getSession()
+      .then(async ({ data: { session } }) => {
+        if (cancelled) return;
+        if (!session) {
+          setLoading(false);
+          clearTimeout(failsafe);
+          return;
+        }
+        const prof = await fetchProfile(session.user.id);
+        if (cancelled) return;
+        setProfile(prof);
+        setLoading(false);
+        clearTimeout(failsafe);
+      })
+      .catch((e) => {
+        console.warn("[Providers] getSession failed", e);
+        if (!cancelled) {
+          setLoading(false);
+          clearTimeout(failsafe);
+        }
+      });
 
     return () => {
       cancelled = true;
@@ -73,6 +96,7 @@ export function Providers({ children }: { children: ReactNode }) {
     };
   }, []);
 
+  // Redirect logic: must be logged in to see anything except /login
   useEffect(() => {
     if (loading) return;
     const onLogin = pathname?.endsWith("/login") || pathname?.endsWith("/login/");
