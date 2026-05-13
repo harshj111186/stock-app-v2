@@ -7,6 +7,21 @@ type AuthState = { loading: boolean; profile: Profile | null; signOut: () => Pro
 const AuthContext = createContext<AuthState>({ loading: true, profile: null, signOut: async () => {} });
 export const useAuth = () => useContext(AuthContext);
 
+async function fetchProfile(userId: string): Promise<Profile | null> {
+  try {
+    const { data, error } = await sb()
+      .from("user_profiles")
+      .select("*")
+      .eq("id", userId)
+      .single();
+    if (error) console.warn("[fetchProfile] error", error);
+    return (data as Profile) ?? null;
+  } catch (e) {
+    console.warn("[fetchProfile] exception", e);
+    return null;
+  }
+}
+
 export function Providers({ children }: { children: ReactNode }) {
   const [loading, setLoading] = useState(true);
   const [profile, setProfile] = useState<Profile | null>(null);
@@ -14,7 +29,6 @@ export function Providers({ children }: { children: ReactNode }) {
   const pathname = usePathname();
 
   useEffect(() => {
-    // Theme: read stored preference or system
     const stored = localStorage.getItem("theme");
     const prefersDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
     if (stored === "light" || (!stored && !prefersDark)) {
@@ -23,25 +37,42 @@ export function Providers({ children }: { children: ReactNode }) {
       document.documentElement.classList.add("dark");
     }
 
-    // Auth: load session + listen for changes
+    let cancelled = false;
     const c = sb();
-    (async () => {
-      const { data: { session } } = await c.auth.getSession();
-      if (!session) { setLoading(false); return; }
-      const { data: prof } = await c.from("user_profiles").select("*").eq("id", session.user.id).single();
-      setProfile(prof as Profile | null);
-      setLoading(false);
-    })();
+
+    const failsafe = setTimeout(() => {
+      if (!cancelled) {
+        console.warn("[Providers] auth bootstrap timed out; falling back");
+        setLoading(false);
+      }
+    }, 4000);
 
     const { data: sub } = c.auth.onAuthStateChange(async (_event, session) => {
-      if (!session) { setProfile(null); return; }
-      const { data: prof } = await c.from("user_profiles").select("*").eq("id", session.user.id).single();
-      setProfile(prof as Profile | null);
+      if (cancelled) return;
+      if (!session) { setProfile(null); setLoading(false); clearTimeout(failsafe); return; }
+      const prof = await fetchProfile(session.user.id);
+      if (cancelled) return;
+      setProfile(prof); setLoading(false); clearTimeout(failsafe);
     });
-    return () => sub.subscription.unsubscribe();
+
+    c.auth.getSession().then(async ({ data: { session } }) => {
+      if (cancelled) return;
+      if (!session) { setLoading(false); clearTimeout(failsafe); return; }
+      const prof = await fetchProfile(session.user.id);
+      if (cancelled) return;
+      setProfile(prof); setLoading(false); clearTimeout(failsafe);
+    }).catch((e) => {
+      console.warn("[Providers] getSession failed", e);
+      if (!cancelled) { setLoading(false); clearTimeout(failsafe); }
+    });
+
+    return () => {
+      cancelled = true;
+      clearTimeout(failsafe);
+      sub.subscription.unsubscribe();
+    };
   }, []);
 
-  // Redirect logic: must be logged in to see anything except /login
   useEffect(() => {
     if (loading) return;
     const onLogin = pathname?.endsWith("/login") || pathname?.endsWith("/login/");
