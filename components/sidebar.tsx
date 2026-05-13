@@ -1,0 +1,91 @@
+"use client";
+import Link from "next/link";
+import { usePathname } from "next/navigation";
+import {
+  LayoutDashboard, Boxes, Warehouse, ArrowLeftRight, Receipt,
+  BarChart3, TrendingUp, AlertOctagon, ShieldCheck, Users, Settings, LogOut,
+  Package,
+} from "lucide-react";
+import { useAuth } from "@/app/providers";
+import { cn } from "@/lib/utils";
+
+const NAV = [
+  { group: "Daily", items: [
+    { href: "/", label: "Dashboard", icon: LayoutDashboard },
+    { href: "/items", label: "Items", icon: Boxes },
+    { href: "/godown-a", label: "Godown A", icon: Warehouse },
+    { href: "/godown-b", label: "Godown B", icon: Warehouse },
+    { href: "/transactions", label: "Transactions", icon: ArrowLeftRight },
+    { href: "/pricing", label: "Pricing", icon: Receipt },
+  ]},
+  { group: "Reports", items: [
+    { href: "/reports/sales", label: "Sales register", icon: BarChart3 },
+    { href: "/reports/abc", label: "ABC analysis", icon: TrendingUp },
+    { href: "/reports/dead-stock", label: "Dead stock", icon: AlertOctagon },
+  ]},
+  { group: "System", items: [
+    { href: "/audit", label: "Audit log", icon: ShieldCheck },
+    { href: "/users", label: "Users", icon: Users },
+    { href: "/settings", label: "Settings", icon: Settings },
+  ]},
+];
+
+export function Sidebar() {
+  const pathname = usePathname();
+  const { profile, signOut } = useAuth();
+  const isActive = (href: string) =>
+    href === "/" ? pathname === "/" || pathname === "" : pathname?.startsWith(href);
+
+  return (
+    <aside className="w-60 flex-shrink-0 bg-zinc-50 dark:bg-zinc-900 border-r border-zinc-200 dark:border-zinc-800 flex flex-col">
+      {/* Brand */}
+      <div className="px-5 py-4 border-b border-zinc-200 dark:border-zinc-800 flex items-center gap-2.5">
+        <div className="w-7 h-7 bg-cyan-500 rounded-md flex items-center justify-center">
+          <Package className="w-4 h-4 text-zinc-900" strokeWidth={2.5} />
+        </div>
+        <div>
+          <div className="font-semibold text-sm">Stock Manager</div>
+          <div className="text-[10px] text-zinc-500">Rye Electricals</div>
+        </div>
+      </div>
+
+      {/* Nav */}
+      <nav className="flex-1 px-2 py-3 space-y-0.5 overflow-y-auto">
+        {NAV.map((sec) => (
+          <div key={sec.group}>
+            <div className="pt-3 pb-1 px-3 text-[10px] uppercase tracking-wider text-zinc-500 font-semibold">{sec.group}</div>
+            {sec.items.map((item) => {
+              const Icon = item.icon;
+              return (
+                <Link key={item.href} href={item.href}
+                  className={cn(
+                    "flex items-center gap-2.5 px-3 py-2 rounded-md text-sm transition-colors",
+                    isActive(item.href)
+                      ? "bg-cyan-500/10 text-cyan-600 dark:text-cyan-400 border-l-2 border-cyan-500 -ml-[2px]"
+                      : "text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800 hover:text-zinc-900 dark:hover:text-zinc-100"
+                  )}>
+                  <Icon className="w-4 h-4" />
+                  {item.label}
+                </Link>
+              );
+            })}
+          </div>
+        ))}
+      </nav>
+
+      {/* User */}
+      <div className="border-t border-zinc-200 dark:border-zinc-800 p-3 flex items-center gap-3">
+        <div className="w-8 h-8 bg-cyan-600 rounded-full flex items-center justify-center text-xs font-semibold text-white">
+          {profile?.email?.[0]?.toUpperCase() ?? "?"}
+        </div>
+        <div className="flex-1 min-w-0">
+          <div className="text-xs font-medium truncate">{profile?.name || profile?.email}</div>
+          <div className="text-[10px] text-zinc-500">{profile?.role}</div>
+        </div>
+        <button onClick={signOut} className="text-zinc-500 hover:text-zinc-300" aria-label="Sign out">
+          <LogOut className="w-4 h-4" />
+        </button>
+      </div>
+    </aside>
+  );
+}
