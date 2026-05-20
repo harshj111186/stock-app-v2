@@ -230,6 +230,48 @@ If you must touch one of these files: **read first, edit surgically, never repla
 
 ## 11. Changelog (latest first — add new entries at the top)
 
+### 2026-05-20 — Godown A + Godown B pages wired up
+**User ask:** "items is all good, we need to build next godown a, and godown B"
+
+**What was already there (and what was wrong)**
+
+A previous session had written a real `GodownView` component (589 lines) but the GitHub-web-UI upload landed it at the **repo root** (`godown-view.tsx`) instead of in `components/`. Meanwhile the two route stubs at `app/godown-a/page.tsx` and `app/godown-b/page.tsx` had been reverted to "Coming next session" Construction placeholders. So the work existed but was completely disconnected — the placeholder pages didn't import the component, and the component was never loaded by anything.
+
+**What this session did**
+
+1. **Moved** `godown-view.tsx` → `components/godown-view.tsx` via `git mv` so history is preserved. The component itself was good — no changes needed.
+2. **Replaced both placeholder pages** with the proper 5-line imports:
+   ```tsx
+   import { GodownView } from "@/components/godown-view";
+   export default function Page() { return <GodownView godown="A" />; }
+   ```
+3. No other files touched.
+
+**What the Godown pages now do**
+
+- Per-warehouse stock view — `godown_stock` is filtered server-side with `.eq("godown", X)`.
+- Header stats: in-stock item count, total cases, total loose, total units, formatted en-IN.
+- Toolbar: search, brand filter, category filter, status filter (in-stock / low / out / never-stocked-here), depth selector (No grouping / Brand / Brand·Cat / Brand·Cat·Subcat), grid/table view toggle, expand-all / collapse-all.
+- Per-godown localStorage keys (`godown-a.view`, `godown-b.view`, etc.) so A and B keep independent UI state.
+- Status tiers: **Healthy**, **Low** (`≤ reorder_point_{a|b}`, floor 2), **Out** (row exists with 0 units), **Never stocked here** (no `godown_stock` row at all — distinct from "ran out").
+- Cards show cases + loose split visibly (e.g. `3c 4L = 34`) per the no-collapse rule (project workflow rule #8).
+- Joins category name via `category_id` FK with fallback to the legacy text column.
+
+**Files patched**
+
+- `godown-view.tsx` → `components/godown-view.tsx` *(moved)*
+- `app/godown-a/page.tsx` *(was 19-line Construction placeholder, now 5-line GodownView wrapper)*
+- `app/godown-b/page.tsx` *(same)*
+
+**No DB changes.** Reads `items`, `godown_stock`, `categories` only — all selects via existing RLS.
+
+**Follow-up ideas (not done in this turn, none blocking)**
+- Add the Items-page pencil-override modal to the GodownCard too — would let users fix a discrepancy in-place while looking at one godown. Currently they have to go back to Items to override.
+- Header "Stock value at this godown" KPI using `pricing` join.
+- Click a card → slide-out side panel with item details + recent transactions for this godown (PROGRESS.md section 6 has this as a deferred "side panel item detail" item).
+
+---
+
 ### 2026-05-20 — Manual stock override on Items page + Adjustment unlocked at DB
 **User ask:** "I want to add an option where I can manually change values of CS size, loose and cases for both Stock A and Stock B. So that it can act as manual override if any discrepancy found in actual stock."
 
