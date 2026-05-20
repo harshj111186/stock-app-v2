@@ -230,6 +230,96 @@ If you must touch one of these files: **read first, edit surgically, never repla
 
 ## 11. Changelog (latest first — add new entries at the top)
 
+### 2026-05-20 — Login deadlock cracked: defer profile fetch out of SDK notify loop (PR #5 / 119f0db)
+
+**User-facing symptom:** sign in succeeds, dashboard flickers, then loading spinner sits for 10s and bounces back to `/login`.
+
+**Why the previous three login fixes weren't enough.** PRs #2–#4 closed real bugs (redirect race, dual-bootstrap race, wedged `navigator.locks`) but the underlying deadlock was lower-level: between the `onAuthStateChange` callback and supabase-js' init sequence itself.
+
+**The actual mechanism (diagnosed live via Chrome MCP).** When `sb()` first runs, the supabase-js constructor immediately kicks off `_initialize()` under an internal auth lock. Inside `_initialize`, `_recoverAndRefresh` reads the valid stored session from localStorage and calls `_notifyAllSubscribers('SIGNED_IN', session)` — which **awaits each subscriber's callback in turn, while still holding the init lock**.
+
+Our `onAuthStateChange` callback in `app/providers.tsx` was `async` and did `await fetchProfile(...)`. `fetchProfile` calls `sb().from('user_profiles')`, which queues that REST request behind the still-running init lock. Init awaits the listener; the listener awaits a call queued behind init → **classic self-deadlock.** The 10s failsafe fires, `profile` stays null, redirect bounces to `/login`.
+
+Console evidence on the deployed app, BEFORE this fix:
+- `auth.lockAcquired = true`
+- `auth.pendingInLock` = array length 1
+- `auth.initialize()` never resolves (5s race, 100% timeout)
+- `auth.lock` was already our PR-#4 no-op (confirmed `async (e,t,n)=>n()`) — so this is NOT a `navigator.locks` problem; it's the SDK's INTERNAL lock.
+
+**The fix.** Make the `onAuthStateChange` callback **strictly synchronous**. Capture the session, then defer profile resolution into a separate task via `setTimeout(async () => { ... }, 0)`. The listener returns `undefined` immediately so the SDK's notify loop can complete, init resolves, the lock releases, and only THEN does the deferred task run `fetchProfile` against an unblocked client.
+
+After fix, verified live in console: `getSession()` returns in 0ms, `fetchProfile` in ~215ms. No more 10s timeouts.
+
+**Why this won't regress easily.** The big inline comment in `app/providers.tsx` lines 53–63 spells out the deadlock mechanism with a "DO NOT make this async" warning. A linter or AI session that reintroduces `async (event, session) =>` will reintroduce the deadlock. Resist the temptation to "simplify" by removing the `setTimeout(0)` — it is load-bearing.
+
+**Files patched**
+- `app/providers.tsx` — listener callback rewritten as synchronous. Profile resolution moved into a `setTimeout(0)` block. Post-bootstrap event branch preserved inside the deferred task so TOKEN_REFRESHED / USER_UPDATED still refresh silently.
+
+**Not touched**
+- `lib/supabase.ts` — `lock: lockNoop` from PR #4 stays. The two fixes are orthogonal: lockNoop bypasses cross-tab serialisation, the `setTimeout(0)` bypasses the SDK's internal init lock. **Need both.**
+- `app/login/page.tsx` — already correct as of PR #2.
+
+---
+
+### 2026-05-20 — Bypass supabase-js navigator.locks (PR #4 / 26d103e)
+
+**User-facing symptom:** "loading spinner hangs for 10s on dashboard, then back to /login" — happening even after the PR #2 / #3 fixes.
+
+**Diagnosed live via Chrome MCP** on the deployed app.
+
+`navigator.locks.query()` returned `lock:sb-zvycuhldwfxpipcaeotc-auth-token` was held with **no pending requesters**. A `navigator.locks.request(...{ ifAvailable: true })` returned `null` — i.e., the lock was wedged; can't acquire it even non-blocking.
+
+supabase-js wraps auth/token operations in the `navigator.locks` Web API by default to serialise them across browser tabs. With the lock stuck, every `onAuthStateChange` / `getSession` / `fetchProfile` call hangs forever → 10s failsafe → profile=null → redirect to `/login`.
+
+**How the lock got stuck.** v1 (`/stock-app/`) and v2 (`/stock-app-v2/`) share the `harshj111186.github.io` origin AND the default storageKey, so they contend on the same lock. If either tab dies mid-operation while holding the lock, the lock stays held forever for the other tab.
+
+**Proof it wasn't RLS or schema.** A direct REST call to `/rest/v1/user_profiles` with the same anon key returned 200 in 60ms. The RLS policy and table schema are fine — the bug is purely in the SDK's lock handling.
+
+**The fix.** Pass a no-op `lock` function to `createClient` via the `auth.lock` option:
+
+```ts
+type LockFn = <R>(name: string, acquireTimeout: number, fn: () => Promise<R>) => Promise<R>;
+const lockNoop: LockFn = async (_name, _acquireTimeout, fn) => fn();
+createClient(url, key, { auth: { ..., lock: lockNoop } });
+```
+
+The cross-tab serialisation is no longer used. Trade-off: two open tabs may both refresh the auth token at the same time, which Supabase handles fine — duplicate refreshes resolve to the same token.
+
+**Files patched**
+- `lib/supabase.ts` — +21 lines. `LockFn` type + `lockNoop` const + `auth.lock: lockNoop` in `createClient` opts. Inline comment explains why this is here so a future linter or AI session doesn't strip it.
+
+**Verified after deploy:**
+- Fresh incognito → /login → sign in → dashboard loads and stays put.
+- DevTools console: no `[Providers] auth bootstrap timed out` warning.
+- `navigator.locks.query()` shows no held auth-token lock.
+
+**Important follow-up.** This fix was necessary but **not sufficient** — the SDK still had an INTERNAL lock that wedged differently. PR #5 cracked that one. Keep both fixes.
+
+---
+
+### 2026-05-20 — Collapse dual auth path into single listener (PR #3 / aaacd7d)
+
+**User-facing symptom:** sign in succeeds, dashboard renders briefly, then loading spinner reappears and bounces back to `/login`.
+
+**Why this was a new bug after PR #2 shipped.** PR #2 closed the redirect race during initial sign-in but exposed a different race in the auth bootstrap path itself.
+
+**Root cause.** `app/providers.tsx` ran two parallel auth-bootstrap paths:
+1. `onAuthStateChange` (which fires `INITIAL_SESSION` on subscribe), AND
+2. an explicit `getSession()` fallback as a belt-and-braces.
+
+Both did `setLoading(true)` → `fetchProfile` → `setProfile`. The second path would re-flash the spinner mid-session, and if its `fetchProfile` transiently failed (RLS hiccup, network blip), it overwrote the valid profile with `null` — triggering the redirect to `/login` mid-session.
+
+**The fix.** Keep only the listener. `onAuthStateChange` fires `INITIAL_SESSION` on subscribe AND every subsequent `SIGNED_IN` / `SIGNED_OUT` / `TOKEN_REFRESHED` / `USER_UPDATED`, so the explicit `getSession()` was redundant. Added a `bootstrapped` flag so post-bootstrap events (TOKEN_REFRESHED, USER_UPDATED) refresh the profile silently in the background without re-showing the spinner, and never overwrite a known-good profile with `null` on a transient refresh failure.
+
+Also extended the failsafe from 4s to 10s. Real-device networks can legitimately take >4s; the failsafe firing prematurely was itself causing some of the bounces.
+
+**Files patched**
+- `app/providers.tsx` — removed the `getSession()` block entirely. Added `bootstrapped` flag with explicit bootstrap-vs-refresh branching inside the listener. Failsafe `4000` → `10000`.
+
+**Note for future sessions.** This fix made the code cleaner but didn't fully solve the login problem — the underlying SDK deadlock (PR #5) was still present. Symptoms shifted but didn't clear. The lock bypass (PR #4) and the synchronous-listener fix (PR #5) followed.
+
+---
+
 ### 2026-05-20 — Transactions page real + Adjustment & Return tabs unlocked
 **Cowork split: this session worked on Transactions while a parallel session worked on Items + Godown A/B + the login-hang re-fix.**
 
@@ -294,7 +384,7 @@ The phase-2 SQL (`Stock Accounting\phase2-adjustment-return.sql`, applied during
 
 ---
 
-### 2026-05-20 — Login hang fix RE-APPLIED (regression from May 14)
+### 2026-05-20 — Login hang fix RE-APPLIED (regression from May 14) (PR #2 / ec5ed99)
 **User ask:** "fix that login issue where even after entering the email and password its not at all working, the login button shows load animation but nothing loads, sometime it works in incognito but sometimes it fails there too."
 
 **What happened.** The May 14 login-hang fix was no longer in either file when this session opened them — both `app/login/page.tsx` and `app/providers.tsx` had reverted to the pre-fix versions. Best guess on how: the May 14 fix was uploaded to GitHub but never landed in the local OneDrive copy, so subsequent uploads from this folder overwrote the deployed fix on commit. The "sometimes works in incognito" intermittency the user described is the giveaway signature of the redirect race — non-deterministic by definition.
@@ -321,6 +411,13 @@ The phase-2 SQL (`Stock Accounting\phase2-adjustment-return.sql`, applied during
 2. Try again with intentionally wrong password → red error box appears, button releases. (Catch block working.)
 3. Turn off wifi → click Sign in → after 12s, "Sign in took too long…" appears, button releases. (Timeout working.)
 4. Open DevTools → Console while signing in → should see no `[fetchProfile] error` lines. If you do, RLS on `user_profiles` is the next thing to check.
+
+**Follow-up status (added retrospectively).** This was the FIRST of four PRs that landed today against the broader login problem. The "Why this likely won't regress" claim above was overoptimistic — the redirect-race fix was real but a deeper auth-bootstrap race remained. Subsequent fixes (documented in the three entries ABOVE this one):
+- **PR #3** (collapse dual auth path) — removed the dual `getSession()`/`onAuthStateChange` race this fix didn't address.
+- **PR #4** (bypass `navigator.locks`) — broke the cross-tab lock contention between v1 and v2.
+- **PR #5** (defer profile fetch out of SDK notify loop) — fixed the actual SDK-init deadlock that was the real root cause.
+
+The full diagnosis chain (PRs #2 → #5) is the canonical reference now. Don't read this PR #2 entry in isolation.
 
 ---
 
