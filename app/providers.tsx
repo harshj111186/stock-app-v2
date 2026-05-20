@@ -29,7 +29,7 @@ export function Providers({ children }: { children: ReactNode }) {
   const pathname = usePathname();
 
   useEffect(() => {
-    // ---- Theme: read stored preference or system ----
+    // ---- Theme ----
     const stored = localStorage.getItem("theme");
     const prefersDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
     if (stored === "light" || (!stored && !prefersDark)) {
@@ -42,9 +42,6 @@ export function Providers({ children }: { children: ReactNode }) {
     let bootstrapped = false;
     const c = sb();
 
-    // 10s failsafe: only fires if the listener never resolves at all (Supabase outage).
-    // Generous because slow networks on real devices can take >4s. If it fires, we
-    // give up and fall through to /login.
     const failsafe = setTimeout(() => {
       if (!cancelled && !bootstrapped) {
         console.warn("[Providers] auth bootstrap timed out; falling back to logged-out");
@@ -53,13 +50,18 @@ export function Providers({ children }: { children: ReactNode }) {
       }
     }, 10000);
 
-    // onAuthStateChange fires INITIAL_SESSION on subscribe AND every subsequent
-    // SIGNED_IN / SIGNED_OUT / TOKEN_REFRESHED / USER_UPDATED. INITIAL_SESSION
-    // makes a separate getSession() redundant — and having both running caused a
-    // race where the second path would re-flash loading=true and, on a failed
-    // refetch, clobber the valid profile with null → bouncing the user to /login
-    // mid-session. So: one path, with explicit bootstrap-vs-refresh handling.
-    const { data: sub } = c.auth.onAuthStateChange(async (_event, session) => {
+    // CRITICAL: this listener must be synchronous (returns undefined immediately).
+    // supabase-js' _notifyAllSubscribers runs during the auth client's _initialize()
+    // *while still holding the internal auth lock*. If the listener returns a Promise
+    // that awaits any SDK call (fetchProfile uses sb().from('user_profiles')...),
+    // that SDK call queues behind the still-running init → INIT NEVER COMPLETES →
+    // listener never returns → deadlock. Symptom on the live site: loading spinner
+    // hangs for 10s, failsafe fires, dashboard bounces to /login.
+    //
+    // Fix: capture the session synchronously, defer the profile fetch into a separate
+    // task via setTimeout(0). By the time the deferred task runs, the SDK's init has
+    // finished, the lock has been released, and fetchProfile can complete normally.
+    const { data: sub } = c.auth.onAuthStateChange((_event, session) => {
       if (cancelled) return;
 
       if (!session) {
@@ -70,24 +72,33 @@ export function Providers({ children }: { children: ReactNode }) {
         return;
       }
 
-      // Post-bootstrap events (TOKEN_REFRESHED, USER_UPDATED) — refresh the
-      // profile in the background, but DON'T re-show the spinner and DON'T
-      // overwrite a known-good profile with null on a transient fetch failure.
-      if (bootstrapped) {
-        const prof = await fetchProfile(session.user.id);
+      // Background profile resolution — does NOT block the SDK's notify loop.
+      const userId = session.user.id;
+      setTimeout(async () => {
         if (cancelled) return;
-        if (prof) setProfile(prof);
-        return;
-      }
-
-      // First bootstrap: keep loading=true while we resolve the profile so the
-      // redirect effect can't bounce to /login during the fetch.
-      const prof = await fetchProfile(session.user.id);
-      if (cancelled) return;
-      bootstrapped = true;
-      setProfile(prof);
-      setLoading(false);
-      clearTimeout(failsafe);
+        try {
+          if (bootstrapped) {
+            // Post-bootstrap event (TOKEN_REFRESHED, USER_UPDATED): refresh silently.
+            // Don't re-show the spinner; don't clobber a known-good profile with null.
+            const prof = await fetchProfile(userId);
+            if (cancelled) return;
+            if (prof) setProfile(prof);
+            return;
+          }
+          const prof = await fetchProfile(userId);
+          if (cancelled) return;
+          bootstrapped = true;
+          setProfile(prof);
+          setLoading(false);
+          clearTimeout(failsafe);
+        } catch (e) {
+          if (cancelled) return;
+          console.warn("[Providers] deferred profile fetch failed", e);
+          bootstrapped = true;
+          setLoading(false);
+          clearTimeout(failsafe);
+        }
+      }, 0);
     });
 
     return () => {
@@ -97,7 +108,7 @@ export function Providers({ children }: { children: ReactNode }) {
     };
   }, []);
 
-  // Redirect logic: must be logged in to see anything except /login
+  // Redirect: must be logged in to see anything except /login
   useEffect(() => {
     if (loading) return;
     const onLogin = pathname?.endsWith("/login") || pathname?.endsWith("/login/");
