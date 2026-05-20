@@ -40,6 +40,9 @@ export type Txn = {
   action: "Purchase" | "Sale" | "Transfer" | "Adjustment" | "Return";
   godown: "A" | "B";
   qty: number;
+  // +1 = stock added at this godown, -1 = stock removed.
+  // Added in phase2-adjustment-return.sql. Always populated by process_transaction.
+  direction: 1 | -1;
   status: string;
   reverses_id: string | null;
   party_id: string | null;

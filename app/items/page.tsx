@@ -1,14 +1,21 @@
 "use client";
-import { Fragment, useEffect, useState, useMemo } from "react";
+import { Fragment, useEffect, useState, useMemo, useCallback } from "react";
 import {
   Plus, Search, ChevronRight, ChevronDown,
   LayoutGrid, Table as TableIcon, Package,
+  Pencil, X, Save, Loader2, AlertCircle,
 } from "lucide-react";
 import { Shell } from "@/components/shell";
+import { useAuth } from "@/app/providers";
 import { sb, type Item, type Stock } from "@/lib/supabase";
 import { colourCss, fmtN } from "@/lib/utils";
 
-type Combined = Item & { totalA: number; totalB: number };
+// Combined now also carries raw cases/loose so the override modal can edit them directly.
+type Combined = Item & {
+  totalA: number; totalB: number;
+  casesA: number; looseA: number;
+  casesB: number; looseB: number;
+};
 type View = "grid" | "table";
 type Depth = 0 | 1 | 2 | 3;
 
@@ -56,6 +63,10 @@ function buildTree(items: Combined[], depth: number): Node[] {
 
 // ─── component ────────────────────────────────────────────────────────────
 export default function ItemsPage() {
+  const { profile } = useAuth();
+  const canWrite = profile?.role === "admin" || profile?.role === "staff";
+  const isAdmin = profile?.role === "admin";
+
   const [items, setItems] = useState<Combined[]>([]);
   const [loaded, setLoaded] = useState(false);
 
@@ -69,6 +80,9 @@ export default function ItemsPage() {
   const [view, setView] = useState<View>("grid");
   const [depth, setDepth] = useState<Depth>(2);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
+
+  // manual override modal
+  const [editingItem, setEditingItem] = useState<Combined | null>(null);
 
   // ─── load persisted UI state once ───────────────────────────────────────
   useEffect(() => {
@@ -86,40 +100,45 @@ export default function ItemsPage() {
   useEffect(() => { try { localStorage.setItem("items.expanded", JSON.stringify([...expanded])); } catch {} }, [expanded]);
 
   // ─── load data ──────────────────────────────────────────────────────────
-  useEffect(() => {
-    (async () => {
-      const c = sb();
-      const [{ data: rows }, { data: stock }, { data: cats }] = await Promise.all([
-        c.from("items").select("*").order("item_code"),
-        c.from("godown_stock").select("*"),
-        c.from("categories").select("id, name"),
-      ]);
-      const catMap = new Map<string, string>(
-        (cats || []).map((x: any) => [x.id as string, x.name as string])
-      );
-      const sMap: Record<string, { A: Stock; B: Stock }> = {};
-      (stock || []).forEach((s: any) => {
-        sMap[s.item_id] = sMap[s.item_id] || {
-          A: { item_id: s.item_id, godown: "A", cases: 0, loose: 0 },
-          B: { item_id: s.item_id, godown: "B", cases: 0, loose: 0 },
-        };
-        sMap[s.item_id][s.godown as "A" | "B"] = s as Stock;
-      });
-      const combined: Combined[] = (rows || []).map((i: any) => {
-        const cs = i.case_size || 0;
-        const a = sMap[i.id]?.A || { cases: 0, loose: 0 };
-        const b = sMap[i.id]?.B || { cases: 0, loose: 0 };
-        return {
-          ...i,
-          category: catMap.get(i.category_id) ?? null,
-          totalA: cs > 0 ? a.cases * cs + a.loose : a.loose,
-          totalB: cs > 0 ? b.cases * cs + b.loose : b.loose,
-        };
-      });
-      setItems(combined);
-      setLoaded(true);
-    })();
+  // Extracted to a callback so the override modal can refresh after saving.
+  const loadData = useCallback(async () => {
+    const c = sb();
+    const [{ data: rows }, { data: stock }, { data: cats }] = await Promise.all([
+      c.from("items").select("*").order("item_code"),
+      c.from("godown_stock").select("*"),
+      c.from("categories").select("id, name"),
+    ]);
+    const catMap = new Map<string, string>(
+      (cats || []).map((x: any) => [x.id as string, x.name as string])
+    );
+    const sMap: Record<string, { A: Stock; B: Stock }> = {};
+    (stock || []).forEach((s: any) => {
+      sMap[s.item_id] = sMap[s.item_id] || {
+        A: { item_id: s.item_id, godown: "A", cases: 0, loose: 0 },
+        B: { item_id: s.item_id, godown: "B", cases: 0, loose: 0 },
+      };
+      sMap[s.item_id][s.godown as "A" | "B"] = s as Stock;
+    });
+    const combined: Combined[] = (rows || []).map((i: any) => {
+      const cs = i.case_size || 0;
+      const a = sMap[i.id]?.A || { cases: 0, loose: 0 };
+      const b = sMap[i.id]?.B || { cases: 0, loose: 0 };
+      return {
+        ...i,
+        category: catMap.get(i.category_id) ?? null,
+        totalA: cs > 0 ? a.cases * cs + a.loose : a.loose,
+        totalB: cs > 0 ? b.cases * cs + b.loose : b.loose,
+        casesA: a.cases || 0, looseA: a.loose || 0,
+        casesB: b.cases || 0, looseB: b.loose || 0,
+      };
+    });
+    setItems(combined);
+    setLoaded(true);
   }, []);
+  useEffect(() => { loadData(); }, [loadData]);
+
+  // open edit modal — only callable when canWrite (button is hidden otherwise)
+  const onEdit = useCallback((it: Combined) => setEditingItem(it), []);
 
   // ─── derived: filter dropdown sources ───────────────────────────────────
   const brands = useMemo(
@@ -279,9 +298,19 @@ export default function ItemsPage() {
       ) : filtered.length === 0 ? (
         <Empty />
       ) : view === "grid" ? (
-        <GridBody tree={tree} depth={depth} isOpen={isOpen} toggle={toggle} statusOf={statusOf} />
+        <GridBody tree={tree} depth={depth} isOpen={isOpen} toggle={toggle} statusOf={statusOf} canWrite={canWrite} onEdit={onEdit} />
       ) : (
-        <TableBody tree={tree} depth={depth} isOpen={isOpen} toggle={toggle} statusBadge={statusBadge} />
+        <TableBody tree={tree} depth={depth} isOpen={isOpen} toggle={toggle} statusBadge={statusBadge} canWrite={canWrite} onEdit={onEdit} />
+      )}
+
+      {/* ─── Manual override modal ───────────────────────────── */}
+      {editingItem && (
+        <EditStockModal
+          item={editingItem}
+          isAdmin={isAdmin}
+          onClose={() => setEditingItem(null)}
+          onSaved={async () => { await loadData(); setEditingItem(null); }}
+        />
       )}
     </Shell>
   );
@@ -289,37 +318,41 @@ export default function ItemsPage() {
 
 // ─── grid view ────────────────────────────────────────────────────────────
 function GridBody({
-  tree, depth, isOpen, toggle, statusOf,
+  tree, depth, isOpen, toggle, statusOf, canWrite, onEdit,
 }: {
   tree: Node[];
   depth: number;
   isOpen: (key: string) => boolean;
   toggle: (key: string) => void;
   statusOf: (i: Combined) => "out" | "low" | "ok";
+  canWrite: boolean;
+  onEdit: (i: Combined) => void;
 }) {
   // When grouping is off, just render one big grid.
   if (depth === 0) {
     return (
       <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5 gap-3">
-        {tree[0]?.items?.map(i => <Card key={i.id} item={i} statusOf={statusOf} />)}
+        {tree[0]?.items?.map(i => <Card key={i.id} item={i} statusOf={statusOf} canWrite={canWrite} onEdit={onEdit} />)}
       </div>
     );
   }
   return (
     <div className="space-y-6">
-      {tree.map(node => <GroupSection key={node.key} node={node} level={0} isOpen={isOpen} toggle={toggle} statusOf={statusOf} />)}
+      {tree.map(node => <GroupSection key={node.key} node={node} level={0} isOpen={isOpen} toggle={toggle} statusOf={statusOf} canWrite={canWrite} onEdit={onEdit} />)}
     </div>
   );
 }
 
 function GroupSection({
-  node, level, isOpen, toggle, statusOf,
+  node, level, isOpen, toggle, statusOf, canWrite, onEdit,
 }: {
   node: Node;
   level: number;
   isOpen: (key: string) => boolean;
   toggle: (key: string) => void;
   statusOf: (i: Combined) => "out" | "low" | "ok";
+  canWrite: boolean;
+  onEdit: (i: Combined) => void;
 }) {
   const open = isOpen(node.key);
   // Heading sizes scale down with level.
@@ -344,26 +377,43 @@ function GroupSection({
       {open && node.children && (
         <div className="space-y-5">
           {node.children.map(c => (
-            <GroupSection key={c.key} node={c} level={level + 1} isOpen={isOpen} toggle={toggle} statusOf={statusOf} />
+            <GroupSection key={c.key} node={c} level={level + 1} isOpen={isOpen} toggle={toggle} statusOf={statusOf} canWrite={canWrite} onEdit={onEdit} />
           ))}
         </div>
       )}
       {open && node.items && (
         <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5 gap-3">
-          {node.items.map(i => <Card key={i.id} item={i} statusOf={statusOf} />)}
+          {node.items.map(i => <Card key={i.id} item={i} statusOf={statusOf} canWrite={canWrite} onEdit={onEdit} />)}
         </div>
       )}
     </section>
   );
 }
 
-function Card({ item, statusOf }: { item: Combined; statusOf: (i: Combined) => "out" | "low" | "ok" }) {
+function Card({ item, statusOf, canWrite, onEdit }: {
+  item: Combined;
+  statusOf: (i: Combined) => "out" | "low" | "ok";
+  canWrite: boolean;
+  onEdit: (i: Combined) => void;
+}) {
   const c = colourCss(item.colour);
   const total = item.totalA + item.totalB;
   const s = statusOf(item);
   const statusColour = s === "out" ? "text-rose-500" : s === "low" ? "text-amber-500" : "text-emerald-500";
   return (
-    <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg p-3 hover:border-cyan-500/50 hover:shadow-sm dark:hover:shadow-cyan-500/5 transition-all cursor-pointer flex flex-col">
+    <div className="group relative bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg p-3 hover:border-cyan-500/50 hover:shadow-sm dark:hover:shadow-cyan-500/5 transition-all cursor-pointer flex flex-col">
+      {/* Manual override edit button (only for admin/staff) */}
+      {canWrite && (
+        <button
+          type="button"
+          onClick={(e) => { e.stopPropagation(); onEdit(item); }}
+          title="Edit stock (manual override)"
+          aria-label="Edit stock (manual override)"
+          className="absolute top-2 right-2 z-10 p-1.5 rounded-md bg-white/90 dark:bg-zinc-900/90 border border-zinc-200 dark:border-zinc-700 text-zinc-500 hover:text-cyan-600 dark:hover:text-cyan-300 hover:border-cyan-500/50 opacity-0 group-hover:opacity-100 transition-opacity shadow-sm"
+        >
+          <Pencil className="w-3.5 h-3.5" />
+        </button>
+      )}
       {/* Colour-derived header strip; falls back to a neutral gradient */}
       <div
         className="aspect-[5/2] rounded-md mb-3 flex items-center justify-center relative overflow-hidden"
@@ -414,18 +464,20 @@ function Card({ item, statusOf }: { item: Combined; statusOf: (i: Combined) => "
 
 // ─── table view (grouped) ─────────────────────────────────────────────────
 function TableBody({
-  tree, depth, isOpen, toggle, statusBadge,
+  tree, depth, isOpen, toggle, statusBadge, canWrite, onEdit,
 }: {
   tree: Node[];
   depth: number;
   isOpen: (key: string) => boolean;
   toggle: (key: string) => void;
   statusBadge: (i: Combined) => React.ReactNode;
+  canWrite: boolean;
+  onEdit: (i: Combined) => void;
 }) {
   const renderItemRow = (i: Combined, indent: number) => {
     const c = colourCss(i.colour);
     return (
-      <tr key={i.id} className="border-t border-zinc-200/50 dark:border-zinc-800/50 hover:bg-zinc-50 dark:hover:bg-zinc-800/40 cursor-pointer">
+      <tr key={i.id} className="group border-t border-zinc-200/50 dark:border-zinc-800/50 hover:bg-zinc-50 dark:hover:bg-zinc-800/40 cursor-pointer">
         <td className="px-5 py-2.5" style={{ paddingLeft: `${indent * 16 + 20}px` }}>
           {i.brand
             ? <span className="bg-cyan-500/15 text-cyan-600 dark:text-cyan-300 px-2 py-0.5 rounded text-[11px]">{i.brand}</span>
@@ -441,7 +493,20 @@ function TableBody({
         <td className="px-3 py-2.5 text-right tnum">{fmtN(i.totalA)}</td>
         <td className="px-3 py-2.5 text-right tnum">{fmtN(i.totalB)}</td>
         <td className="px-3 py-2.5 text-right tnum font-semibold">{fmtN(i.totalA + i.totalB)}</td>
-        <td className="px-5 py-2.5 text-right">{statusBadge(i)}</td>
+        <td className="px-3 py-2.5 text-right">{statusBadge(i)}</td>
+        <td className="px-5 py-2.5 text-right w-10">
+          {canWrite && (
+            <button
+              type="button"
+              onClick={(e) => { e.stopPropagation(); onEdit(i); }}
+              title="Edit stock (manual override)"
+              aria-label="Edit stock (manual override)"
+              className="p-1 rounded text-zinc-400 hover:text-cyan-600 dark:hover:text-cyan-300 opacity-0 group-hover:opacity-100 transition-opacity"
+            >
+              <Pencil className="w-3.5 h-3.5" />
+            </button>
+          )}
+        </td>
       </tr>
     );
   };
@@ -454,7 +519,7 @@ function TableBody({
     return (
       <Fragment key={n.key}>
         <tr className="bg-zinc-50/50 dark:bg-zinc-900/50 border-t border-zinc-200 dark:border-zinc-800 select-none">
-          <td colSpan={8} className="px-3 py-2">
+          <td colSpan={9} className="px-3 py-2">
             <button
               onClick={() => toggle(n.key)}
               className="w-full flex items-center gap-2 text-left hover:bg-zinc-100/60 dark:hover:bg-zinc-800/60 -mx-3 px-3 py-1 rounded transition-colors"
@@ -486,7 +551,8 @@ function TableBody({
             <th className="text-right px-3 py-2.5 font-medium">Stock A</th>
             <th className="text-right px-3 py-2.5 font-medium">Stock B</th>
             <th className="text-right px-3 py-2.5 font-medium">Total</th>
-            <th className="text-right px-5 py-2.5 font-medium">Status</th>
+            <th className="text-right px-3 py-2.5 font-medium">Status</th>
+            <th className="px-5 py-2.5 font-medium w-10" aria-label="actions" />
           </tr>
         </thead>
         <tbody>
@@ -528,5 +594,308 @@ function Empty() {
       <Package className="w-8 h-8 text-zinc-400 dark:text-zinc-600 mx-auto mb-3" strokeWidth={1.5} />
       <div className="text-sm text-zinc-500">No items match your filters.</div>
     </div>
+  );
+}
+
+// ─── manual stock-override modal ──────────────────────────────────────────
+// Lets the user fix discrepancies between system stock and physical count.
+// Writes one or two Adjustment transactions (one per godown that changed)
+// via process_transaction() so the audit trail is intact. Case size
+// (which lives on the items table, not godown_stock) is updated separately
+// via a plain UPDATE — admin only, because of items-table RLS.
+function EditStockModal({
+  item, isAdmin, onClose, onSaved,
+}: {
+  item: Combined;
+  isAdmin: boolean;
+  onClose: () => void;
+  onSaved: () => void | Promise<void>;
+}) {
+  const oldCs = item.case_size || 0;
+  const [cs, setCs] = useState(String(oldCs));
+  const [aCases, setACases] = useState(String(item.casesA));
+  const [aLoose, setALoose] = useState(String(item.looseA));
+  const [bCases, setBCases] = useState(String(item.casesB));
+  const [bLoose, setBLoose] = useState(String(item.looseB));
+  const [reason, setReason] = useState("count correction");
+  const [reasonOther, setReasonOther] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // numeric parsings (default 0 on empty / NaN)
+  const csN = Math.max(0, Number(cs || 0) | 0);
+  const aCN = Math.max(0, Number(aCases || 0) | 0);
+  const aLN = Math.max(0, Number(aLoose || 0) | 0);
+  const bCN = Math.max(0, Number(bCases || 0) | 0);
+  const bLN = Math.max(0, Number(bLoose || 0) | 0);
+
+  // Total physical units, before and after
+  const oldATotal = oldCs > 0 ? item.casesA * oldCs + item.looseA : item.looseA;
+  const oldBTotal = oldCs > 0 ? item.casesB * oldCs + item.looseB : item.looseB;
+  const newATotal = csN > 0 ? aCN * csN + aLN : aLN;
+  const newBTotal = csN > 0 ? bCN * csN + bLN : bLN;
+  const deltaA = newATotal - oldATotal;
+  const deltaB = newBTotal - oldBTotal;
+  const csChanged = csN !== oldCs;
+  const nothingChanged = !csChanged && deltaA === 0 && deltaB === 0;
+
+  // chosen reason text to write to the ledger
+  const reasonText = reason === "other" ? reasonOther.trim() : reason;
+
+  const onlyDigits = (s: string) => s.replace(/[^\d]/g, "");
+
+  async function save() {
+    if (nothingChanged) { setError("Nothing to save — change at least one value."); return; }
+    if (!reasonText) { setError("Please provide a reason."); return; }
+    if (csChanged && !isAdmin) {
+      setError("Only admins can change case size. Ask an admin, or untouch the case size field.");
+      return;
+    }
+
+    setError(null);
+    setSaving(true);
+    try {
+      const c = sb();
+      const today = new Date().toISOString().slice(0, 10);
+
+      // 1) Update case_size on items if it changed. Done first so the
+      //    Adjustment calls split the new total using the new case size.
+      if (csChanged) {
+        const { error: e1 } = await c.from("items").update({ case_size: csN }).eq("id", item.id);
+        if (e1) throw e1;
+      }
+
+      // 2) Adjustment for Godown A if its physical total changed
+      if (deltaA !== 0) {
+        const { error: eA } = await c.rpc("process_transaction", {
+          p_item_id: item.id,
+          p_action: "Adjustment",
+          p_godown: "A",
+          p_qty: Math.abs(deltaA),
+          p_date: today,
+          p_note: reasonText,
+          p_direction: deltaA > 0 ? 1 : -1,
+        });
+        if (eA) throw eA;
+      }
+
+      // 3) Same for Godown B
+      if (deltaB !== 0) {
+        const { error: eB } = await c.rpc("process_transaction", {
+          p_item_id: item.id,
+          p_action: "Adjustment",
+          p_godown: "B",
+          p_qty: Math.abs(deltaB),
+          p_date: today,
+          p_note: reasonText,
+          p_direction: deltaB > 0 ? 1 : -1,
+        });
+        if (eB) throw eB;
+      }
+
+      await onSaved();
+    } catch (e: any) {
+      setError(e?.message || "Failed to save override.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div
+      className="fixed inset-0 z-50 bg-black/50 dark:bg-black/70 flex items-center justify-center p-4 overflow-y-auto"
+      role="dialog"
+      aria-modal="true"
+      aria-label="Manual stock override"
+      onClick={onClose}
+    >
+      <div
+        className="bg-white dark:bg-zinc-900 rounded-lg w-full max-w-2xl shadow-2xl border border-zinc-200 dark:border-zinc-800 my-8"
+        onClick={(e) => e.stopPropagation()}
+      >
+        {/* Header */}
+        <div className="px-5 py-4 border-b border-zinc-200 dark:border-zinc-800 flex items-start justify-between gap-4">
+          <div className="min-w-0">
+            <h2 className="text-base font-semibold">Manual stock override</h2>
+            <p className="text-xs text-zinc-500 mt-0.5 truncate">
+              {item.brand && <span>{item.brand} · </span>}{item.model} · {item.size} · {item.colour}
+              <span className="text-zinc-400"> · {item.item_code}</span>
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label="Close"
+            className="text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200 -mr-1.5"
+          >
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+
+        {/* Body */}
+        <div className="p-5 space-y-5">
+          <div className="bg-amber-50 dark:bg-amber-500/10 border border-amber-200 dark:border-amber-500/30 rounded-md p-3 text-[12px] text-amber-800 dark:text-amber-200 leading-relaxed">
+            Use this only to <b>fix discrepancies</b> between the system and the actual physical count.
+            For everyday Purchase / Sale / Transfer, use the Transactions page instead.
+            Saving here writes an <b>Adjustment</b> entry per godown so the audit log is preserved.
+          </div>
+
+          {/* Case size */}
+          <div>
+            <Label>Case size (units per carton)</Label>
+            <NumInput value={cs} onChange={(v) => setCs(onlyDigits(v))} disabled={!isAdmin} />
+            {!isAdmin && (
+              <div className="text-[11px] text-zinc-500 mt-1">Admin only — sign in as admin to edit.</div>
+            )}
+            {csChanged && isAdmin && (
+              <div className="text-[11px] text-amber-600 dark:text-amber-400 mt-1">
+                Changing case size from <b>{oldCs}</b> to <b>{csN}</b>. The carton counts below are interpreted with the <b>new</b> value.
+              </div>
+            )}
+          </div>
+
+          {/* Godown A + B */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <GodownBlock
+              label="Stock A"
+              casesValue={aCases} setCases={(v) => setACases(onlyDigits(v))}
+              looseValue={aLoose} setLoose={(v) => setALoose(onlyDigits(v))}
+              oldTotal={oldATotal} newTotal={newATotal} delta={deltaA} cs={csN}
+              casesN={aCN} looseN={aLN}
+            />
+            <GodownBlock
+              label="Stock B"
+              casesValue={bCases} setCases={(v) => setBCases(onlyDigits(v))}
+              looseValue={bLoose} setLoose={(v) => setBLoose(onlyDigits(v))}
+              oldTotal={oldBTotal} newTotal={newBTotal} delta={deltaB} cs={csN}
+              casesN={bCN} looseN={bLN}
+            />
+          </div>
+
+          {/* Reason */}
+          <div>
+            <Label>Reason (saved to the audit log)</Label>
+            <select
+              value={reason}
+              onChange={(e) => setReason(e.target.value)}
+              className="w-full bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-cyan-500"
+            >
+              <option value="count correction">Count correction</option>
+              <option value="damage">Damage</option>
+              <option value="lost">Lost</option>
+              <option value="found">Found</option>
+              <option value="theft">Theft</option>
+              <option value="data-entry fix">Data-entry fix</option>
+              <option value="other">Other…</option>
+            </select>
+            {reason === "other" && (
+              <input
+                type="text"
+                placeholder="Describe the reason…"
+                value={reasonOther}
+                onChange={(e) => setReasonOther(e.target.value)}
+                className="mt-2 w-full bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-cyan-500"
+              />
+            )}
+          </div>
+
+          {error && (
+            <div className="text-sm text-rose-600 dark:text-rose-300 bg-rose-500/10 border border-rose-500/30 rounded-md p-2.5 flex items-start gap-2">
+              <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
+              <span className="min-w-0 break-words">{error}</span>
+            </div>
+          )}
+        </div>
+
+        {/* Footer */}
+        <div className="px-5 py-3 border-t border-zinc-200 dark:border-zinc-800 flex items-center justify-between gap-3 bg-zinc-50 dark:bg-zinc-900/50 rounded-b-lg">
+          <div className="text-[11px] text-zinc-500">
+            {nothingChanged
+              ? "No changes yet."
+              : `Will write ${[csChanged && "case-size update", deltaA !== 0 && "A adjustment", deltaB !== 0 && "B adjustment"].filter(Boolean).join(" + ")}.`}
+          </div>
+          <div className="flex gap-2">
+            <button
+              type="button"
+              onClick={onClose}
+              className="px-3 py-1.5 text-sm text-zinc-600 dark:text-zinc-300 hover:bg-zinc-200 dark:hover:bg-zinc-800 rounded-md"
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              onClick={save}
+              disabled={saving || nothingChanged}
+              className="bg-cyan-500 hover:bg-cyan-400 disabled:opacity-40 disabled:cursor-not-allowed text-zinc-900 px-3.5 py-1.5 rounded-md text-sm font-medium flex items-center gap-1.5"
+            >
+              {saving ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Save className="w-3.5 h-3.5" />}
+              {saving ? "Saving…" : "Save override"}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function GodownBlock({
+  label, casesValue, setCases, looseValue, setLoose,
+  oldTotal, newTotal, delta, cs, casesN, looseN,
+}: {
+  label: string;
+  casesValue: string; setCases: (v: string) => void;
+  looseValue: string; setLoose: (v: string) => void;
+  oldTotal: number; newTotal: number; delta: number; cs: number;
+  casesN: number; looseN: number;
+}) {
+  const deltaCls = delta > 0
+    ? "text-emerald-600 dark:text-emerald-400"
+    : delta < 0
+    ? "text-rose-500"
+    : "text-zinc-500";
+  return (
+    <div className="border border-zinc-200 dark:border-zinc-800 rounded-md p-4 space-y-3">
+      <div className="text-sm font-medium">{label}</div>
+      <div className="grid grid-cols-2 gap-3">
+        <div>
+          <Label>Cartons</Label>
+          <NumInput value={casesValue} onChange={setCases} />
+        </div>
+        <div>
+          <Label>Loose</Label>
+          <NumInput value={looseValue} onChange={setLoose} />
+        </div>
+      </div>
+      <div className="text-[11px] text-zinc-500 pt-2 border-t border-zinc-100 dark:border-zinc-800 space-y-0.5">
+        <div>In system: <b className="tnum text-zinc-700 dark:text-zinc-200">{fmtN(oldTotal)}</b> units</div>
+        <div>
+          New target: <b className="tnum text-zinc-700 dark:text-zinc-200">{fmtN(newTotal)}</b> units
+          {cs > 0 && <span className="text-zinc-400"> ({casesN}×{cs} + {looseN})</span>}
+        </div>
+        <div>
+          Delta: <b className={`tnum ${deltaCls}`}>{delta > 0 ? "+" : ""}{fmtN(delta)}</b>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Label({ children }: { children: React.ReactNode }) {
+  return <div className="text-[11px] uppercase tracking-wider text-zinc-500 font-medium mb-1.5">{children}</div>;
+}
+
+function NumInput({
+  value, onChange, disabled,
+}: { value: string; onChange: (v: string) => void; disabled?: boolean }) {
+  return (
+    <input
+      type="number"
+      min="0"
+      inputMode="numeric"
+      value={value}
+      disabled={disabled}
+      onChange={(e) => onChange(e.target.value)}
+      className="w-full bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-cyan-500 tnum disabled:opacity-50 disabled:cursor-not-allowed"
+    />
   );
 }

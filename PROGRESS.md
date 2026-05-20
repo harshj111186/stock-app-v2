@@ -230,6 +230,80 @@ If you must touch one of these files: **read first, edit surgically, never repla
 
 ## 11. Changelog (latest first — add new entries at the top)
 
+### 2026-05-20 — Manual stock override on Items page + Adjustment unlocked at DB
+**User ask:** "I want to add an option where I can manually change values of CS size, loose and cases for both Stock A and Stock B. So that it can act as manual override if any discrepancy found in actual stock."
+
+**What was built**
+
+A new **Edit-stock modal** opens from a small pencil icon on every Items-page card (and as the last column in the table view). The modal lets the user:
+- View current case size, A.cartons, A.loose, B.cartons, B.loose
+- Type the actual physical values they just counted
+- See a live delta per godown (e.g. "Delta: -3" in red) before saving
+- Pick a reason ("count correction", "damage", "lost", "found", "theft", "data-entry fix", "other…")
+- Save → writes one Adjustment transaction per godown that changed (so the audit log stays intact), plus a direct UPDATE to items.case_size when that changed
+
+Role-aware: admin sees everything. Staff can change cases/loose (writes go through `process_transaction()` which is `security definer` and bypasses RLS), but the case-size field is disabled because `items` table is admin-write-only. Viewer doesn't see the pencil at all.
+
+**Why this needed a DB migration (not just a UI change)**
+
+The `process_transaction()` function in `phase1-schema.sql` only had branches for Purchase / Sale / Transfer. Calling it with `action = 'Adjustment'` silently wrote a zero-impact ledger row — the enum value existed (`phase1-migration.sql` added it on 2026-05-13) but the function never used it. The locked "Adjustment" tab in `transactions/page.tsx` was waiting for exactly this fix.
+
+So this session executed the previously-designed Phase-2 plan (from the May 14 changelog entry below) at the DB level.
+
+**Files patched (1 new, 2 edited)**
+
+1. **`Stock Accounting/phase2-adjustment-return.sql`** *(new)*
+   - Adds `direction smallint` column to `transactions`, backfilled (Purchase=+1, Sale=-1, Transfer=-1, old Adjustment/Return=+1) and made NOT NULL with a check constraint.
+   - Drops the old 6-arg `process_transaction` and recreates it as 7-arg with `p_direction int default null`. Adjustment + Return require an explicit `±1`; other actions resolve direction internally. Outbound moves (`direction = -1`) get the same stock-sufficiency check as Sale.
+   - Updates `reverse_transaction` so reversing an Adjustment/Return inserts the same action with the opposite direction (was crashing into the Transfer-only branch before).
+   - Updates `recompute_stock_levels()` to use `direction * qty` instead of the hard-coded action→sign CASE expression. The `also_transferred_in` CTE for Transfer destinations stays as-is.
+   - Idempotent: safe to re-run. Final SELECT verifies no rows have NULL/bad direction.
+
+2. **`stock-app-v2/app/items/page.tsx`** *(edited — surgical, per section 7)*
+   - New imports: `useCallback`, `useAuth`, Lucide icons `Pencil, X, Save, Loader2, AlertCircle`.
+   - `Combined` type extended with `casesA / looseA / casesB / looseB` so the modal can edit raw stock without a second fetch.
+   - Data loader extracted into a `useCallback` (`loadData`) so the modal can refresh after saving.
+   - `canWrite` / `isAdmin` derived from `useAuth().profile`.
+   - `editingItem` state + `onEdit` callback threaded through `GridBody → GroupSection → Card` and `TableBody → renderItemRow`.
+   - Pencil button on each card (top-right, fade-in on hover) and a new last column in the table view (also hover-revealed). Hidden entirely for viewer-role users.
+   - New `EditStockModal` component (~230 lines) with `GodownBlock`, `Label`, `NumInput` helpers at the bottom of the file. All linter-customised existing code (tree view, persisted UI state, useMemo blocks) left exactly as-is.
+
+3. **`stock-app-v2/lib/supabase.ts`** *(edited)*
+   - Added `direction: 1 | -1` to the `Txn` type with a comment pointing to this migration.
+
+**Files NOT touched**
+- `transactions/page.tsx` — the Adjustment / Return tabs there are still locked. The DB now supports them, so unlocking is a small follow-up (the previously-designed plan in the older Changelog entry below applies). Not done in this turn because the user's ask was specifically the Items-page override.
+- `components/*`, `lib/utils.ts`, `app/page.tsx` (dashboard), all other pages: untouched.
+- All other linter-customised files: untouched.
+
+**Deploy required (manual — 2 steps)**
+
+1. **Run the SQL.** Open Supabase → SQL Editor → New query. Open `Stock Accounting\phase2-adjustment-return.sql`, copy the whole file, paste, click **Run**. The verification SELECT at the bottom should show `rows_missing_direction = 0`, `rows_bad_direction = 0`, `new_signature_present = 1`.
+
+2. **Upload the two changed files to GitHub.** Open https://github.com/harshj111186/stock-app-v2 → navigate into each folder → "Add file → Upload files" → drag-drop:
+   - `app/items/page.tsx`  →  upload into the `app/items/` folder
+   - `lib/supabase.ts`     →  upload into the `lib/` folder
+   - Optionally also drop the updated `PROGRESS.md` at the repo root.
+   - One commit per upload is fine. GitHub Action will rebuild and republish to Pages in ~1–2 min.
+
+After both steps, hover any item card on https://harshj111186.github.io/stock-app-v2/items/ → pencil appears → click → fix the count → reason → Save. The dashboard, Items list, and (eventually) Reports all see the new numbers because they come from the same `godown_stock` rows.
+
+**Edge cases handled**
+- Changing case size first updates `items.case_size`, then runs the Adjustments so the carton/loose split uses the new value.
+- If only A changed, only one Adjustment row is written. If both changed, two rows. If only CS changed (totals stay equal), only the items UPDATE runs.
+- "Other" reason exposes a free-text field so users can write their own description.
+- Modal saves are disabled until something actually changes (button stays grey).
+- Outbound deltas (`-N`) get the same stock-sufficiency check as Sale, server-side.
+- Modal closes on ESC / backdrop click; stop-propagation on the panel prevents accidental closes.
+
+**Follow-ups (next session candidates)**
+- Unlock the Adjustment and Return tabs in `transactions/page.tsx` — the DB is ready; only the UI guard and the `p_direction` plumbing remain (the design is in the May 14 changelog entry below).
+- v1 (`stock-app/index.html`) does not pass `p_direction`. Its existing Purchase/Sale/Transfer calls keep working unchanged (default NULL is fine for those). It can't use Adjustment/Return, but doesn't need to. No fix required on v1.
+- Reversibility on the Items page: currently no UI to reverse a wrong override. Workaround: open the modal again and type the previous values. A "Last 5 adjustments for this item" panel inside the modal would be a nice future addition.
+- The `transactions.reason` column exists from phase1-migration but `process_transaction` writes to `transactions.note`. The override modal passes the reason text as `p_note`, so it ends up in `note`, not `reason`. Pre-existing inconsistency; not blocking; flagged here for cleanup.
+
+---
+
 ### 2026-05-14 — v2 sign-in hang fixed (button stuck on "...")
 **Symptom reported by user:** clicking Sign in on the v2 login page leaves the button showing "..." endlessly. Confirmed reproducing in Incognito too — so NOT a stale-token issue.
 
