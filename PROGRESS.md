@@ -230,6 +230,100 @@ If you must touch one of these files: **read first, edit surgically, never repla
 
 ## 11. Changelog (latest first — add new entries at the top)
 
+### 2026-05-20 — Transactions page real + Adjustment & Return tabs unlocked
+**Cowork split: this session worked on Transactions while a parallel session worked on Items + Godown A/B + the login-hang re-fix.**
+
+**Starting state — important to know before reading the diff**
+
+The GitHub repo was still shipping the 19-line `Construction` placeholder for `app/transactions/page.tsx`. The 647-line "real" page described in the 2026-05-14 changelog entry below only ever existed locally in `OneDrive\…\Stock Accounting\stock-app-v2\app\transactions\page.tsx` — it was never pushed. So this turn does TWO things at once:
+1. Lands a real Transactions page in the deploy folder (`Projects\stock-app-v2\app\transactions\page.tsx`) for the first time.
+2. Bakes in the Adjustment + Return unlock directly, instead of shipping the page locked-then-unlocking it later.
+
+The phase-2 SQL (`Stock Accounting\phase2-adjustment-return.sql`, applied during the May 20 Items override turn) is the precondition. `process_transaction` is now 7-arg with `p_direction int default null`, the `transactions.direction` column exists, and `reverse_transaction` handles Adjustment/Return correctly. The page calls into that, end-to-end.
+
+**What the page does**
+
+- Top tab strip with all 5 action types live (Purchase, Sale, Transfer, Adjustment, Return). No `Lock` icon, no `disabled` attribute, no `LIVE_ACTIONS` whitelist — every tab is selectable.
+- Item picker: typeahead combobox of up to 30 matches, `onMouseDown` selection to dodge the blur-before-click race. Shows brand, model, size, colour, item_code, and `case×N`.
+- Carton + Loose entered separately (carton-loose-stays-separate rule #8). Total computed client-side as `cartons * case_size + loose` (or just `loose` if `case_size = 0`). Live total preview below.
+- **Adjustment tab — Reason dropdown is split with `<optgroup>`**:
+  - **Stock goes UP (+):** Found / Count up / Customer return → back on shelf
+  - **Stock goes DOWN (−):** Damage / Lost / Count down
+  - A small arrow-icon hint under the dropdown spells out "Will add N units to Godown X" or "Will remove N from Godown X" — kills the ambiguity the May 14 plan called out.
+  - The slug (`found`, `count_up`, etc.) maps to `±1` via the `ADJ_DIRECTION` constant at the top of the file. SQL never parses the reason text; it trusts the `p_direction` we pass alongside.
+- **Return tab — segmented direction toggle + party label that follows it**:
+  - "Customer return (into godown)" → `+1`, party field labelled "Customer (returning)".
+  - "Supplier return (out of godown)" → `-1`, party field labelled "Supplier (returning to)".
+  - Plain-English explainer line under the toggle so the user can't mis-classify it.
+- Form footer shows the resolved direction (`+1 (in)` in emerald or `−1 (out)` in rose) as a sanity-check before save.
+- Client-side validation runs BEFORE the RPC:
+  - No item picked / qty ≤ 0 → toast and bail.
+  - Transfer with From == To → toast and bail.
+  - Adjustment with no Reason picked → toast and bail.
+  - **Any outbound move** (Sale, Transfer, Adjustment with `-1`, Return with `-1`) checks `currentStock(item, godown) >= qty` against the loaded `godown_stock` map. Mirrors the SQL's own check; surfaces "Insufficient stock at Godown X (have N)" without a round-trip.
+- RPC call now passes the 7th arg: `sb().rpc("process_transaction", { p_item_id, p_action, p_godown, p_qty, p_date, p_note, p_direction })`. `p_direction` is `null` for Purchase/Sale/Transfer (SQL resolves it from action) and `±1` for Adjustment/Return.
+- After success: cartons/loose/rate/invoice/party/reason all clear, but the selected item + godown + action stay for fast repeat entry. Last action saved to `localStorage["txn.lastAction"]`.
+- Transaction log below the form: action filter, free-text search, per-row Reverse button. Reversal rows show "reversal of XXXXXX…", originals that have already been reversed show "reversed" greyed-out, and any row with `action ∈ {Adjustment, Return}` shows a `+ in` / `− out` tag in the Qty cell (read off `t.direction`) so the log is readable at a glance. Purchase/Sale/Transfer rows get no extra tag (their direction is implied by action).
+- Toast: bottom-right, 4-second auto-dismiss, emerald tick / rose alert.
+
+**Style:** matches Godown / Items conventions — `Fragment` wrappers, `useMemo` for derived state, `tabular-nums` on numeric cells, Lucide icons throughout (no emoji), cyan-500 accent. Per-action colour stays: cyan Purchase, emerald Sale, amber Transfer, violet Adjustment, rose Return.
+
+**Files patched**
+
+- `stock-app-v2/app/transactions/page.tsx` *(was 19-line `Construction` stub; now ~770 lines real)*. New file at this path in the repo; the OneDrive 647-line version was the starting template but trimmed of `LIVE_ACTIONS` / `LOCKED_NOTE` / `Lock`-icon machinery and extended with `ADJ_DIRECTION`, the Return direction toggle, the form-footer direction indicator, and the log-row `+ in`/`− out` tag.
+
+**Files NOT touched**
+
+- `lib/supabase.ts` — already has `direction: 1 | -1` on the `Txn` type (added during the May 20 Items override turn). No change needed.
+- `components/*`, `app/items/page.tsx`, `app/godown-a/page.tsx`, `app/godown-b/page.tsx`, `app/page.tsx`, the v1 `stock-app/index.html` — all untouched. v1 will keep working: it calls the 6-arg signature in spirit, but PG resolves to the new 7-arg function with `p_direction` defaulting to `NULL` — fine for Purchase/Sale/Transfer.
+- `phase2-adjustment-return.sql` — already applied during the May 20 Items override turn. No new SQL in this turn.
+
+**Edge cases handled**
+
+- Reversing an Adjustment or Return now uses the SQL's new branch (`reverse_transaction` in `phase2-adjustment-return.sql` inserts the same action with the opposite direction). The page itself doesn't need to know — the Reverse button always calls `sb().rpc("reverse_transaction", { p_txn_id })` and the SQL does the right thing per action.
+- Stock-sufficiency check fires for negative-direction Adjustment / Return on the client. The SQL has the same check, so this is a UX nicety (cleaner error message, no round-trip).
+- "Count up" / "Count down" Adjustments are the structured equivalent of what the Items-page override modal writes as free-text reasons. Both flows hit the same `process_transaction(... , p_direction)` path — no divergence at the DB layer.
+- Save button's `disabled` condition no longer references `LIVE_ACTIONS`; just `submitting` + `!canWrite`. Read-only role still sees the amber "Your role is read-only" hint instead.
+
+**Follow-ups (not blocking)**
+
+- The `transactions.reason` column still isn't populated by `process_transaction` (writes to `note` instead). Log display falls back to `t.invoice_no || t.status` — usually shows "OK". Pre-existing inconsistency flagged in the May 20 Items-override entry; still not fixed here.
+- The `Txn` type doesn't include `note`. Adding it would let the log show the reason/inv/party string we assemble at save time. Minor.
+- Optimistic UI on Reverse so the row visibly flips to "reversed" without waiting for `reload()`.
+- `parties` table is still empty; Customer/Supplier fields remain free-text. Wiring `party_id` is a separate piece of work.
+
+---
+
+### 2026-05-20 — Login hang fix RE-APPLIED (regression from May 14)
+**User ask:** "fix that login issue where even after entering the email and password its not at all working, the login button shows load animation but nothing loads, sometime it works in incognito but sometimes it fails there too."
+
+**What happened.** The May 14 login-hang fix was no longer in either file when this session opened them — both `app/login/page.tsx` and `app/providers.tsx` had reverted to the pre-fix versions. Best guess on how: the May 14 fix was uploaded to GitHub but never landed in the local OneDrive copy, so subsequent uploads from this folder overwrote the deployed fix on commit. The "sometimes works in incognito" intermittency the user described is the giveaway signature of the redirect race — non-deterministic by definition.
+
+**Root cause (same as May 14, repeated here for the record).**
+
+1. **Redirect-race in `app/providers.tsx`.** After `signInWithPassword` resolves, the login page calls `router.replace("/")`. Meanwhile Supabase fires SIGNED_IN → `onAuthStateChange` starts fetching `user_profiles`. During the window where `pathname` is "/" but `profile` is still null (fetch in flight), the redirect `useEffect` runs `if (!profile && !onLogin) router.replace("/login")` and bounces back. Profile loads → bounce to "/". Visible flap.
+
+2. **No safety net in `app/login/page.tsx`.** `try/finally` only — no timeout, no `catch`. If `signInWithPassword` ever hangs (browser navigator-lock contention, network), `setBusy(false)` never runs and the button stays on "..." forever.
+
+**Files patched (same two as May 14)**
+
+- `app/providers.tsx` — added `setLoading(true)` BEFORE `await fetchProfile(...)` in BOTH the `onAuthStateChange` callback and the `getSession().then(...)` path. The redirect effect already early-returns on `loading`, so this closes the window. Inline comment explains the rationale so a future linter pass doesn't strip it.
+- `app/login/page.tsx` — three changes:
+  - **12-second `Promise.race` timeout** on the auth call. Hung calls release the button with "Sign in took too long…" instead of silent forever-spinner.
+  - **`try { ... } catch (e) { ... } finally`** — thrown errors now surface in the red error box rather than disappearing.
+  - **`window.location.assign(...)` instead of `router.replace("/")`** — hard navigation forces Providers to bootstrap fresh with the new session in localStorage, sidesteps the redirect race even if the providers.tsx fix somehow regresses again. In prod the target is `/stock-app-v2/`; in dev it's `/` (computed from `process.env.NODE_ENV`, inlined at build time).
+  - Removed the now-unused `useRouter` import.
+
+**Why this likely won't regress again.** The hard `window.location.assign` in login is the belt to the providers.tsx braces — even if a future linter session strips the `setLoading(true)` in providers, the hard navigation forces a fresh bootstrap and the race never starts. To get back to the broken state, *both* defences would have to be removed in the same upload.
+
+**Verification checklist after deploy:**
+1. Open https://harshj111186.github.io/stock-app-v2/ in a fresh incognito window. Sign in → should land on dashboard in ~1s.
+2. Try again with intentionally wrong password → red error box appears, button releases. (Catch block working.)
+3. Turn off wifi → click Sign in → after 12s, "Sign in took too long…" appears, button releases. (Timeout working.)
+4. Open DevTools → Console while signing in → should see no `[fetchProfile] error` lines. If you do, RLS on `user_profiles` is the next thing to check.
+
+---
+
 ### 2026-05-20 — Items page: show category on every card + match Godown's FK fallback
 **User ask:** "since I can see categories in godown A and B, perfect, why can't see same categorisation in items? in fact it's the categorisation from items that shall be passed down to godown a and godown B."
 
