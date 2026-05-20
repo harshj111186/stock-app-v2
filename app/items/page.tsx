@@ -125,7 +125,10 @@ export default function ItemsPage() {
       const b = sMap[i.id]?.B || { cases: 0, loose: 0 };
       return {
         ...i,
-        category: catMap.get(i.category_id) ?? null,
+        // Prefer category name via FK; fall back to the legacy category text column
+        // for any row whose category_id wasn't backfilled. Matches GodownView's
+        // resolution so both pages bucket identical items into identical groups.
+        category: catMap.get(i.category_id) ?? i.category ?? null,
         totalA: cs > 0 ? a.cases * cs + a.loose : a.loose,
         totalB: cs > 0 ? b.cases * cs + b.loose : b.loose,
         casesA: a.cases || 0, looseA: a.loose || 0,
@@ -442,9 +445,21 @@ function Card({ item, statusOf, canWrite, onEdit }: {
       <div className="text-sm font-medium truncate" title={item.model}>{item.model}</div>
 
       {/* Size · Colour */}
-      <div className="text-xs text-zinc-500 mb-3 truncate">
+      <div className="text-xs text-zinc-500 mb-1 truncate">
         {[item.size, item.colour].filter(Boolean).join(" · ") || "—"}
       </div>
+
+      {/* Category › Subcategory — shown on every card so categorisation is
+          visible even at the "No grouping" depth setting. Subtle grey to keep
+          the model as the primary identifier. */}
+      {(item.category || item.subcategory) && (
+        <div
+          className="text-[10px] text-zinc-400 dark:text-zinc-500 mb-3 truncate"
+          title={[item.category, item.subcategory].filter(Boolean).join(" › ")}
+        >
+          {[item.category, item.subcategory].filter(Boolean).join(" › ")}
+        </div>
+      )}
 
       {/* Footer: stock + status */}
       <div className="mt-auto flex items-center justify-between text-xs border-t border-zinc-100 dark:border-zinc-800 pt-2">

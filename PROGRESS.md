@@ -230,6 +230,23 @@ If you must touch one of these files: **read first, edit surgically, never repla
 
 ## 11. Changelog (latest first — add new entries at the top)
 
+### 2026-05-20 — Items page: show category on every card + match Godown's FK fallback
+**User ask:** "since I can see categories in godown A and B, perfect, why can't see same categorisation in items? in fact it's the categorisation from items that shall be passed down to godown a and godown B."
+
+**Context.** The user was right that items.category_id + items.subcategory are the single source of truth for both pages — Godown A/B just filter `godown_stock` and reuse the same grouping logic. The visual difference they were seeing came from two things, only one of which was a real bug:
+
+1. **Sticky depth-selector.** `localStorage["items.depth"]` was at `0` ("No grouping") from an earlier session, so Items rendered flat while Godown defaulted to depth 2 ("Brand · Category"). UI-only — fixed by changing the dropdown.
+2. **Subtle FK-fallback inconsistency.** `app/items/page.tsx` resolved category as `catMap.get(i.category_id) ?? null` while `components/godown-view.tsx` used `catMap.get(i.category_id) ?? i.category ?? null`. For any item whose `category_id` is null but has a legacy `category` text value, Items would bucket it under "(No category)" while Godown bucketed it correctly. Likely 0 items affected today (phase1-migration backfilled the FK), but real divergence.
+
+**Files patched**
+- `app/items/page.tsx`
+  - Load function: category resolution now mirrors Godown's — FK first, then legacy text, then null.
+  - Card component: added a subtle "Category › Subcategory" metadata line under the size/colour row (text-[10px] zinc-400, truncate, title-tooltip on overflow). Visible at every depth so categorisation is readable even when the user has "No grouping" selected.
+
+**No DB changes. No new RPC calls.**
+
+---
+
 ### 2026-05-20 — Godown A + Godown B pages wired up
 **User ask:** "items is all good, we need to build next godown a, and godown B"
 
