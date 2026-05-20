@@ -2,10 +2,8 @@
 import { useState } from "react";
 import { Package } from "lucide-react";
 import { sb } from "@/lib/supabase";
-import { useRouter } from "next/navigation";
 
 export default function LoginPage() {
-  const router = useRouter();
   const [mode, setMode] = useState<"signin" | "signup">("signin");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -18,17 +16,37 @@ export default function LoginPage() {
     setErr(""); setMsg(""); setBusy(true);
     try {
       const c = sb();
-      const res = mode === "signin"
-        ? await c.auth.signInWithPassword({ email, password })
-        : await c.auth.signUp({ email, password });
+
+      // 12s safety timeout. If signInWithPassword hangs (browser navigator-lock
+      // contention, dead network), release the button with a clear error rather
+      // than leaving "..." forever.
+      const authPromise = mode === "signin"
+        ? c.auth.signInWithPassword({ email, password })
+        : c.auth.signUp({ email, password });
+
+      const timeout = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("Sign in took too long. Try again or refresh the page.")), 12000)
+      );
+
+      const res = (await Promise.race([authPromise, timeout])) as Awaited<typeof authPromise>;
+
       if (res.error) { setErr(res.error.message); return; }
       if (mode === "signup" && !res.data.session) {
         setMsg("Check your email for a confirmation link, then sign in.");
         setMode("signin");
         return;
       }
-      router.replace("/");
-    } finally { setBusy(false); }
+
+      // Hard navigation instead of router.replace to sidestep the auth-listener
+      // redirect race in providers.tsx — Providers will bootstrap fresh with the
+      // new session already in localStorage.
+      const target = process.env.NODE_ENV === "production" ? "/stock-app-v2/" : "/";
+      window.location.assign(target);
+    } catch (e: unknown) {
+      setErr(e instanceof Error ? e.message : "Sign in failed. Please try again.");
+    } finally {
+      setBusy(false);
+    }
   };
 
   return (

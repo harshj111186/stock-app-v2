@@ -58,6 +58,11 @@ export function Providers({ children }: { children: ReactNode }) {
         clearTimeout(failsafe);
         return;
       }
+      // Keep loading=true while we resolve the profile. The redirect effect
+      // early-returns on loading, so this prevents a /login bounce during the
+      // brief window where the session exists but the profile fetch is still
+      // in flight — which is what made Sign in appear stuck on "...".
+      setLoading(true);
       const prof = await fetchProfile(session.user.id);
       if (cancelled) return;
       setProfile(prof);
@@ -75,6 +80,7 @@ export function Providers({ children }: { children: ReactNode }) {
           clearTimeout(failsafe);
           return;
         }
+        setLoading(true);
         const prof = await fetchProfile(session.user.id);
         if (cancelled) return;
         setProfile(prof);
