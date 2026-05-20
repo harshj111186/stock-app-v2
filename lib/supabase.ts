@@ -4,9 +4,31 @@ import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 const url = process.env.NEXT_PUBLIC_SUPABASE_URL!;
 const key = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
 
+// supabase-js uses navigator.locks to serialize auth-token operations across
+// tabs. The v1 app at /stock-app/ and v2 app at /stock-app-v2/ share the
+// harshj111186.github.io origin and the same storageKey, so they fight for
+// the same lock. When the lock gets wedged (verified live with
+// navigator.locks.query() — "held" with no pending requesters), every auth
+// call hangs: sign-in succeeds but fetchProfile in providers.tsx times out
+// at 10s, profile stays null, redirect bounces to /login.
+//
+// Bypassing the lock makes auth calls fire immediately. The trade-off is
+// that two open tabs might both refresh the token at the same time, which
+// Supabase handles fine — duplicate refreshes resolve to the same token.
+type LockFn = <R>(name: string, acquireTimeout: number, fn: () => Promise<R>) => Promise<R>;
+const lockNoop: LockFn = async (_name, _acquireTimeout, fn) => fn();
+
 let _client: SupabaseClient | null = null;
 export function sb(): SupabaseClient {
-  if (!_client) _client = createClient(url, key, { auth: { persistSession: true, autoRefreshToken: true } });
+  if (!_client) {
+    _client = createClient(url, key, {
+      auth: {
+        persistSession: true,
+        autoRefreshToken: true,
+        lock: lockNoop,
+      },
+    });
+  }
   return _client;
 }
 
