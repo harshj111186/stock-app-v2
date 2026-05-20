@@ -54,7 +54,20 @@ export type Item = {
   created_at: string;
 };
 export type Stock = { item_id: string; godown: "A" | "B"; cases: number; loose: number };
-export type Pricing = { item_id: string; lp: number; discount: number; gst_rate: number; effective_from: string };
+export type Pricing = {
+  item_id: string;
+  lp: number;
+  // Combined effective discount fraction (1 - product(1 - d_i)). Kept in
+  // sync with `discounts` by the app on save so existing readers (e.g. the
+  // dashboard's stock-value formula) keep working without joining the array.
+  discount: number;
+  // Breakdown of the discount stack. Each entry is a fraction applied to
+  // the price AFTER the preceding entry. e.g. [0.40, 0.05] = 40% off, then
+  // a further 5% off the discounted price. May be empty.
+  discounts: number[];
+  gst_rate: number;
+  effective_from: string;
+};
 export type Txn = {
   id: string;
   item_id: string;
