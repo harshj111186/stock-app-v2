@@ -230,6 +230,64 @@ If you must touch one of these files: **read first, edit surgically, never repla
 
 ## 11. Changelog (latest first — add new entries at the top)
 
+### 2026-05-21 — Transactions page: case-size popup on Add-to-queue + repo hygiene
+
+**User ask:** "in transaction for adjustment or purchase etc, if an item with no case size is purchased or sold or adjusted, then before processing directly to loose, a popup should appear asking for case size, once entered the case size for that item, it should process things accordingly."
+
+**The problem.** Items in the catalogue that haven't had a case size set (`items.case_size = 0`) force loose-only entry on the Transactions page — the form hides Cartons + Loose and shows a single Quantity field. That's correct for legitimately loose-only items (think single screws), but it's also what happens for items that SHOULD have a case size but nobody's set one yet. Staff would silently process 60 units of a fan into Godown A as "60 loose", which is fine math-wise but loses the carton structure forever (well, until someone goes to Items and sets case size manually, then runs corrective adjustments).
+
+**The fix.** A new **case-size popup** intercepts Add-to-queue when the selected item has `case_size = 0`:
+
+- **Admin** sees the modal with an editable case-size input. Enter, say, 12. The modal previews "Will split as 5 cartons + 0 loose = 60 units" if the pending qty is 60. Click **Set case size & add**: the modal saves `items.case_size = 12`, refreshes the items list locally, re-splits the row's loose-only quantity into 5 cartons + 0 loose (total_qty unchanged — the RPC still gets 60), then queues the row. Future entries for this item will show the proper Cartons + Loose fields automatically.
+- **Staff / viewer** see the modal but the case-size input is replaced with an amber "Admin only" note (`items` table is admin-write-only via RLS). They get **Skip — add as loose** and **Cancel** as the only options.
+- **Skip — add as loose** is available to everyone. Queues the row exactly as built, with `case_size = 0` still on the item. Useful for items that really are loose-only — and required by staff who can't set case size themselves.
+- **Cancel** dismisses the modal without queueing.
+
+The popup triggers for **all 5 action types** (Purchase, Sale, Transfer, Adjustment, Return) — the user explicitly asked for "purchased or sold or adjusted" and the Return / Transfer cases are symmetric.
+
+**Item-picker hint.** The picker dropdown now shows a small amber **"no case"** badge on items with `case_size = 0`, so the user knows BEFORE they pick that the popup will appear. Items with a case size keep the existing `case×N` badge.
+
+**Pre-flight stock simulation already DTRT.** Once admin sets the case size, `reload()` refreshes the items array, and the queue's `useMemo` pre-flight re-computes — picking up the new `case_size` for godown-total math on any existing queue rows for that item. No special handling needed; the existing reactive chain just works.
+
+**Files patched**
+
+- `app/transactions/page.tsx` (1083 → 1296 lines, +213):
+  - New state: `pendingCaseSize`, `savingCaseSize`. Derived `isAdmin` from auth profile.
+  - New `Boxes` import from lucide (icon used in the modal header).
+  - `addToQueue` refactored: builds the row, then gates on `selectedItem.case_size === 0` — if true, parks the row in `pendingCaseSize` instead of queuing. The actual push-to-queue is moved to a new `doAddToQueue(row)` helper called by both the no-gate path and the modal handlers.
+  - New `saveCaseSizeAndAdd(newSize)` — admin-only: writes `items.case_size`, reloads, re-splits cartons/loose from the parked row's total, calls `doAddToQueue`.
+  - New `skipCaseSizeAndAdd()` — queues the parked row as-is.
+  - New `cancelCaseSize()` — dismisses the modal, parked row discarded.
+  - New `CaseSizeModal` component at the bottom of the file (~110 lines): backdrop click + Esc key both cancel (only when not saving), live cartons/loose preview, role-aware button row.
+  - `ItemPicker` got the small `no case` amber badge for `case_size === 0` items.
+
+- `.gitignore` (extra line):
+  - Added `.claude/` to the OS/editor block (sits alongside `.vscode/` and `.idea/` — same pattern: per-user IDE/tool config, not project state).
+
+- `package-lock.json` — newly committed.
+
+- `PROGRESS.md` — this entry.
+
+**Why `.gitignore` + `package-lock.json` ride along with the feature PR.** Both were unresolved loose ends flagged in the prior session's audit:
+- `.claude/launch.json` is a Claude Code dev-server launch config (`npm run dev` on port 3000). Tool-specific, regenerable, prone to per-user drift — same shape as `.vscode/launch.json` which is already gitignored. Excluding it now prevents accidental commits.
+- `package-lock.json` had appeared as an untracked 94 KB file at the repo root after a local `npm install`. The deploy workflow (`.github/workflows/deploy.yml`) currently does `npm ci || npm install` — without a committed lockfile it always falls through to the slower, non-deterministic `npm install`. Committing the lockfile makes CI deterministic (same transitive versions every build, eliminating the risk of a patch update breaking a deploy with no code change) and shaves ~5–15 seconds off the install step. The flip side is that future `npm install`s update the file — small diff noise, big determinism win.
+
+**Edge cases handled**
+
+- **Esc closes the modal**, click-outside the panel closes it (both gated on `!saving` so a mid-save click doesn't interrupt the update).
+- **Invalid case-size input** (e.g. "0", "-1", "1.5") shows a rose "Enter a whole number ≥ 1" hint and keeps the Save button disabled.
+- **Saving error** (e.g. RLS reject because the user is actually staff masquerading) surfaces a rose toast with the Postgres error text; the modal stays open so the user can choose Skip.
+- **Already-queued rows for the same item** before the case size was set: their `total_qty` is correct (the math worked loose-only). After case_size is set, future processing still calls the RPC with `p_qty: total_qty` and the SQL `process_transaction` does its own carton/loose split using the current `items.case_size`. So already-queued rows just inherit the new structure automatically.
+- **Re-opening the modal** for the same item if the user cancelled and re-clicked Add-to-queue: state resets, no stale values carried over.
+
+**Follow-ups (not blocking)**
+
+- Once enough items get case sizes set on the fly via this popup, the Items page's case-size column will see fewer 0s. May be worth a "last set" timestamp column if we ever want to audit how case sizes were filled in.
+- The item-picker's "no case" badge could be extended to other "missing data" flags (no HSN, no GST rate, etc.) for catalogue completeness at a glance. Out of scope here.
+- Staff currently can't update `items.case_size` even via this popup (RLS denies). If we want to let staff propose a case size and have admin approve later, we'd need a new `case_size_proposals` table + approval flow. Not asked for.
+
+---
+
 ### 2026-05-21 — Transactions page: batch-queue mode with pre-flight stock check
 
 **User ask:** "many time the staff first enter sales for which purchase has to go first to show the stocks and then it leads to error, so i want data entry setup in transaction to be better in a way that the staff can enter all the details in 1 go for all sales, purchase, transfer etc. when he clicks process, u process them in a way that purchase then transfer then sales, like that. if there is a return too then process the return which adds the stock back to us and then process the return which lessen the stock so that no error arrives saying no stock while processing any outward transaction."

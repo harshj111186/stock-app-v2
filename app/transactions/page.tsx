@@ -3,7 +3,7 @@ import { Fragment, useEffect, useMemo, useState } from "react";
 import {
   ArrowDownToLine, ArrowUpFromLine, ArrowLeftRight, Wrench, Undo2,
   Search, RotateCcw, Loader2, CheckCircle2, AlertCircle,
-  ArrowDown, ArrowUp, Plus, Play, Trash2, X, ListChecks,
+  ArrowDown, ArrowUp, Plus, Play, Trash2, X, ListChecks, Boxes,
 } from "lucide-react";
 import { Shell } from "@/components/shell";
 import { useAuth } from "@/app/providers";
@@ -150,6 +150,13 @@ export default function TransactionsPage() {
   const [processing, setProcessing] = useState(false);
   const [processIdx, setProcessIdx] = useState<number>(0);
   const [processErrors, setProcessErrors] = useState<ProcessError[]>([]);
+
+  // ── case-size gate: if the user is adding a row for an item with no
+  // case_size, intercept and prompt for one before the row hits the queue.
+  // Admin can save the new case_size to items; staff can only skip-as-loose.
+  const [pendingCaseSize, setPendingCaseSize] = useState<{ itemId: string; rowToAdd: QueuedTxn } | null>(null);
+  const [savingCaseSize, setSavingCaseSize] = useState(false);
+  const isAdmin = profile?.role === "admin";
 
   useEffect(() => {
     try {
@@ -302,13 +309,76 @@ export default function TransactionsPage() {
       date: f.date,
     };
 
-    setQueue((q) => [...q, row]);
-    setProcessErrors((errs) => errs); // unchanged; preserved errors stay attached to surviving uids
-    try { localStorage.setItem("txn.lastAction", f.action); } catch {}
+    // Gate: if the selected item has no case_size yet, intercept the add
+    // and ask the user to set one (or skip and accept loose-only) before
+    // anything goes into the queue. The pending row is parked in state;
+    // saveCaseSizeAndAdd / skipCaseSizeAndAdd resume the add.
+    if (selectedItem.case_size === 0) {
+      setPendingCaseSize({ itemId: selectedItem.id, rowToAdd: row });
+      return;
+    }
 
+    doAddToQueue(row);
+  };
+
+  // The actual queue-push, separated so the case-size modal can call it
+  // after either Save-and-continue or Skip-as-loose.
+  const doAddToQueue = (row: QueuedTxn) => {
+    setQueue((q) => [...q, row]);
+    try { localStorage.setItem("txn.lastAction", row.action); } catch {}
     // Keep item + godown + action + date for fast repeat entry; clear the rest.
     setF((x) => ({ ...x, cartons: "", loose: "", rate: "", invoice_no: "", party_name: "", reason: "" }));
-    showToast("ok", `Queued ${f.action} of ${fmtN(totalQty)} unit${totalQty === 1 ? "" : "s"}.`);
+    showToast("ok", `Queued ${row.action} of ${fmtN(row.total_qty)} unit${row.total_qty === 1 ? "" : "s"}.`);
+  };
+
+  // Admin path from the modal: writes the new case_size to items, reloads,
+  // re-splits the pending row's loose-only qty into cartons + loose for the
+  // queue display, then completes the add.
+  const saveCaseSizeAndAdd = async (newSize: number) => {
+    if (!pendingCaseSize) return;
+    if (!isAdmin) { showToast("bad", "Only admins can set case size."); return; }
+    if (!Number.isInteger(newSize) || newSize < 1) { showToast("bad", "Case size must be a whole number ≥ 1."); return; }
+
+    setSavingCaseSize(true);
+    try {
+      const { error } = await sb()
+        .from("items")
+        .update({ case_size: newSize })
+        .eq("id", pendingCaseSize.itemId);
+      if (error) throw error;
+
+      // Refresh items so the form (and pre-flight, and any future picker
+      // selection of this item) sees the new case size.
+      await reload();
+
+      // Re-split the row's loose-only quantity into cartons + loose so the
+      // queue table reads naturally. total_qty is unchanged → the RPC still
+      // gets the same number.
+      const total = pendingCaseSize.rowToAdd.total_qty;
+      const cartons = Math.floor(total / newSize);
+      const loose = total - cartons * newSize;
+      const updatedRow: QueuedTxn = { ...pendingCaseSize.rowToAdd, cartons, loose };
+
+      doAddToQueue(updatedRow);
+      setPendingCaseSize(null);
+      showToast("ok", `Case size set to ${newSize}; queued ${updatedRow.action}.`);
+    } catch (e: any) {
+      showToast("bad", e?.message || "Failed to update case size.");
+    } finally {
+      setSavingCaseSize(false);
+    }
+  };
+
+  // Staff (or anyone) escape hatch: queue the row as-is, item.case_size stays 0.
+  // process_transaction handles cs=0 items as loose-only on the DB side.
+  const skipCaseSizeAndAdd = () => {
+    if (!pendingCaseSize) return;
+    doAddToQueue(pendingCaseSize.rowToAdd);
+    setPendingCaseSize(null);
+  };
+
+  const cancelCaseSize = () => {
+    setPendingCaseSize(null);
   };
 
   const removeFromQueue = (uid: string) => {
@@ -827,6 +897,19 @@ export default function TransactionsPage() {
         </div>
       )}
 
+      {pendingCaseSize && itemById.get(pendingCaseSize.itemId) && (
+        <CaseSizeModal
+          item={itemById.get(pendingCaseSize.itemId)!}
+          pendingQty={pendingCaseSize.rowToAdd.total_qty}
+          pendingAction={pendingCaseSize.rowToAdd.action}
+          isAdmin={isAdmin}
+          saving={savingCaseSize}
+          onSave={saveCaseSizeAndAdd}
+          onSkip={skipCaseSizeAndAdd}
+          onCancel={cancelCaseSize}
+        />
+      )}
+
       {toast && (
         <div className={[
           "fixed bottom-4 right-4 z-30 px-4 py-2 rounded-md text-sm shadow-lg flex items-center gap-2 max-w-md",
@@ -1071,13 +1154,143 @@ function ItemPicker({
                 <div className="truncate">{i.brand && <span className="text-zinc-400">{i.brand} · </span>}{i.model}</div>
                 <div className="text-[11px] text-zinc-500 truncate">{i.size} · {i.colour} · {i.item_code}</div>
               </div>
-              {i.case_size > 0 && (
-                <span className="text-[10px] text-zinc-400 tnum whitespace-nowrap">case×{i.case_size}</span>
-              )}
+              {i.case_size > 0
+                ? <span className="text-[10px] text-zinc-400 tnum whitespace-nowrap">case×{i.case_size}</span>
+                : <span className="text-[10px] text-amber-500 tnum whitespace-nowrap" title="No case size set yet">no case</span>}
             </button>
           ))}
         </div>
       )}
+    </div>
+  );
+}
+
+// ─── case-size modal ──────────────────────────────────────────────────────
+// Shown when the user clicks Add-to-queue with an item that has case_size=0.
+// Admin: set a new case size on items + queue the row split into cartons/loose.
+// Staff: only the "skip — add as loose" path is available (items table is
+// admin-write-only). Pre-flight stock simulation in the page uses the same
+// item.case_size, so once admin sets it, future queue rows for this item
+// see the right total math too.
+function CaseSizeModal({
+  item, pendingQty, pendingAction, isAdmin, saving, onSave, onSkip, onCancel,
+}: {
+  item: Item;
+  pendingQty: number;
+  pendingAction: string;
+  isAdmin: boolean;
+  saving: boolean;
+  onSave: (size: number) => void;
+  onSkip: () => void;
+  onCancel: () => void;
+}) {
+  const [sizeStr, setSizeStr] = useState("");
+  const n = Number(sizeStr || 0);
+  const valid = Number.isInteger(n) && n >= 1;
+  const cartons = valid ? Math.floor(pendingQty / n) : 0;
+  const loose = valid ? pendingQty - cartons * n : pendingQty;
+  const itemLabel = `${item.brand ? item.brand + " · " : ""}${item.model} · ${item.size} · ${item.colour}`;
+
+  useEffect(() => {
+    const onEsc = (e: KeyboardEvent) => { if (e.key === "Escape" && !saving) onCancel(); };
+    window.addEventListener("keydown", onEsc);
+    return () => window.removeEventListener("keydown", onEsc);
+  }, [onCancel, saving]);
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm px-4"
+      onClick={() => { if (!saving) onCancel(); }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        className="w-full max-w-md bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg shadow-xl overflow-hidden"
+      >
+        <div className="px-5 py-4 border-b border-zinc-200 dark:border-zinc-800 flex items-start gap-3">
+          <div className="w-9 h-9 bg-amber-500/15 rounded-lg flex items-center justify-center flex-shrink-0">
+            <Boxes className="w-5 h-5 text-amber-600 dark:text-amber-400" />
+          </div>
+          <div className="flex-1 min-w-0">
+            <h3 className="text-sm font-semibold">Case size not set</h3>
+            <p className="text-xs text-zinc-500 mt-0.5 truncate" title={itemLabel}>{itemLabel}</p>
+          </div>
+          <button
+            type="button"
+            onClick={onCancel}
+            disabled={saving}
+            className="text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-200 disabled:opacity-40"
+            aria-label="Close"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+
+        <div className="p-5 space-y-4">
+          <div className="bg-zinc-50 dark:bg-zinc-800/40 rounded p-3 border border-zinc-200 dark:border-zinc-700/50">
+            <div className="text-[11px] uppercase tracking-wider text-zinc-500 mb-1">Pending {pendingAction.toLowerCase()}</div>
+            <div className="text-2xl font-semibold tnum text-zinc-900 dark:text-zinc-100">
+              {fmtN(pendingQty)} <span className="text-xs font-normal text-zinc-500">unit{pendingQty === 1 ? "" : "s"}</span>
+            </div>
+            <div className="text-[11px] text-zinc-500 mt-1">
+              Currently entered as loose-only. Set a case size to split into cartons + loose.
+            </div>
+          </div>
+
+          {isAdmin ? (
+            <div>
+              <Label>Case size (units per carton)</Label>
+              <Input
+                type="number" min="1" inputMode="numeric"
+                value={sizeStr}
+                onChange={(v) => setSizeStr(v.replace(/[^\d]/g, ""))}
+                placeholder="e.g. 12"
+              />
+              {valid && (
+                <div className="text-xs text-zinc-500 mt-1.5">
+                  Will split as <b className="tnum text-zinc-700 dark:text-zinc-200">{cartons}</b> carton{cartons === 1 ? "" : "s"} + <b className="tnum text-zinc-700 dark:text-zinc-200">{loose}</b> loose = {fmtN(pendingQty)} units.
+                </div>
+              )}
+              {sizeStr && !valid && (
+                <div className="text-xs text-rose-500 mt-1.5">Enter a whole number ≥ 1.</div>
+              )}
+            </div>
+          ) : (
+            <div className="text-xs text-amber-700 dark:text-amber-300 bg-amber-500/10 rounded p-2.5 border border-amber-500/20 leading-relaxed">
+              <b>Admin only.</b> Ask an admin to set the case size for this item, or skip and add as loose-only for now. The transaction still processes correctly either way — you just can't enter cartons until case size is set.
+            </div>
+          )}
+        </div>
+
+        <div className="px-5 py-3 border-t border-zinc-200 dark:border-zinc-800 flex flex-wrap items-center justify-end gap-2 bg-zinc-50/50 dark:bg-zinc-900/40">
+          <button
+            type="button"
+            onClick={onCancel}
+            disabled={saving}
+            className="text-xs text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-300 px-3 py-1.5 disabled:opacity-40"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            onClick={onSkip}
+            disabled={saving}
+            className="text-xs text-zinc-700 dark:text-zinc-200 hover:bg-zinc-100 dark:hover:bg-zinc-800 px-3 py-1.5 rounded-md border border-zinc-200 dark:border-zinc-700 disabled:opacity-40"
+          >
+            Skip — add as loose
+          </button>
+          {isAdmin && (
+            <button
+              type="button"
+              onClick={() => onSave(n)}
+              disabled={!valid || saving}
+              className="bg-cyan-500 hover:bg-cyan-400 disabled:opacity-40 disabled:cursor-not-allowed text-zinc-900 px-4 py-1.5 rounded-md text-xs font-medium flex items-center gap-2"
+            >
+              {saving ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <CheckCircle2 className="w-3.5 h-3.5" />}
+              Set case size &amp; add
+            </button>
+          )}
+        </div>
+      </div>
     </div>
   );
 }
