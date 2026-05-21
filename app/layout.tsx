@@ -3,10 +3,29 @@ import "./globals.css";
 import { Providers } from "./providers";
 import { InstallProvider } from "@/components/install-provider";
 
+// Next.js Metadata API does NOT auto-prefix `manifest` and `icons` hrefs
+// with basePath. The generated HTML ends up with:
+//
+//   <link rel="manifest" href="/manifest.webmanifest"/>
+//   <link rel="icon" href="/icon.svg" type="image/svg+xml"/>
+//
+// which the browser resolves against the host root, not the basePath —
+// so on `harshj111186.github.io/stock-app-v2/` it fetches
+// `harshj111186.github.io/manifest.webmanifest` and 404s. Chrome DevTools
+// then says "No manifest detected" and silently disables install.
+//
+// We hardcode the basePath here (matches `repo` in next.config.mjs +
+// `BASE` in app/manifest.ts). NODE_ENV gates so dev (basePath="") still
+// works locally.
+const isProd = process.env.NODE_ENV === "production";
+const BASE   = isProd ? "/stock-app-v2" : "";
+
 export const metadata: Metadata = {
   title: "Stock Manager",
   description: "Two-godown stock manager — v2",
   applicationName: "Stock Manager",
+  // Explicit basePath-prefixed manifest URL — see header comment.
+  manifest: `${BASE}/manifest.webmanifest`,
   appleWebApp: {
     capable: true,
     title: "Stock Manager",
@@ -16,8 +35,8 @@ export const metadata: Metadata = {
     startupImage: undefined,
   },
   icons: {
-    icon: [{ url: "/icon.svg", type: "image/svg+xml" }],
-    apple: [{ url: "/icon.svg", type: "image/svg+xml" }],
+    icon:  [{ url: `${BASE}/icon.svg`, type: "image/svg+xml" }],
+    apple: [{ url: `${BASE}/icon.svg`, type: "image/svg+xml" }],
   },
   formatDetection: { telephone: false },
 };
