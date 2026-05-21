@@ -3,7 +3,7 @@ import { Fragment, useEffect, useMemo, useState } from "react";
 import {
   ArrowDownToLine, ArrowUpFromLine, ArrowLeftRight, Wrench, Undo2,
   Search, RotateCcw, Loader2, CheckCircle2, AlertCircle,
-  ArrowDown, ArrowUp,
+  ArrowDown, ArrowUp, Plus, Play, Trash2, X, ListChecks,
 } from "lucide-react";
 import { Shell } from "@/components/shell";
 import { useAuth } from "@/app/providers";
@@ -29,6 +29,29 @@ type FormState = {
   date: string;
 };
 
+// A row queued for batch processing. Captures all user-entered fields plus
+// the computed total_qty and resolved direction so the queue table can render
+// and the processor can fire RPCs without re-doing form math.
+type QueuedTxn = {
+  uid: string;
+  action: ActionKind;
+  item_id: string;
+  godown: "A" | "B";
+  to_godown: "A" | "B";
+  cartons: number;
+  loose: number;
+  total_qty: number;
+  rate: string;
+  invoice_no: string;
+  party_name: string;
+  reason: string;
+  return_dir: 1 | -1;
+  direction: number | null; // null for Purchase/Sale/Transfer (SQL resolves); ±1 for Adj/Return
+  date: string;
+};
+
+type ProcessError = { rowUid: string; message: string };
+
 const TODAY = () => new Date().toISOString().slice(0, 10);
 
 const initialForm = (): FormState => ({
@@ -48,10 +71,8 @@ const initialForm = (): FormState => ({
 
 const ALL_ACTIONS: ActionKind[] = ["Purchase", "Sale", "Transfer", "Adjustment", "Return"];
 
-// Adjustment Reason → direction. The dropdown is visually grouped into
-// "Stock goes UP" and "Stock goes DOWN"; the value strings here are the
-// keys saved on transactions.note. The DB doesn't parse them — it just
-// trusts the p_direction we pass alongside.
+// Adjustment Reason → direction. Slugs map to ±1; SQL never parses these
+// strings, it trusts the p_direction we pass alongside.
 const ADJ_DIRECTION: Record<string, 1 | -1> = {
   found: 1,
   count_up: 1,
@@ -60,6 +81,52 @@ const ADJ_DIRECTION: Record<string, 1 | -1> = {
   lost: -1,
   count_down: -1,
 };
+
+// ─── queue helpers ────────────────────────────────────────────────────────
+// Processing priority — LOWER runs first. The whole point of the queue is
+// to maximise stock at every godown before any outbound move is attempted,
+// so the order is:
+//   1 = Purchase                 (+ stock at chosen godown)
+//   2 = Adjustment going up      (+ stock at chosen godown)
+//   3 = Customer return          (+ stock at chosen godown)
+//   4 = Transfer                 (move between A and B)
+//   5 = Adjustment going down    (- stock at chosen godown)
+//   6 = Sale                     (- stock at chosen godown)
+//   7 = Supplier return          (- stock at chosen godown)
+function priorityOf(t: QueuedTxn): number {
+  if (t.action === "Purchase") return 1;
+  if (t.action === "Adjustment") return t.direction === 1 ? 2 : 5;
+  if (t.action === "Return")     return t.return_dir === 1 ? 3 : 7;
+  if (t.action === "Transfer")   return 4;
+  if (t.action === "Sale")       return 6;
+  return 99;
+}
+
+const PRIORITY_LABEL: Record<number, string> = {
+  1: "1 · Purchase",
+  2: "2 · Adj UP",
+  3: "3 · Cust return",
+  4: "4 · Transfer",
+  5: "5 · Adj DOWN",
+  6: "6 · Sale",
+  7: "7 · Supp return",
+};
+
+// Effect on stock per (item, godown). Transfer affects two godowns at once.
+type StockDelta = { godown: "A" | "B"; delta: number; transferTo?: { godown: "A" | "B"; delta: number } };
+function deltaOf(t: QueuedTxn): StockDelta {
+  const q = t.total_qty;
+  if (t.action === "Purchase") return { godown: t.godown, delta: +q };
+  if (t.action === "Sale")     return { godown: t.godown, delta: -q };
+  if (t.action === "Transfer") return { godown: t.godown, delta: -q, transferTo: { godown: t.to_godown, delta: +q } };
+  if (t.action === "Adjustment") return { godown: t.godown, delta: (t.direction || 0) * q };
+  if (t.action === "Return")     return { godown: t.godown, delta: (t.return_dir || 0) * q };
+  return { godown: t.godown, delta: 0 };
+}
+
+function makeUid(): string {
+  return Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+}
 
 // ─── page ─────────────────────────────────────────────────────────────────
 export default function TransactionsPage() {
@@ -72,12 +139,17 @@ export default function TransactionsPage() {
   const [loaded, setLoaded] = useState(false);
 
   const [f, setF] = useState<FormState>(initialForm());
-  const [submitting, setSubmitting] = useState(false);
   const [toast, setToast] = useState<{ kind: "ok" | "bad"; text: string } | null>(null);
 
   const [logFilter, setLogFilter] = useState<ActionKind | "">("");
   const [logQuery, setLogQuery] = useState("");
   const [reversingId, setReversingId] = useState<string | null>(null);
+
+  // ── batch queue state ──────────────────────────────────────────────────
+  const [queue, setQueue] = useState<QueuedTxn[]>([]);
+  const [processing, setProcessing] = useState(false);
+  const [processIdx, setProcessIdx] = useState<number>(0);
+  const [processErrors, setProcessErrors] = useState<ProcessError[]>([]);
 
   useEffect(() => {
     try {
@@ -122,21 +194,13 @@ export default function TransactionsPage() {
   const looseN = Number(f.loose || 0);
   const totalQty = cs > 0 ? cartonsN * cs + looseN : looseN;
 
-  const sourceStock = selectedItem ? stock[selectedItem.id]?.[f.godown] : null;
-  const sourceTotal = sourceStock
-    ? (selectedItem!.case_size || 0) > 0
-      ? sourceStock.cases * (selectedItem!.case_size || 1) + sourceStock.loose
-      : sourceStock.loose
-    : 0;
-
   const showToast = (kind: "ok" | "bad", text: string) => {
     setToast({ kind, text });
     setTimeout(() => setToast(null), 4000);
   };
 
-  // Direction the current form will produce. -1 means stock leaves the
-  // selected godown; +1 means it enters. For Transfer the SOURCE side is
-  // -1 and the DB writes the destination side implicitly.
+  // Direction the current form will produce (-1, +1, or null for actions where
+  // the SQL resolves it).
   const formDirection: 1 | -1 | null = (() => {
     if (f.action === "Purchase") return 1;
     if (f.action === "Sale") return -1;
@@ -146,70 +210,177 @@ export default function TransactionsPage() {
     return null;
   })();
 
-  const submit = async () => {
+  // Queue sorted by processing priority — this IS the order rows will run in.
+  const sortedQueue = useMemo(() => {
+    return [...queue].sort((a, b) => {
+      const dp = priorityOf(a) - priorityOf(b);
+      if (dp !== 0) return dp;
+      return a.uid.localeCompare(b.uid); // stable tiebreak by insertion
+    });
+  }, [queue]);
+
+  // ── Pre-flight: simulate the stock walk for the queue ─────────────────
+  // For every item touched by the queue, start from its current godown
+  // balance and apply each row's delta in priority order. If any step would
+  // take a godown below zero, flag that row.
+  type RowSnapshot = { uid: string; A: number; B: number; warning?: string };
+  const preflight = useMemo<{ ok: boolean; snapshots: RowSnapshot[]; firstError: string | null }>(() => {
+    if (sortedQueue.length === 0) return { ok: true, snapshots: [], firstError: null };
+
+    const sim: Record<string, { A: number; B: number }> = {};
+    const getOrInit = (itemId: string) => {
+      if (sim[itemId]) return sim[itemId];
+      const s = stock[itemId];
+      const item = itemById.get(itemId);
+      const cs = item?.case_size || 0;
+      const aTotal = s?.A ? (cs > 0 ? s.A.cases * cs + s.A.loose : s.A.loose) : 0;
+      const bTotal = s?.B ? (cs > 0 ? s.B.cases * cs + s.B.loose : s.B.loose) : 0;
+      sim[itemId] = { A: aTotal, B: bTotal };
+      return sim[itemId];
+    };
+
+    const snapshots: RowSnapshot[] = [];
+    let firstError: string | null = null;
+
+    for (const t of sortedQueue) {
+      const cur = getOrInit(t.item_id);
+      const d = deltaOf(t);
+      const next = { A: cur.A, B: cur.B };
+      next[d.godown] += d.delta;
+      if (d.transferTo) next[d.transferTo.godown] += d.transferTo.delta;
+
+      let warning: string | undefined;
+      if (next.A < 0 || next.B < 0) {
+        const failG: "A" | "B" = next.A < 0 ? "A" : "B";
+        const item = itemById.get(t.item_id);
+        const label = item ? `${item.brand ? item.brand + " · " : ""}${item.model} ${item.size}` : "item";
+        warning = `Godown ${failG} would go to ${next[failG]} (have ${cur[failG]}, need ${Math.abs(d.delta + (d.transferTo?.godown === failG ? d.transferTo.delta : 0))})`;
+        if (!firstError) firstError = `${label}: ${warning}`;
+      }
+
+      sim[t.item_id] = next;
+      snapshots.push({ uid: t.uid, A: next.A, B: next.B, warning });
+    }
+
+    return { ok: firstError === null, snapshots, firstError };
+  }, [sortedQueue, stock, itemById]);
+
+  // ── Add the current form to the queue (does NOT hit the DB) ───────────
+  const addToQueue = () => {
     if (!canWrite) { showToast("bad", "Read-only role can't log transactions."); return; }
     if (!selectedItem) { showToast("bad", "Pick an item first."); return; }
     if (totalQty <= 0) { showToast("bad", "Quantity must be greater than zero."); return; }
-
     if (f.action === "Transfer" && f.godown === f.to_godown) {
       showToast("bad", "From and To godowns must differ."); return;
     }
 
-    // Resolve the explicit direction we'll pass to the RPC. Adjustment +
-    // Return REQUIRE it; everything else passes null and the SQL resolves
-    // direction from the action.
-    let p_direction: number | null = null;
+    let direction: number | null = null;
     if (f.action === "Adjustment") {
       if (!f.reason) { showToast("bad", "Pick a reason for the adjustment."); return; }
       const d = ADJ_DIRECTION[f.reason];
       if (d !== 1 && d !== -1) { showToast("bad", "Pick a valid reason."); return; }
-      p_direction = d;
+      direction = d;
     } else if (f.action === "Return") {
-      p_direction = f.return_dir;
+      direction = f.return_dir;
     }
 
-    // Outbound moves need enough stock at the source. Sale, Transfer, and
-    // any -1 Adjustment/Return all share the same check.
-    const isOutbound =
-      f.action === "Sale" ||
-      f.action === "Transfer" ||
-      (f.action === "Adjustment" && p_direction === -1) ||
-      (f.action === "Return" && p_direction === -1);
-    if (isOutbound && totalQty > sourceTotal) {
-      showToast("bad", `Insufficient stock at Godown ${f.godown} (have ${sourceTotal}).`);
+    const row: QueuedTxn = {
+      uid: makeUid(),
+      action: f.action,
+      item_id: selectedItem.id,
+      godown: f.godown,
+      to_godown: f.to_godown,
+      cartons: cartonsN,
+      loose: looseN,
+      total_qty: totalQty,
+      rate: f.rate,
+      invoice_no: f.invoice_no,
+      party_name: f.party_name,
+      reason: f.reason,
+      return_dir: f.return_dir,
+      direction,
+      date: f.date,
+    };
+
+    setQueue((q) => [...q, row]);
+    setProcessErrors((errs) => errs); // unchanged; preserved errors stay attached to surviving uids
+    try { localStorage.setItem("txn.lastAction", f.action); } catch {}
+
+    // Keep item + godown + action + date for fast repeat entry; clear the rest.
+    setF((x) => ({ ...x, cartons: "", loose: "", rate: "", invoice_no: "", party_name: "", reason: "" }));
+    showToast("ok", `Queued ${f.action} of ${fmtN(totalQty)} unit${totalQty === 1 ? "" : "s"}.`);
+  };
+
+  const removeFromQueue = (uid: string) => {
+    setQueue((q) => q.filter((t) => t.uid !== uid));
+    setProcessErrors((errs) => errs.filter((e) => e.rowUid !== uid));
+  };
+
+  const clearQueue = () => {
+    if (queue.length === 0) return;
+    if (!confirm(`Clear all ${queue.length} queued ${queue.length === 1 ? "entry" : "entries"}?`)) return;
+    setQueue([]);
+    setProcessErrors([]);
+  };
+
+  // ── Run the entire queue in safe order ────────────────────────────────
+  const processQueue = async () => {
+    if (queue.length === 0) return;
+    if (!canWrite) { showToast("bad", "Read-only role can't process."); return; }
+    if (!preflight.ok) {
+      showToast("bad", "Fix the pre-flight error before processing.");
       return;
     }
 
-    setSubmitting(true);
-    try {
-      const note = [
-        f.reason && `reason: ${f.reason}`,
-        f.invoice_no && `inv: ${f.invoice_no}`,
-        f.party_name && `party: ${f.party_name}`,
-        f.rate && `rate: ${f.rate}`,
-      ].filter(Boolean).join(" • ") || null;
+    setProcessing(true);
+    setProcessErrors([]);
+    setProcessIdx(0);
 
-      const { data, error } = await sb().rpc("process_transaction", {
-        p_item_id: selectedItem.id,
-        p_action: f.action,
-        p_godown: f.godown,
-        p_qty: totalQty,
-        p_date: f.date,
-        p_note: note,
-        p_direction,
-      });
-      if (error) throw error;
+    const failures: ProcessError[] = [];
+    let processed = 0;
 
-      try { localStorage.setItem("txn.lastAction", f.action); } catch {}
+    for (let i = 0; i < sortedQueue.length; i++) {
+      setProcessIdx(i);
+      const t = sortedQueue[i];
+      try {
+        const note = [
+          t.reason && `reason: ${t.reason}`,
+          t.invoice_no && `inv: ${t.invoice_no}`,
+          t.party_name && `party: ${t.party_name}`,
+          t.rate && `rate: ${t.rate}`,
+        ].filter(Boolean).join(" • ") || null;
 
-      setF((x) => ({ ...x, cartons: "", loose: "", rate: "", invoice_no: "", party_name: "", reason: "" }));
-      showToast("ok", `${f.action} saved (#${(data ?? "").toString().slice(0, 8)}).`);
-      await reload();
-    } catch (e: any) {
-      showToast("bad", e.message || "Failed to save transaction.");
-    } finally {
-      setSubmitting(false);
+        const { error } = await sb().rpc("process_transaction", {
+          p_item_id: t.item_id,
+          p_action: t.action,
+          p_godown: t.godown,
+          p_qty: t.total_qty,
+          p_date: t.date,
+          p_note: note,
+          p_direction: t.direction,
+        });
+        if (error) throw error;
+        processed++;
+      } catch (e: any) {
+        failures.push({ rowUid: t.uid, message: e?.message || "Unknown error" });
+      }
     }
+
+    setProcessIdx(sortedQueue.length);
+    setProcessing(false);
+
+    if (failures.length === 0) {
+      setQueue([]);
+      showToast("ok", `Processed ${processed} transaction${processed === 1 ? "" : "s"}.`);
+    } else {
+      // Keep only the failed rows so the user can fix and retry.
+      const failedUids = new Set(failures.map((f) => f.rowUid));
+      setQueue((q) => q.filter((t) => failedUids.has(t.uid)));
+      setProcessErrors(failures);
+      showToast("bad", `Processed ${processed}, ${failures.length} failed — see queue.`);
+    }
+
+    await reload();
   };
 
   const reverseRow = async (id: string) => {
@@ -241,17 +412,25 @@ export default function TransactionsPage() {
     return list;
   }, [txns, logFilter, logQuery, itemById]);
 
+  const queueCount = queue.length;
+  const errorMap = useMemo(() => {
+    const m = new Map<string, string>();
+    processErrors.forEach((e) => m.set(e.rowUid, e.message));
+    return m;
+  }, [processErrors]);
+
   return (
     <Shell title="Transactions">
       <div className="flex items-center justify-between mb-6">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">Transactions</h1>
           <p className="text-sm text-zinc-500 mt-1">
-            {loaded ? `${txns.length} recent entries` : "Loading…"} — every stock change runs through <code className="text-[11px]">process_transaction()</code> atomically.
+            {loaded ? `${txns.length} recent entries` : "Loading…"} — batch entry: queue everything first, process in safe order so a Sale never fails before its Purchase has landed.
           </p>
         </div>
       </div>
 
+      {/* ── Entry form ─────────────────────────────────────────────────── */}
       <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg overflow-hidden mb-8">
         <div className="flex border-b border-zinc-200 dark:border-zinc-800">
           {ALL_ACTIONS.map((a) => {
@@ -498,20 +677,155 @@ export default function TransactionsPage() {
                 ? <span className="text-amber-500">Your role is read-only.</span>
                 : formDirection
                 ? <>All stock math runs in Postgres atomically. <span className="text-zinc-400">Direction:</span> <b className={formDirection === 1 ? "text-emerald-500" : "text-rose-500"}>{formDirection === 1 ? "+1 (in)" : "−1 (out)"}</b></>
-                : "All stock math runs in Postgres atomically."}
+                : "Pick a reason / direction to see the direction."}
             </div>
             <button
               type="button"
-              disabled={submitting || !canWrite}
-              onClick={submit}
+              disabled={processing || !canWrite}
+              onClick={addToQueue}
               className="bg-cyan-500 hover:bg-cyan-400 disabled:opacity-40 disabled:cursor-not-allowed text-zinc-900 px-4 py-2 rounded-md text-sm font-medium flex items-center gap-2"
             >
-              {submitting ? <Loader2 className="w-4 h-4 animate-spin" /> : <CheckCircle2 className="w-4 h-4" />}
-              {submitting ? "Saving…" : `Save ${f.action}`}
+              <Plus className="w-4 h-4" />
+              Add {f.action} to queue
             </button>
           </div>
         </div>
       </div>
+
+      {/* ── Queue panel ────────────────────────────────────────────────── */}
+      {queueCount > 0 && (
+        <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg overflow-hidden mb-8">
+          <div className="flex flex-wrap items-center gap-3 px-5 py-3 border-b border-zinc-200 dark:border-zinc-800">
+            <ListChecks className="w-4 h-4 text-cyan-500" />
+            <div className="flex-1 min-w-[180px]">
+              <div className="text-sm font-medium">Queue · {queueCount} {queueCount === 1 ? "entry" : "entries"}</div>
+              <div className="text-[11px] text-zinc-500">
+                Order: <b>Purchase → Adj UP → Customer return → Transfer → Adj DOWN → Sale → Supplier return.</b>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={clearQueue}
+              disabled={processing}
+              className="text-xs text-zinc-500 hover:text-rose-500 disabled:opacity-40 flex items-center gap-1"
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+              Clear all
+            </button>
+            <button
+              type="button"
+              onClick={processQueue}
+              disabled={processing || !preflight.ok || !canWrite}
+              className="bg-emerald-500 hover:bg-emerald-400 disabled:opacity-40 disabled:cursor-not-allowed text-zinc-900 px-4 py-2 rounded-md text-sm font-medium flex items-center gap-2"
+              title={!preflight.ok ? "Fix pre-flight error first" : "Process all queued entries"}
+            >
+              {processing
+                ? <><Loader2 className="w-4 h-4 animate-spin" /> Processing {processIdx + 1}/{queueCount}…</>
+                : <><Play className="w-4 h-4" /> Process queue ({queueCount})</>}
+            </button>
+          </div>
+
+          {/* pre-flight banner */}
+          {!preflight.ok && !processing && (
+            <div className="px-5 py-2 bg-rose-500/10 text-rose-700 dark:text-rose-300 text-xs flex items-center gap-2 border-b border-rose-500/20">
+              <AlertCircle className="w-3.5 h-3.5 flex-shrink-0" />
+              <span><b>Stock check failed:</b> {preflight.firstError}. Add more stock above this row in the queue, or remove the offending entry.</span>
+            </div>
+          )}
+          {preflight.ok && !processing && processErrors.length === 0 && (
+            <div className="px-5 py-2 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300 text-xs flex items-center gap-2 border-b border-emerald-500/20">
+              <CheckCircle2 className="w-3.5 h-3.5 flex-shrink-0" />
+              <span>All clear. Process will run {queueCount} {queueCount === 1 ? "entry" : "entries"} in the order shown below.</span>
+            </div>
+          )}
+          {processErrors.length > 0 && !processing && (
+            <div className="px-5 py-2 bg-rose-500/10 text-rose-700 dark:text-rose-300 text-xs flex items-center gap-2 border-b border-rose-500/20">
+              <AlertCircle className="w-3.5 h-3.5 flex-shrink-0" />
+              <span><b>{processErrors.length} {processErrors.length === 1 ? "entry" : "entries"} failed.</b> Survivors stay in the queue with the error attached — fix and click Process queue again.</span>
+            </div>
+          )}
+
+          <table className="w-full text-sm">
+            <thead className="bg-zinc-50 dark:bg-zinc-900/50">
+              <tr className="text-zinc-500 text-[11px] uppercase tracking-wider">
+                <th className="text-left px-5 py-2 font-medium">#</th>
+                <th className="text-left px-3 py-2 font-medium">Action</th>
+                <th className="text-left px-3 py-2 font-medium">Item</th>
+                <th className="text-left px-3 py-2 font-medium">Godown</th>
+                <th className="text-right px-3 py-2 font-medium">Qty</th>
+                <th className="text-right px-3 py-2 font-medium">A after</th>
+                <th className="text-right px-3 py-2 font-medium">B after</th>
+                <th className="text-left px-3 py-2 font-medium">Status</th>
+                <th className="text-right px-5 py-2 font-medium" />
+              </tr>
+            </thead>
+            <tbody>
+              {sortedQueue.map((t, i) => {
+                const it = itemById.get(t.item_id);
+                const snap = preflight.snapshots[i];
+                const procErr = errorMap.get(t.uid);
+                const dir = t.action === "Purchase" ? 1
+                  : t.action === "Sale" ? -1
+                  : t.action === "Transfer" ? -1
+                  : t.direction;
+                return (
+                  <tr key={t.uid} className={[
+                    "border-t border-zinc-100 dark:border-zinc-800/60",
+                    snap?.warning ? "bg-rose-500/5"
+                    : procErr ? "bg-rose-500/10"
+                    : "hover:bg-zinc-50 dark:hover:bg-zinc-800/30",
+                  ].join(" ")}>
+                    <td className="px-5 py-2.5 text-zinc-500 tnum">
+                      <span className="text-[10px] text-zinc-400">{PRIORITY_LABEL[priorityOf(t)]}</span>
+                    </td>
+                    <td className="px-3 py-2.5"><ActionBadge action={t.action} /></td>
+                    <td className="px-3 py-2.5">
+                      {it
+                        ? <span>{it.brand && <span className="text-zinc-400">{it.brand} · </span>}{it.model} <span className="text-zinc-500">· {it.size} · {it.colour}</span></span>
+                        : <span className="text-zinc-500">?</span>}
+                    </td>
+                    <td className="px-3 py-2.5 text-zinc-500">
+                      {t.godown}{t.action === "Transfer" && <span className="text-zinc-400"> → {t.to_godown}</span>}
+                    </td>
+                    <td className="px-3 py-2.5 text-right tnum">
+                      <span className="inline-flex items-center gap-1 justify-end">
+                        {dir === 1
+                          ? <span className="text-[10px] text-emerald-600 dark:text-emerald-400 font-medium">+ in</span>
+                          : <span className="text-[10px] text-rose-600 dark:text-rose-400 font-medium">− out</span>}
+                        <span>{fmtN(t.total_qty)}</span>
+                      </span>
+                    </td>
+                    <td className={`px-3 py-2.5 text-right tnum ${snap && snap.A < 0 ? "text-rose-500 font-medium" : "text-zinc-500"}`}>{snap ? fmtN(snap.A) : "—"}</td>
+                    <td className={`px-3 py-2.5 text-right tnum ${snap && snap.B < 0 ? "text-rose-500 font-medium" : "text-zinc-500"}`}>{snap ? fmtN(snap.B) : "—"}</td>
+                    <td className="px-3 py-2.5 text-xs">
+                      {procErr
+                        ? <span className="text-rose-600 dark:text-rose-300 inline-flex items-center gap-1"><AlertCircle className="w-3 h-3" /> {procErr}</span>
+                        : snap?.warning
+                        ? <span className="text-rose-600 dark:text-rose-300 inline-flex items-center gap-1"><AlertCircle className="w-3 h-3" /> {snap.warning}</span>
+                        : processing && i < processIdx
+                        ? <span className="text-emerald-600 dark:text-emerald-400 inline-flex items-center gap-1"><CheckCircle2 className="w-3 h-3" /> done</span>
+                        : processing && i === processIdx
+                        ? <span className="text-cyan-600 dark:text-cyan-400 inline-flex items-center gap-1"><Loader2 className="w-3 h-3 animate-spin" /> running</span>
+                        : <span className="text-zinc-400">queued</span>}
+                    </td>
+                    <td className="px-5 py-2.5 text-right">
+                      <button
+                        type="button"
+                        onClick={() => removeFromQueue(t.uid)}
+                        disabled={processing}
+                        className="text-zinc-400 hover:text-rose-500 disabled:opacity-40"
+                        title="Remove from queue"
+                      >
+                        <X className="w-4 h-4" />
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
 
       {toast && (
         <div className={[
@@ -524,6 +838,7 @@ export default function TransactionsPage() {
         </div>
       )}
 
+      {/* ── Transaction log ────────────────────────────────────────────── */}
       <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg overflow-hidden">
         <div className="flex items-center gap-3 px-5 py-3 border-b border-zinc-200 dark:border-zinc-800">
           <div className="text-sm font-medium">Transaction log</div>
@@ -574,8 +889,6 @@ export default function TransactionsPage() {
               const it = itemById.get(t.item_id);
               const isReversal = !!t.reverses_id;
               const alreadyReversed = txns.some((x) => x.reverses_id === t.id);
-              // Only Adjustment / Return rows expose direction in the log
-              // — Purchase/Sale/Transfer direction is implied by action.
               const showDirHint = t.action === "Adjustment" || t.action === "Return";
               return (
                 <tr key={t.id} className="border-t border-zinc-100 dark:border-zinc-800/60 hover:bg-zinc-50 dark:hover:bg-zinc-800/30">
