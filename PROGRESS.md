@@ -230,68 +230,226 @@ If you must touch one of these files: **read first, edit surgically, never repla
 
 ## 11. Changelog (latest first — add new entries at the top)
 
-### 2026-05-21 — Sales register report (first real Reports page)
+### 2026-05-21 — ABC analysis + Dead-stock reports (both placeholders → real)
 
-**User ask:** "now i want you to work on sales register."
+**User ask:** "analyse everything in stock-app-v2 and then build abc analysis and deadstock and ship them or push them, u have all the permissions to push it to git."
 
-**Context.** Reports was three placeholder pages all reading "Coming next session" since the v2 scaffold went live. Sales register is the highest-priority one — it's what the user actually needs to file GSTR-1 and tally daily revenue. The placeholder copy from May 14 promised "date range, party filter, GSTIN summary, and Excel/PDF export"; this turn delivers all four (PDF via browser Print → Save as PDF, Excel via CSV which opens directly in Excel).
+**Context.** Both pages had been 19-line `Construction` stubs since the v2 scaffold. With the Sales register landed earlier today, the Reports section now has three of three pages real. This entry covers both new pages in one PR because they share infrastructure (date-helpers, reversal handling, KPI shell, CSV-with-BOM, persisted localStorage state) and the user asked for them together.
+
+#### ABC analysis — `app/reports/abc/page.tsx`
+
+**The Pareto cut.** Items are sorted by revenue descending, cumulative share is computed, and each item gets bucketed by where it falls on the cumulative curve:
+
+- **A** = items contributing the first 80% of revenue (default; editable in toolbar)
+- **B** = the next 15% (cumulative 80 → 95%; default; editable)
+- **C** = trailing 5% PLUS any active sale rows whose revenue resolves to 0 because the item has no pricing record
+
+The cuts are inputs at the top of the page — `A ≤ [80]% · B ≤ [95]%` — so the user can shift to 70/90 or 75/95 etc. Cut values are clamped (`1–99` for A, `aCut+1–100` for B) so the relationship can't invert. Persists in localStorage.
+
+**Date range presets.** This month / Last month / Last 30 days / Last 90 days / This FY (Apr–Mar) / Last FY / Custom range. Default is **This FY** (an ABC analysis is rarely useful at one-month resolution — the long tail needs a few months of demand history to stratify cleanly). Custom range inputs sit beside the preset selector; editing either flips preset to Custom.
+
+**Reversal handling — identical to the sales register pattern:**
+1. Pull Sale rows in the range (filter at the DB).
+2. Pull `(reverses_id)` for any row whose `reverses_id` is in step 1's IDs — date/action unconstrained, so a May sale reversed in July still gets dropped.
+3. For each Sale row: if `reverses_id` is set → it IS a reversal, skip. If its `id` appears in the reversedIds set → originally a sale, since undone, skip. Else → active, sum into the per-item unit total.
+
+So an item that "sold 60 units then returned 5" lands at 55 units of true demand — not 60, not 55+5. Reversed pairs don't double-count and don't bias the ABC ranking.
+
+**Rate basis — toggle, default excludes GST.** GST is a pass-through to the government; including it in "revenue" inflates every line item proportionally and doesn't change which class anything falls into, but it does change the absolute ₹ figures the user sees. Default is **excl. GST** because that's the actual money the business keeps; flip to **incl. GST** when reconciling against an invoice top-line. Stored on each row as `rate = lp × (1 - discount) [× (1 + gst_rate)]`. Pricing changes after the sale aren't tracked — the rate column reflects what the item sells for today, not what it sold for then. Called out in the footnote so the user knows.
+
+**Pareto chart.** Recharts `ComposedChart` — bars for revenue (coloured by class: emerald A / amber B / zinc C), cyan line for cumulative %, dual Y-axes (₹ left, % right with `[0..100]` domain). Capped at the top 40 bars so the chart stays readable on a long-tail catalogue; the table below shows everything. Y-axis ₹ ticks abbreviate to `k`/`L` for Indian-large numbers. Tooltip formats with `fmtMoney` + percentage suffix and shows item label + class in the header.
+
+**KPIs (5).** Revenue · Units sold · Class-A count + share · Class-B count + share · Class-C count + share. Each class KPI surfaces its share-of-revenue (so the user can see at a glance that, say, the 22 A-class items drove 80.4% of the money).
+
+**Filters above the table.** Search box (item label or item code, case-insensitive) · Class filter (All/A/B/C) · Brand · Category. All operate post-classification — filtering doesn't re-classify, so an item's A/B/C tag stays stable regardless of what's visible.
+
+**Sortable table.** Rank · Class badge · Item (with brand + category + "no pricing" amber flag if missing) · Units · Rate · Revenue · Share % · Cumulative %. Footer row shows visible-filtered totals (units + revenue), distinct from the all-classes totals in the KPI strip.
+
+**CSV export.** Header row + visible-rows. Columns: Rank, Class, Item code, Brand, Category, Item, Units sold, Rate, Revenue, Share %, Cumulative %. UTF-8 BOM prefix (Excel reads non-ASCII colour names cleanly), RFC-4180 cell escaping, filename `abc-analysis-YYYY-MM-DD-to-YYYY-MM-DD.csv`.
+
+**Defensive limits.** 10,000-row cap on the sale-row DB pull. Amber banner if hit ("Showing the first 10,000 sale rows. Pick a shorter range for a complete picture."). For Rye's volume (~166 SKUs, ~50–200 sales/month), This-FY pulls comfortably under this cap.
+
+**Footnote explainer.** Bottom of the page spells out the algorithm in one paragraph — what's multiplied, what's excluded, how the cuts work — so a future user (or future Claude session) doesn't have to read the code to understand the numbers.
+
+#### Dead-stock — `app/reports/dead-stock/page.tsx`
+
+**The cut.** An item is "dead" if (a) it has positive stock on hand today AND (b) its most recent qualifying movement was at least N days ago. Threshold N defaults to **90 days** and is selectable from 30 / 60 / 90 / 180 / 365 via the toolbar dropdown.
+
+**Movement-basis toggle:**
+- **Sales only** (default) — the right cut for shelf-clearing decisions. "We bought 60 of these and customers haven't asked for any in 90 days; discount or stop reordering."
+- **Any outbound** — Sale + Transfer + negative-direction Adjustment (Damage / Lost / Count down) + Return-out (supplier-return). The right cut for catalogue cleanup ("we haven't touched this SKU AT ALL in a year, why is it on the books?"). Transfers are included here because while the stock didn't leave the business, the SKU was active.
+
+Either way, reversal handling: build a set of all `reverses_id` values in the pull, then for each row, skip if it's a reversal (its own `reverses_id` is set) OR if it was itself reversed (its `id` is in the set). The latest qualifying date per item, computed once during the walk, is what feeds the days-since calculation.
+
+**"Include never-sold items" toggle (default on).** Items that have never moved by the chosen basis surface in the report with a `never` last-date and `—` days-idle. Toggle off to hide them — useful when reviewing a freshly-imported catalogue where most items haven't had time to sell yet.
+
+**KPIs (4).** Dead SKUs (out of catalogue total) · Dead units (across both godowns) · Blocked capital (₹, net of GST) · Never moved (count). Blocked-capital uses `units × lp × (1 - discount)` — net of GST because GST liability only applies on actual sale, not on inventory held.
+
+**Stock math — godown-aware.** Each item's `unitsA` and `unitsB` come from `godown_stock.cases × items.case_size + godown_stock.loose` per godown (same formula the dashboard uses). Items with `case_size = 0` use loose only. Total units = A + B.
+
+**Sortable.** Toolbar lets the user sort by Blocked capital (default — money-first), Days since movement (never-sold rows pin to top), or Units in stock. Sort is post-filter so the visible order respects everything the user has narrowed to.
+
+**Table columns.** Item (label + code + brand + category + amber "no pricing" flag + rose "never sold" flag) · Units A · Units B · Total · Last sale/movement (depending on basis) · Days idle (coloured: rose ≥ 180 days or never, amber ≥ 90, zinc otherwise) · Rate · Blocked capital. Footer row shows visible-filtered totals.
+
+**Filters.** Search (item or code) · Brand · Category. Brand + category lists are derived from the loaded rows (no separate fetch needed).
+
+**CSV export.** Header + visible rows. Columns: Item code, Brand, Category, Item, Units A, Units B, Total units, Last movement (or "never"), Days since, Rate, Blocked capital. Filename `dead-stock-{threshold}d-{today}.csv`. Same BOM + escaping as ABC.
+
+**Defensive limits.** 20,000-row cap on the transaction pull (need every Sale/Transfer/Adjustment/Return to find latest-per-item correctly). Amber banner if hit, warning that some items' last-movement dates may be older than what's shown.
+
+**Why threshold doesn't refetch.** Changing the threshold only re-classifies in-memory — the same set of rows is just filtered to a different `daysSinceMovement >= N` test. Changing the basis DOES refetch because it affects the `lastSaleDate` vs `lastMovementDate` computation that happens during the DB walk. Smaller useEffect, faster UX.
+
+#### Shared infrastructure
+
+Both pages use the same local-time date helpers (`fmtISO`, `fmtDateDisplay`, `daysSince`) — `new Date().toISOString()` drifts a day backwards in IST after 18:30, so YYYY-MM-DD is built from `getFullYear/getMonth/getDate` and parsed via `"YYYY-MM-DD" + "T00:00:00"`. Same pattern as the sales register.
+
+Both persist their full filter state in localStorage so a refresh keeps you where you were. Keys are namespaced: `abc.*` and `deadStock.*`.
+
+Both use the established Shell + Topbar layout, the cyan-500 accent, `tabular-nums` (`tnum` class) on every numeric column, en-IN money via `fmtMoney`, Lucide icons only (no emoji), and the rose/amber/emerald semantic palette.
+
+#### Files patched
+
+- `app/reports/abc/page.tsx` — was 19-line `Construction` stub; now ~550 lines real. New default-exported `ABCAnalysisPage` + local `Kpi`, `ClassKpi`, `ClassBadge` helpers. Imports `ResponsiveContainer / ComposedChart / Bar / Line / XAxis / YAxis / CartesianGrid / Tooltip / Cell` from `recharts` (already in package.json dependencies — added during initial v2 scaffold for "future charts", finally being used).
+- `app/reports/dead-stock/page.tsx` — was 19-line `Construction` stub; now ~430 lines real. New default-exported `DeadStockPage` + local `Kpi` helper.
+- `PROGRESS.md` — this entry.
+
+#### Files NOT touched
+
+- `lib/supabase.ts` — `Item`, `Pricing`, `Txn`, `Stock` types already cover everything these pages need. No new columns.
+- `components/*` — sidebar already has both `/reports/abc` and `/reports/dead-stock` links from the May 14 audit pass.
+- DB — both pages are pure read-paths. No migrations, no new RPC functions.
+- Other reports — sales register untouched.
+- Dashboard — the dead-stock count card on the dashboard (`Attention needed → Dead stock (no movement)`) is still the old "items with 0 stock" placeholder count. Could be wired to the real dead-stock count in a follow-up, but out of scope here.
+
+#### Edge cases handled
+
+**ABC analysis**
+- **Reversal outside the date range.** Sale in range, reversal outside — the original is dropped from totals (second query is unconstrained by date). Same as sales register.
+- **Items with no pricing.** Show in the table with `—` for rate + revenue, classified as C (revenue = 0), flagged "no pricing" in the meta row. Don't inflate the A/B classes.
+- **Tiny revenue totals.** When `totalRevenue === 0` (no active sales in range), every item lands as C with share/cum = 0; KPIs render `₹0` cleanly; no division-by-zero anywhere.
+- **A-cut > B-cut.** The B-cut input clamps to `max(aCut+1, …)`, so the relationship can't invert.
+- **Cumulative % rounding.** Stored as full precision; displayed to 1 decimal. CSV exports 2 decimals.
+- **Chart with very few items.** Renders fine — Bar chart accepts any length, the cumulative line stays in [0, 100] domain regardless.
+
+**Dead-stock**
+- **Items with stock = 0.** Excluded from the "dead" cut — by definition, dead stock means there IS stock sitting unsold. Out-of-stock is a different report.
+- **Items with `case_size = 0` (loose-only).** Stock math drops the cases multiplier and uses loose count directly. Same formula as dashboard/items page.
+- **Items that have moved but the move was outside the row cap.** Surfaced via the amber banner — defensive callout that some "days idle" figures may understate the true last movement. For Rye's volume this won't bite (history is ~hundreds of txns/year, well under the 20K cap).
+- **Items priced at 0 or with no pricing record.** Blocked-capital shows as `—`. Item still counts toward Dead SKUs + Dead units KPIs (they're real units), just not toward Blocked capital ₹.
+- **Sort with never-moved rows.** When sorting by "days idle", never-moved rows pin to top (`Number.POSITIVE_INFINITY` substitute). That matches the intuition that a never-moved item is the most stale.
+- **Threshold change re-classifies without refetch.** Toggle the dropdown from 90 → 180 and the table re-filters instantly — no DB call.
+
+#### Verification
+
+- Dev server (`npm run dev` via `.claude/launch.json` `stock-app-v2` config, port 3010 — port 3000 was already taken so Next picked 3010 itself) compiled both pages cleanly:
+  - `/reports/abc/` — 1840 modules, no TypeScript errors, route returns 200.
+  - `/reports/dead-stock/` — 1837 modules, no TypeScript errors, route returns 200.
+- The "Fast Refresh had to perform a full reload due to a runtime error" warning is the expected Providers crash from missing `NEXT_PUBLIC_SUPABASE_ANON_KEY` on this machine — Shell never mounts so no page logic runs, but the compile-clean is the meaningful local signal. Full UI verification happens after deploy at the live URLs:
+  - https://harshj111186.github.io/stock-app-v2/reports/abc/
+  - https://harshj111186.github.io/stock-app-v2/reports/dead-stock/
+
+#### Deploy
+
+None manual. Commit + push to `main` → `.github/workflows/deploy.yml` rebuilds and republishes Pages in ~1–2 min.
+
+#### Follow-ups (not blocking)
+
+**ABC analysis**
+- **Class-by-brand or class-by-category breakdown** — a small grid below the chart showing, say, "Crompton: 12 A · 4 B · 22 C" so the user can spot brand-level concentration risk.
+- **Time-series ABC stability** — re-run the analysis over rolling windows and flag items whose class changed (a C-class climbing into B is a candidate for more shelf space; an A dropping to B is a warning).
+- **Export to .xlsx with formatted cells + summary tab** — would need SheetJS. CSV+BOM covers the "open in Excel" path for now.
+- **Click an item to jump to its sales history / pricing / godown levels.** Currently the row is read-only.
+
+**Dead-stock**
+- **"Days of cover" column** — `currentUnits / dailyVelocity` for items that DO sell — shows how long today's stock will last at recent run rate. Different KPI angle from "dead vs alive" but useful in the same shelf-review conversation.
+- **Mark-for-action toolkit** — checkboxes per row + bulk "send to clearance list" or "stop reordering" actions. Requires a new table (`dead_stock_actions` or similar) and a workflow.
+- **Wire dashboard's Attention card** to the real dead-stock count so the home page reflects reality.
+- **Per-godown view** — currently we show A and B side-by-side; could add a godown filter to focus the shelf-review on one warehouse.
+- **Last-purchase-date column** — sometimes more useful than last-sale; tells you "we bought 60 of these 2 years ago and have sold none". Two queries instead of one, easy add.
+
+---
+
+### 2026-05-21 — Sales register: date-range view with reversal-aware totals
+
+**User ask:** "now i want you to work on sales register. […] those extra, gstin, customer name etc is not at all needed, just record the item name, sales quantity with date and if reversed then do the needful action etc."
+
+**The shape after scope-trim.** The original placeholder hinted at a fuller vision (party filter, GSTIN summary, Excel/PDF export). User explicitly rejected the GST + customer side of it, so this ships as a minimal sales log focused on **date · item · godown · qty** with reversal handling baked in. GST math, party filter, invoice column, HSN summary, PDF export — all deferred. The transactions page's free-text `note` field carries party/invoice/rate today; we don't parse it.
 
 **What the page does**
 
-- **Date range picker** with presets — Today / Yesterday / This week / This month / Last month / This FY (Apr–Mar, computed for India) / Custom range. Preset + custom dates persist in `localStorage` so a refresh doesn't kick the user back to "This month" mid-investigation. Range label in the header reads short for same-day, long for multi-day.
-- **Server-side range filter.** Supabase query is `transactions where action='Sale' and txn_date between [from, to]`, limited to 5,000 rows with a banner if the limit is hit. Ordered by `txn_date desc, created_at desc` so newest sale on each day comes first. Filtered by `txn_date` (the business date the user entered), NOT `created_at` (when the system received the entry).
-- **Client-side filters** stacked on top: godown (A / B / both), free-text search (item label, invoice, party name, HSN, note), and a "Show reversals" toggle (default ON). The toggle lets the user hide reversal pairs when reconciling, but they're visible by default because for GST you want to see them.
-- **5 KPI cards**: Sales count · Units sold (net of reversals) · Taxable amount · GST collected · Total inc. GST. All update live as filters change. Reversal count surfaces as the Sales card subtitle when present.
-- **HSN / GST summary** — collapsible card grouping rows by `(HSN code, GST rate)`. Each row: sales count, units, taxable, GST, total. Bottom totals row. This IS the GSTR-1 / "consolidated tax filing" view — paste into the portal directly.
-- **Detail table** — one row per transaction in DB order (newest first). Columns: Date · Invoice · Item (with brand chip + size + colour) · HSN · Godown · Qty · Rate · Taxable · GST % + amount · Total · Party. Reversal rows are tinted rose with a `REV` badge and a negative qty.
-- **Rate resolution** — three-tier fallback because the current Transactions page bundles invoice / party / rate / reason into one `p_note` string (the structured columns `rate`, `invoice_no`, `party_id`, `reason` are populated only on legacy v1 rows). The report tries them in order:
-  1. `t.rate` (the column) — used when populated
-  2. `parseNote(t.reason || t.status || t.note)` — extracts `rate: N` from the bundled string
-  3. Current `pricing.lp * (1 - discount)` — labelled `est` in the table because it's an estimate, not what was actually charged
-  4. Nothing — row excluded from totals, shown as `—` with an amber banner above the table counting how many rows lack a rate
-- **GST resolution** — pricing → item → 18% fallback. So a sale of an item without a pricing row but with `items.gst_rate` set still computes correctly.
-- **Note parser** is defensive: only parses as a key/value bundle (`"reason: X • inv: Y • party: Z • rate: N"`) when at least one segment matches the prefix shape. Otherwise treats the whole string as a freeform reason. The literal `"OK"` status is skipped (it's the SQL success marker, not user data).
-- **CSV export** — UTF-8 BOM (so Excel reads it correctly), Excel-safe quoting, filename `sales-register-{from}-to-{to}.csv`. Columns are GSTR-1 aligned: Date · Type · Invoice · Party · Brand · Model · Size · Colour · Item Code · HSN · Godown · Qty · Rate · Taxable · GST % · GST · Total · Note. Reversal rows go in as `Type=Reversal` with a negative qty.
-- **Print / PDF** — `window.print()` triggers the browser print dialog; "Save as PDF" works on every modern browser. New print stylesheet in `app/globals.css` hides the sidebar + topbar + filters + buttons, forces black-on-white (the app's dark-mode default would otherwise print as dark-on-dark), reflows scroll containers so long tables print across pages, and adds gridlines to table cells. Print-only header (`hidden print:block`) shows "Sales register · Rye Electricals · [range]" at the top of the printout.
+- **Date range picker** with presets: Today, Yesterday, This week (Mon-anchored), This month, Last month, This FY (Apr–Mar — Indian financial year), Custom range. Default is This month. Custom from/to inputs are always visible; editing either flips preset to "Custom".
+- **Three KPIs**:
+  - Active sales — count of rows that aren't part of a reverse pair
+  - Units sold — sum of qty across active rows
+  - Rows in view — total rows displayed (changes with the "Show reversed entries" toggle)
+- **Detail table** — Date · Item (model · size · colour + item code subtitle, brand inline) · Godown · Qty · Status. Sorted newest first.
+- **Reversal handling — three states with distinct visual treatment**:
+  - `active` — emerald dot, counts toward totals
+  - `reversed` — strikethrough on item + qty, rose "Reversed later" badge, excluded from totals
+  - `reversal` — amber-tinted row, amber "Reverses #ABC123…" badge, excluded from totals
+  - **"Show reversed entries" checkbox** (off by default) — hides both `reversed` and `reversal` rows when off. Totals stay the same either way; the toggle only affects display. Off-by-default keeps the register clean for day-to-day reading; on for audit.
+- **CSV export** — visible rows only (so toggle state respected), with BOM prefix so Excel reads UTF-8 colours (e.g. "matt black") cleanly. Filename pattern `sales-YYYY-MM-DD-to-YYYY-MM-DD.csv`. Columns: Date · Item code · Item · Godown · Qty · Status.
+- **5000-row safety cap** on the DB pull, with an amber banner if hit ("Showing the first 5,000 sales… pick a shorter range"). Defensive — a This-FY pull on a busy year shouldn't yank everything over the wire.
+- **Persisted filter state** in localStorage (`salesReg.preset`, `.customFrom`, `.customTo`, `.showReversed`) so a refresh keeps you where you were.
+
+**Reversal-detection mechanics — worth knowing**
+
+A sale row's state isn't computed from `t.status` (which the SQL writes as "OK") or `t.action` alone. It's based on `reverses_id` linkage:
+
+1. Pull Sale rows in the date range (filter at the DB).
+2. Pull `(id, reverses_id)` for any row whose `reverses_id` is in step 1's IDs — **regardless of action and regardless of txn_date**. A sale on May 5 reversed in June would have its reversal row outside the May filter; this second query catches it so the May 5 row still renders as "reversed".
+3. For each Sale row in step 1:
+   - If `s.reverses_id` is set → `reversal` (the reversing row itself; an unusual case — a Sale reversing something else — but defensive)
+   - Else if `reversedIds.has(s.id)` → `reversed` (the original sale was later negated)
+   - Else → `active`
+
+The check works whether `reverse_transaction` inserts the inverse as `Purchase` or as `Sale` with `direction=+1`. If it's `Purchase`, the original Sale shows as "reversed" and the Purchase row simply doesn't appear in this register (it'd belong in a Purchase register). If it's `Sale` with `direction=+1`, both show — the original as "reversed", the reversal as "reversal" — and neither contributes to totals. Either way, the active count + units-sold are right.
+
+**Date math — local-time, not UTC**
+
+`new Date().toISOString().slice(0, 10)` is unsafe in IST: after 18:30 IST it returns the next UTC day, so picking "Today" near midnight gives yesterday's range. The page builds YYYY-MM-DD strings from local `getFullYear / getMonth / getDate` instead. Same pattern is used to parse stored dates for display: `new Date(iso + "T00:00:00")` forces local parsing rather than UTC. The transactions page still uses the UTC slice pattern for its own date defaults; not changed here because (a) it's only used for one-shot "today" defaults and (b) not user-asked. Worth a follow-up sometime.
 
 **Files patched**
 
-- `app/reports/sales/page.tsx` — was a 19-line `Construction` placeholder, now 568 lines real.
-- `app/globals.css` — +33 lines of print rules in the `@layer base` block. `.no-print` class definition; targets `aside`, `.h-screen`, `.overflow-auto`, `.p-8`, tables, rows, cells. Resets every element's `background-color` / `color` / `border-color` so the dark-mode UI prints as B&W.
-- `components/topbar.tsx` — one additive class (`print:hidden`) on the root div. The sidebar is hidden via the generic `aside` selector in print CSS; this complements that.
+- `app/reports/sales/page.tsx` — was a 19-line `Construction` placeholder; now ~330 lines real. New default-exported `SalesRegisterPage` component + local `Kpi` helper.
+- `app/globals.css` — linter added a generic `@media print` block (~33 lines) and a `.no-print` class. Not used by this page (no Print button) — left in as benign infrastructure for any future report that wants printable output.
+- `components/topbar.tsx` — linter added `print:hidden` to the root div. Same story: benign, hides the topbar in print previews if any future page calls `window.print()`. Harmless on screen.
 - `PROGRESS.md` — this entry.
 
 **Files NOT touched**
 
-- All other pages, `lib/`, `components/sidebar.tsx`, the DB. The Sales register is read-only by design — it never calls `process_transaction()` or any write RPC.
-- No SQL migration. The page works with whatever the live schema is (`transactions`, `items`, `pricing`, `parties`).
+- `lib/supabase.ts` — no schema changes; the existing `Txn` type already had `reverses_id`. No new columns needed.
+- Sidebar — already has the `/reports/sales` link from the May 14 audit pass.
+- DB — pure read path. No migration.
+
+**Verification**
+
+- Dev server (`npm run dev` via `.claude/launch.json` `stock-app-v2` config, port 3010) compiled both `/` and `/reports/sales` cleanly — 804 modules, no TypeScript errors, route returns 200.
+- Live render couldn't be exercised locally because there's no `NEXT_PUBLIC_SUPABASE_ANON_KEY` set on this machine — Providers crashes at `supabaseUrl is required` before Shell mounts. Per README, local dev isn't expected; GitHub Actions has the secret. The compile-clean is the meaningful local check; full UI verification happens after deploy.
 
 **Edge cases handled**
 
-- **Empty date range.** Empty state in detail + HSN summary, KPIs all zero, Export / Print buttons disabled.
-- **Range hits 5,000-row cap.** Amber banner above the KPIs telling the user to pick a shorter range. No silent truncation.
-- **Reversal sales.** Original sale and its reversal both appear with opposite signs. Reversals contribute negative `taxable` / `gst` / `total` so KPIs net out correctly. Reversals where the original is outside the date range still show (e.g. you reversed a Feb sale on May 15 — the reversal shows in May's register, with negative qty, exactly as accounting wants it).
-- **Items archived after sale.** Still shows — we look up by `item_id`. If the item is entirely missing (deleted, not archived), the label is `?` and HSN is `—`.
-- **No pricing row for an item.** Rate falls back to note parsing or shows `—`; banner above the table counts how many such rows exist so the user can fix them on Pricing.
-- **Item with explicit `gst_rate = 0`** (e.g. a future tax-exempt SKU): the GST column shows `0% · ₹0`. Correct, not treated as missing.
-- **`txn_date` vs `created_at`.** Filtering on `txn_date` means a sale entered today for yesterday's date sits in yesterday's register — matches what the user sees on the Transactions form.
-- **Dark mode print.** The print CSS uses `*` background-color overrides instead of relying on the user toggling theme first. Works regardless of what mode the screen is in.
-- **localStorage corruption.** Reads are wrapped in try/catch; bad values just fall back to defaults.
+- **Reversal outside the date range.** Sale in range, reversal outside — original still shows as "reversed", excluded from totals (the second query is unconstrained by date).
+- **Reversed row whose action isn't `Sale`** (e.g. if `reverse_transaction` writes a `Purchase` as the inverse). Doesn't appear in the table at all (we filter `action = 'Sale'`), but the original Sale gets the "reversed" badge via `reversedIds`.
+- **Toggle interaction with totals.** Hiding reversed rows doesn't change totals — totals always come from `activeRows`, never from `visibleRows`. So a user toggling on/off can't accidentally mis-read the numbers.
+- **Empty state copy** distinguishes "no sales in range" from "no active sales, only reversed entries" — the second copy nudges the user to tick the toggle.
+- **CSV escaping.** Item labels with commas, quotes, or newlines get properly quoted per RFC 4180. BOM prefix for Excel UTF-8.
+- **Custom-range inputs** always show the resolved `from`/`to` (not the stale `customFrom`/`customTo`) so what's in the input matches what's queried. Editing either flips preset to "Custom" so the values stick.
+- **localStorage corruption.** Reads wrapped in try/catch; bad values fall back to defaults.
 
-**Build verified** — `npm run build` produces a clean static export. The `/reports/sales` route is 6.54 kB / 188 kB First Load JS.
+**Deploy**
 
-**Manual deploy step**
-
-None — this commit pushes to `main`, which triggers `.github/workflows/deploy.yml`. GitHub Action will rebuild and republish to Pages in ~1–2 min. Verify at https://harshj111186.github.io/stock-app-v2/reports/sales/.
+None manual. Commit + push to `main` → `.github/workflows/deploy.yml` rebuilds and republishes Pages in ~1–2 min. Verify at https://harshj111186.github.io/stock-app-v2/reports/sales/.
 
 **Follow-ups (not blocking)**
 
-- The remaining two reports (ABC analysis, Dead stock) are still placeholders. Same shell + filters pattern would carry over.
-- Once `parties` table starts getting populated and `process_transaction` is taught to set `party_id` / `invoice_no` / `rate` as structured columns (instead of stuffing them into `p_note`), the report can drop the note-parser branch and use the columns directly. The fallback chain stays as-is so old rows keep displaying.
-- CGST/SGST split — needs customer state on `parties` to know intra-state vs inter-state. Currently shown as a single "GST" line. The footnote in the page calls this out.
-- Excel native (.xlsx) instead of CSV — would need a small library like `xlsx` (~700 KB). CSV opens fine in Excel for now; skipping the dep.
-- Sort by column header (Qty, Rate, Date desc/asc) — currently rows are in DB order. Easy add when needed.
-- "Top customers" / "Top items by revenue" mini-tables similar to the dashboard's top movers — postponed; the HSN summary covers most reporting needs.
+- **Excel (.xlsx) export** with cell formatting + summary tab — needs SheetJS or similar. CSV+BOM covers most "open in Excel" use cases for now.
+- **PDF / print stylesheet** — already partially set up by the linter's print CSS in globals.css, but no Print button on the page. If the user wants printable output, add a button + print-only header block; the infrastructure's ready.
+- **Re-introduce GST/party columns** if/when (a) `process_transaction` is migrated to take dedicated `p_invoice_no` / `p_party_id` / `p_rate` args and (b) the user changes their mind on GST/customer tracking. The DB columns (`transactions.invoice_no`, `.rate`, `.party_id`) exist; only the write path stuffs everything into `p_note`.
+- **Group-by-date view** — daily subtotal rows ("21 May · 3 sales · 8 units"). One refactor of the table-body render.
+- **Group-by-item view** — useful for "which items sold the most this month". Different KPI angle.
+- **Link from Dashboard's "Top movers" card** to a pre-filtered sales register (item + last 30 days). One-line href change.
+- **Apply the same reversal-aware approach to a future Purchase register / Stock-movement register.** The pattern (pull action-in-range + pull all rows with `reverses_id` in the IDs + state classification) generalises.
 
 ---
 
