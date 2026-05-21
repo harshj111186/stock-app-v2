@@ -122,14 +122,19 @@ begin
   values (
     new.id,
     new.email,
-    case when v_is_seed_admin then 'admin' else 'viewer' end,
+    -- Explicit enum cast; protects against any future PG version being
+    -- stricter about CASE expression result types.
+    (case when v_is_seed_admin then 'admin' else 'viewer' end)::role_t,
     v_is_seed_admin,
     v_is_super,
     case when v_is_seed_admin then now() else null end
   )
   on conflict (id) do update set
     -- If somehow a row exists already (rare), upgrade the seed admins.
-    role           = case when excluded.role::text = 'admin' then 'admin' else user_profiles.role end,
+    role           = case
+                       when excluded.role::text = 'admin' then 'admin'::role_t
+                       else user_profiles.role
+                     end,
     active         = user_profiles.active or excluded.active,
     is_super_admin = user_profiles.is_super_admin or excluded.is_super_admin,
     approved_at    = coalesce(user_profiles.approved_at, excluded.approved_at);
@@ -371,7 +376,10 @@ begin
     raise exception 'only the super-admin can manage the admin role';
   end if;
 
-  update user_profiles set role = p_new_role where id = p_user_id;
+  -- Explicit text → enum cast (role column type is role_t). p_new_role is
+  -- already validated to one of the three known values above, so the cast
+  -- can't fail at runtime.
+  update user_profiles set role = p_new_role::role_t where id = p_user_id;
 end $$;
 
 grant execute on function admin_set_role(uuid, text) to authenticated;
