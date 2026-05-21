@@ -338,6 +338,21 @@ This is the first time a PR has a hard DB precondition since the phase-2 adjustm
 - **PIN gate inactivity timeout** — auto-lock after N minutes of no clicks. Not asked; matches the "once per session" intent so probably not needed.
 - **Apply consistent date display** — currently the migration uses `to_char(..., 'HH24:MI')` for the lockout-until message; should use a more friendly relative-time format on the client.
 
+#### Same-day hotfixes
+
+Three regressions surfaced as the user signed in for the first time after the migration. All three are in-place fixed in the original `2026-05-22-pin-auth-and-approval.sql` AND each has a standalone patch SQL for the running database. Future replays of the bundle land correctly.
+
+1. **`SELECT *` on user_profiles failed** ("permission denied for table user_profiles"). Cause: the column-level `REVOKE SELECT … GRANT SELECT (col list)` lockdown of `pin_hash` makes Postgres reject `SELECT *` outright — even if the calling code never wanted `pin_hash`. Symptom: user signed in, then bounced back to `/login` after a brief flash.
+   Fix: new `PROFILE_COLUMNS` constant in `lib/supabase.ts` listing the 12 readable columns; both `fetchProfile` (providers) and the users-page admin list use it via `.select(PROFILE_COLUMNS)` instead of `.select("*")`. Commit `32e885d`. **No SQL patch needed** — pure client-side change.
+
+2. **`function gen_salt(unknown) does not exist`** when user typed the PIN twice on the set-PIN gate. Cause: Supabase installs pgcrypto in the `extensions` schema, not `public`; my functions declared `set search_path = public` (correct hygiene for SECURITY DEFINER), so unqualified `gen_salt('bf')` / `crypt(...)` calls couldn't find them.
+   Fix: fully-qualified as `extensions.crypt(...)` / `extensions.gen_salt(...)` inside `set_pin`, `verify_pin`, `change_pin`. Patch: `db/2026-05-22-pgcrypto-schema-fix.sql`. Commit `1e67665`.
+
+3. **`column "role" is of type role_t but expression is of type text`** when admin tried to change anyone's role via the Users page. Cause: PL/pgSQL won't implicitly cast a text variable to an enum type the way it will for a string literal, and `admin_set_role` had `update user_profiles set role = p_new_role` with `p_new_role text`.
+   Fix: explicit `::role_t` cast inside `admin_set_role`. Also defensively recast the literals inside `handle_new_user`'s INSERT + ON CONFLICT clauses so a future PG version being stricter about CASE-expression result types can't quietly break signups. Patch: `db/2026-05-22-role-enum-cast-fix.sql`. Commit `b1158b9`.
+
+**Lesson for next migration touching column grants:** any `.select("*")` against the affected table needs to be replaced with an explicit column list before the migration runs. The two failures (1) and (3) are exactly the kind of thing that's easy to miss in a code review but bites on first sign-in.
+
 ---
 
 ### 2026-05-21 — ABC analysis + Dead-stock reports (both placeholders → real)
