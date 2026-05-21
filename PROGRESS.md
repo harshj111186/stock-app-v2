@@ -230,6 +230,75 @@ If you must touch one of these files: **read first, edit surgically, never repla
 
 ## 11. Changelog (latest first — add new entries at the top)
 
+### 2026-05-21 — Transactions page: batch-queue mode with pre-flight stock check
+
+**User ask:** "many time the staff first enter sales for which purchase has to go first to show the stocks and then it leads to error, so i want data entry setup in transaction to be better in a way that the staff can enter all the details in 1 go for all sales, purchase, transfer etc. when he clicks process, u process them in a way that purchase then transfer then sales, like that. if there is a return too then process the return which adds the stock back to us and then process the return which lessen the stock so that no error arrives saying no stock while processing any outward transaction."
+
+**The problem.** Single-entry mode forced the staff to enter Purchases BEFORE the corresponding Sale, otherwise the Sale would fail with "Insufficient stock at Godown X" because the Purchase hadn't landed yet. Real-world workflow doesn't follow that order — staff often capture Sales (today's customer activity) first and remember to enter Purchases (yesterday's stock-in) later.
+
+**The fix — queue mode.** The Save button is gone. Replaced with **Add to queue**. Every entry drops into a queue table below the form. When the user clicks **Process queue**, the system runs every entry in this fixed, stock-safe order:
+
+| Priority | Action | Direction | Effect |
+|---|---|---|---|
+| 1 | Purchase | +1 | + stock at chosen godown |
+| 2 | Adjustment (Found / Count up / Customer return → shelf) | +1 | + stock at chosen godown |
+| 3 | Return — customer return into godown | +1 | + stock at chosen godown |
+| 4 | Transfer | n/a | moves between A and B |
+| 5 | Adjustment (Damage / Lost / Count down) | −1 | − stock at chosen godown |
+| 6 | Sale | −1 | − stock at chosen godown |
+| 7 | Return — supplier return out of godown | −1 | − stock at chosen godown |
+
+So a Sale can sit in the queue alongside the Purchase that creates its stock, and processing order guarantees the Sale never fails because of "no stock yet". This is the user-mentioned `purchase → transfer → sales` order, expanded across all 5 action types.
+
+**Pre-flight stock simulation.** As entries land in the queue, the page runs a client-side simulation: starting from each item's current `godown_stock`, it walks the sorted queue and computes the running balance after each step. If any step would take a godown below zero, the row is highlighted in rose, the running balance column shows the negative number, and a **rose banner** at the top of the queue spells out which item and which godown, with current-stock and shortfall amounts. The **Process queue** button is disabled until the pre-flight is green. So the staff sees the problem WHILE they can still fix it (add more Purchase qty, change godown, remove a Sale, etc.) instead of after a partial process. An emerald "All clear" banner shows when the queue is ready.
+
+**Per-row status during process.** As the queue runs, each row's Status column flips:
+- `queued` (zinc) → `running` (cyan, spinning loader) → `done` (emerald, tick) — or
+- `running` → `<error message>` (rose, with AlertCircle) if the RPC rejected it.
+
+If any row fails, **survivors stay in the queue with the error attached** so the user can fix and re-process. Successful rows are removed from the queue.
+
+**Form behavior preserved.** Existing fast-repeat behavior kept: after Add to queue, `item + godown + action + date` stay; `cartons + loose + rate + invoice + party + reason` clear. So entering 20 Purchase lines from one supplier is `pick item → cartons/loose → Add → pick next item → cartons/loose → Add → …`, action stays Purchase, godown stays where you set it, date stays the same.
+
+**Files patched**
+
+- `app/transactions/page.tsx` — substantial rewrite, 770 → 1083 lines:
+  - New `QueuedTxn` type capturing all per-row state.
+  - New module-level helpers: `priorityOf(t)`, `deltaOf(t)`, `makeUid()`, `PRIORITY_LABEL` for the queue display.
+  - New component state: `queue`, `processing`, `processIdx`, `processErrors`.
+  - New `sortedQueue` `useMemo` (priority-ordered, stable by uid for ties).
+  - New `preflight` `useMemo` — walks `sortedQueue` against current `stock`, returns `{ ok, snapshots, firstError }` for the banner + per-row warning column.
+  - `submit` renamed to `addToQueue`; pushes onto the queue, no RPC.
+  - New `processQueue` — runs every row sequentially via `process_transaction(... p_direction)`. On any failure: collects errors, keeps failed rows in queue, removes successful ones. Calls `reload()` at the end either way.
+  - New `removeFromQueue(uid)` and `clearQueue()`.
+  - New Queue panel JSX between the form and the transaction log: table with columns `# · Action · Item · Godown · Qty · A after · B after · Status · ×`. Header row has Clear all + Process queue (N) buttons. Banners (rose / emerald / rose-with-errors) at the top of the panel.
+  - Form footer "Save Purchase" button now reads **Add Purchase to queue** with a Plus icon.
+- `PROGRESS.md` — this entry.
+
+**Files NOT touched**
+
+- `lib/supabase.ts`, `app/providers.tsx`, `app/login/page.tsx`, `app/items/page.tsx`, `components/godown-view.tsx`, `app/page.tsx` (dashboard), v1 `stock-app/index.html` — all untouched.
+- No DB changes. Backend still uses the 7-arg `process_transaction` from `phase2-adjustment-return.sql`. The queue just calls it N times in client-side priority order.
+
+**Edge cases handled**
+
+- Multiple Sales of the same item in one queue: pre-flight tracks running stock through ALL queue rows, so the 2nd Sale will only succeed if the 1st didn't already drain the godown.
+- Transfer simultaneously decrements source and increments destination in the simulation — so a queue like "Purchase A 10 → Transfer A→B 10 → Sale B 10" passes pre-flight even though B starts at 0.
+- Adjustment direction is computed from the Reason dropdown at add-time; Return direction is computed from the In/Out toggle. Stored on the queue row, used both for the SQL call and the simulation.
+- Partial processing: if rows 1-3 succeed and row 4 fails, rows 1-3 are removed from the queue, rows 4-N stay with the failure message attached to row 4. The user can fix row 4 (or remove it) and click Process queue again to run the remaining rows. The DB is consistent because each row is its own atomic RPC.
+- Pre-flight ignores the SQL's own stock check — they're redundant. The pre-flight is for UX (catch errors before the round-trip); the SQL is the source of truth.
+- The Transaction log below the queue is unchanged. Successfully-processed queue rows appear in the log on the next `reload()`.
+
+**Follow-ups (not blocking)**
+
+- Bulk import from CSV / paste — same queue, populated from a paste-box. Would let staff bring in 50 lines of Purchases from an invoice in seconds.
+- Re-order rows within the queue manually (drag handles). Currently the order is fixed by `priorityOf`; manual re-order would let power users handle exotic cases.
+- Save the queue to localStorage so a refresh doesn't lose pending work. Currently the queue is in-memory only.
+- "Process and stop on error" vs "Process and continue" toggle. Currently the loop processes all rows and reports failures at the end — could be opinionated to stop at the first failure to preserve fix order.
+- Edit a queue row instead of remove + re-add.
+
+---
+
 ### 2026-05-20 — Login deadlock cracked: defer profile fetch out of SDK notify loop (PR #5 / 119f0db)
 
 **User-facing symptom:** sign in succeeds, dashboard flickers, then loading spinner sits for 10s and bounces back to `/login`.
