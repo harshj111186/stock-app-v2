@@ -87,4 +87,29 @@ export type Txn = {
   created_by: string | null;
   created_at: string;
 };
-export type Profile = { id: string; email: string; name: string | null; role: "admin" | "staff" | "viewer"; active: boolean };
+// User profile.
+//
+// pin_hash is intentionally absent from this type — the column has had its
+// SELECT grant revoked in db/2026-05-22-pin-auth-and-approval.sql, so it
+// never reaches the client. PIN operations go through SECURITY DEFINER RPCs
+// (set_pin / verify_pin / change_pin / admin_reset_pin).
+//
+// Gate states the app reads off this row:
+//   - approved_at IS NULL                    → pending admin approval
+//   - active = false (but approved_at set)   → deactivated by admin
+//   - pin_set_at IS NULL                     → user must set a PIN first
+//   - pin_locked_until > now()               → 15-min lockout after 5 misses
+//   - is_super_admin = true                  → harsh; immune to other admins
+export type Profile = {
+  id: string;
+  email: string;
+  name: string | null;
+  role: "admin" | "staff" | "viewer";
+  active: boolean;
+  is_super_admin: boolean;
+  approved_at: string | null;
+  approved_by: string | null;
+  pin_set_at: string | null;
+  pin_attempts: number;
+  pin_locked_until: string | null;
+};

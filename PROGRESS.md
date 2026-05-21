@@ -230,6 +230,116 @@ If you must touch one of these files: **read first, edit surgically, never repla
 
 ## 11. Changelog (latest first — add new entries at the top)
 
+### 2026-05-22 — PIN-based auth + signup-approval workflow + super-admin
+
+**User ask:** "make changes to user setup, where harsh.j111186@gmail.com is ultimate admin and bhavik9347@gmail.com acts as admin too, any signups needs admin approval, also want a pin based setup, where each account is set to a pin which is setup when signed up and gets linked to that account so launching app again wont require email and password but the 4 digit pin. same account sign in to different device should ask for that pin too, all the user accts can be overridden by admin"
+
+**The shape of it.** Three independent feature slices, shipped together because they share the same DB columns and gate machinery:
+
+1. **PIN-based unlock.** Every account has a 4-digit PIN, bcrypt-hashed in `user_profiles.pin_hash`. After Supabase email/password auth succeeds, a PIN gate intercepts before the app loads. PIN unlock is **per browser session** (sessionStorage, not localStorage) — so closing the tab requires re-entry, but a refresh keeps you in. PIN is account-scoped, so signing in on a new device also prompts for the PIN.
+2. **Signup approval workflow.** New signups land with `approved_at IS NULL` and `active = false`. They see a "Waiting for admin approval" screen. An admin clicks Approve on the Users page → `active = true, approved_at = now()`. Harsh and Bhavik (by email match in the signup trigger) are auto-approved and given admin role.
+3. **Super-admin tier.** Harsh's row carries `is_super_admin = true`. Functionally that means: only super-admin can promote anyone to admin or demote an existing admin; super-admin's own row can't be modified by anyone else (PIN reset, deactivate, role change all blocked). Bhavik gets `role = admin` but not `is_super_admin`.
+
+**Defaults chosen (without explicit user input):**
+- Wrong PIN: 5 attempts → 15-minute lockout (stored in `pin_locked_until`).
+- New signups default to **viewer** role until promoted.
+- Bhavik can manage staff/viewer roles + approve/reject pending users, but can't promote anyone to admin.
+- Bhavik can reset PINs and deactivate users, but not Harsh.
+- Harsh can do everything to anyone.
+
+#### Files patched / created
+
+- **`db/2026-05-22-pin-auth-and-approval.sql`** *(new — ~290 lines)*
+  - `create extension if not exists pgcrypto;`
+  - Adds columns to `user_profiles`: `pin_hash text`, `pin_set_at timestamptz`, `pin_attempts smallint`, `pin_locked_until timestamptz`, `is_super_admin boolean`, `approved_at timestamptz`, `approved_by uuid → auth.users(id)`.
+  - **Column-level lockdown**: `REVOKE SELECT ON user_profiles FROM authenticated`, then `GRANT SELECT (id, email, name, role, active, is_super_admin, approved_at, approved_by, pin_set_at, pin_attempts, pin_locked_until, created_at) ON user_profiles TO authenticated`. `pin_hash` is intentionally excluded — the hash never reaches the client. (4-digit PIN space is 10K; even bcrypt-slow brute-force is feasible if the hash leaks, so it must not.)
+  - Grandfathers existing active users by setting `approved_at = coalesce(created_at, now())` for any active row with `approved_at IS NULL`. So flipping this migration on doesn't lock out the people already in.
+  - One-off `UPDATE` seeds harsh as `is_super_admin = true, role = 'admin', active = true, approved_at = coalesce(approved_at, now())`.
+  - `handle_new_user()` trigger rewritten: harsh/bhavik emails get `role = 'admin', active = true, is_super_admin = (email == harsh's), approved_at = now()`; everyone else gets `role = 'viewer', active = false, approved_at = null`. Replaces the old "first user becomes admin" logic.
+  - **SECURITY DEFINER RPCs** added: `set_pin(p_pin text)`, `verify_pin(p_pin text) → boolean`, `change_pin(p_old_pin, p_new_pin) → boolean`, `admin_reset_pin(p_user_id)`, `admin_approve_user(p_user_id)`, `admin_set_role(p_user_id, p_new_role)`, `admin_set_active(p_user_id, p_active)`, `admin_set_name(p_user_id, p_name)`. Plus two internal `_is_active_admin(uid)` and `_is_super_admin(uid)` helpers used inside the admin RPCs to gate access.
+  - All admin RPCs respect the two-tier rule: regular admin can't modify a super-admin row; only super-admin can mint or unmake admins.
+  - Idempotent — safe to re-run. Final verification queries at the bottom show counts and confirm `pin_hash` isn't in the authenticated-grant list.
+
+- **`lib/supabase.ts`** *(edited)* — `Profile` type extended with `is_super_admin`, `approved_at`, `approved_by`, `pin_set_at`, `pin_attempts`, `pin_locked_until`. `pin_hash` is **intentionally not in the type** because the DB column-level grant excludes it. Comment explains the gate-state heuristics the app reads off the row.
+
+- **`app/providers.tsx`** *(major rewrite)* — adds the gate state machine. After Supabase auth resolves a session and we fetch the profile, the order of gates is:
+  1. session null → /login (unchanged).
+  2. `profile.approved_at == null` → `<PendingApproval/>`.
+  3. `profile.active === false` (but approved before) → `<PendingApproval/>` (same component; from the user's view "you can't get in" is the same experience).
+  4. `profile.pin_set_at == null` → `<PinGate mode="set"/>`.
+  5. `sessionStorage[\`pinUnlocked:${id}\`] !== "1"` → `<PinGate mode="enter"/>`.
+  6. Otherwise → render children. The login page is exempt (renders directly so the user can actually sign in/up).
+  
+  Three helpers exported alongside the provider: `isPinUnlocked(userId)`, `markPinUnlocked(userId)`, `clearPinUnlocked(userId)`. signOut() clears the flag before calling `auth.signOut()` so the next login doesn't inherit a stale unlock. The PR #5 deadlock-fix machinery (synchronous listener, setTimeout(0) deferred profile fetch, 10s failsafe, `lock: lockNoop`) is preserved verbatim. A `refreshProfile()` is exposed on context so the PendingApproval screen's Refresh button can re-poll without forcing a page reload.
+
+- **`components/pin-gate.tsx`** *(new)* — 4-digit pad with auto-advance, backspace-to-previous, paste-a-4-digit-string-anywhere fills all four. Two modes: `"enter"` (calls `verify_pin`, surfaces lockout / wrong-PIN messages) and `"set"` (two-step: first PIN → confirm PIN → `set_pin` RPC). Reusable `PinInput` sub-component encapsulates the four-box behaviour so the settings page or any future surface can reuse it. The gate also has a Sign-out link so a user with a forgotten PIN can bail to the login screen.
+
+- **`components/pending-approval.tsx`** *(new)* — "Waiting for admin approval" screen. Hits `refreshProfile()` on Check Again button so a freshly-approved user can step into the app without closing the tab. Sign-out link as escape hatch.
+
+- **`app/login/page.tsx`** *(rewritten)* — signup mode now collects email + password + 4-digit PIN + confirm. Two post-signup branches:
+  - **Session returned** (email confirmation off — our project default): calls `set_pin` RPC, marks `sessionStorage.pinUnlocked:{id} = "1"` so providers skips the PIN gate on the immediate next bootstrap (the user just typed it, no need to re-prompt), then `window.location.assign("/")`. Non-seed users land on `<PendingApproval/>`; harsh/bhavik flow straight in.
+  - **No session** (email confirmation on): can't save PIN yet (no auth context). Shows "Check your email for a confirmation link", switches to sign-in mode. The set-PIN gate catches them after they confirm + sign in.
+  
+  Sign-in mode is unchanged in behavior — `window.location.assign` hard nav still in place to sidestep the redirect race.
+
+- **`app/users/page.tsx`** *(major rewrite)* — three buckets: **Pending approval** (with prominent amber styling + Approve button), **Active** (with role dropdown, PIN status indicator, Reset PIN, Deactivate, edit-name buttons), **Deactivated** (with Reactivate). Permissions baked into a `useRowPerms()` helper so desktop + mobile renderers stay in lockstep:
+  - `canChangeRole`: not super-admin row, not another admin row unless I'm super
+  - `canResetPin`: any admin except super-admin can't touch super-admin
+  - `canDeactivate`: same as role + can't deactivate self
+  - Role dropdown options: super-admin sees `[admin, staff, viewer]`; regular admin sees `[staff, viewer]`. If the row's current role isn't in the options (regular admin looking at another admin), the current value is preserved in the dropdown so the select doesn't show a wrong value.
+  - Super-admin badge (ShieldCheck icon + "Super admin" pill) on the appropriate row.
+  - Mobile and desktop both implemented (linter had previously added mobile cards to this page; I preserved the pattern).
+
+- **`app/settings/page.tsx`** *(edited)* — adds a Change PIN card. Old PIN + new PIN + confirm new. Calls `change_pin` RPC; surfaces the "old PIN wrong" / "structurally bad new PIN" cases distinctly. Role display now shows "super admin" with the ShieldCheck icon when applicable.
+
+- **`PROGRESS.md`** — this entry.
+
+#### Files NOT touched
+
+- `app/items/page.tsx`, `app/page.tsx` (dashboard), `app/transactions/page.tsx`, `app/pricing/page.tsx`, `app/reports/*`, `app/audit/page.tsx`, `app/godown-{a,b}/page.tsx`, `components/godown-view.tsx`, `components/shell.tsx`, `components/sidebar.tsx`, `components/topbar.tsx` — none of them care about PIN/approval; they all sit behind the gates in providers.
+- `lib/utils.ts` — no new helpers needed.
+- Other SQL — `process_transaction`, `reverse_transaction`, RLS on transactions/items/godown_stock — none touched. PIN auth is orthogonal to the data layer.
+
+#### Deploy steps
+
+This is the first time a PR has a hard DB precondition since the phase-2 adjustment migration. **Do the SQL FIRST**, otherwise the app will sign in and immediately crash trying to call RPCs that don't exist.
+
+1. **Run the SQL.** Open Supabase → SQL Editor → New query. Open `db/2026-05-22-pin-auth-and-approval.sql`, copy the whole file, paste, click **Run**. The verification queries at the bottom should report `super_admins = 1` (harsh) and `pin_hash` should NOT appear in the column-grants list.
+2. **Tell Bhavik to sign up.** He goes to https://harshj111186.github.io/stock-app-v2/login/ → Sign up → enters his email + password + a 4-digit PIN of his choice. Trigger auto-approves him as admin.
+3. **First time you (Harsh) sign in after the migration**: you'll be prompted to **set your PIN** (because your existing profile didn't have one). That set-PIN screen IS your first chance to pick the PIN you'll use going forward.
+4. **Upload the changed files to GitHub.** Drag-drop each one into the right folder. The GitHub Action will rebuild and republish in ~1-2 min.
+
+#### Edge cases handled
+
+- **Existing active users keep working** — grandfathered as approved by the backfill `UPDATE`. They'll be prompted to set a PIN on their next sign-in (gate 4), then they're in.
+- **Email confirmation on (if that gets enabled in Supabase later)** — login page handles it cleanly: signup without session shows the "check your email" message and defers PIN to after confirm. Once they confirm and sign in, set-PIN gate fires.
+- **PIN locked out** — `verify_pin` raises with a "PIN locked. Try again after HH:MM" message that PinGate surfaces. Admin can reset the PIN to clear the lock, or the user can wait 15 minutes.
+- **Admin resets their own PIN** — they can use the Change PIN flow in Settings (knows their current PIN). If they forgot their current PIN, they can ask the other admin to reset it (Bhavik can reset Harsh's? No — super-admin protection blocks this. Harsh would need to use service_role to reset himself — escape hatch via Supabase dashboard). Worth noting as a follow-up risk.
+- **Two tabs of the same user** — both tabs share `sessionStorage` if they're in the same tab; different tabs each prompt for PIN once. Actually sessionStorage is per-tab; closing one doesn't affect the other. So Tab A unlocks, Tab B still needs PIN.
+- **Switching accounts in same browser** — `pinUnlocked:{userId}` is keyed by userId; signOut() clears that user's flag explicitly. New sign-in writes a new flag.
+- **PIN gate vs auth-state changes** — if Supabase fires TOKEN_REFRESHED while at the PIN gate, providers' deferred-fetch branch (post-bootstrap) re-fetches profile but does NOT re-trigger the spinner; the PIN gate stays visible.
+- **`is_super_admin` boolean instead of `superadmin` role** — chose boolean to avoid touching the role enum's value set. The role enum stays `{admin, staff, viewer}`. Cleaner migration.
+- **Modal `prompt()` for setName** — pragmatic for an admin-only utility. Not pretty but doesn't justify a custom modal yet.
+
+#### Security notes
+
+- **`pin_hash` never leaves the DB.** Column-level grant excludes it from authenticated's SELECT permissions, and every PIN operation goes through SECURITY DEFINER RPCs that compare hashes internally with `crypt()`. A client query that selects `*` from `user_profiles` won't even include the column.
+- **bcrypt cost** — using `gen_salt('bf')` with default cost factor (currently 6 in pgcrypto). 4-digit PINs are only 10K combinations; if the hash were ever exposed, a bcrypt-6 brute force is fast. The combination of column-level lockdown + lockout-after-5-attempts is the actual defense.
+- **Rate limiting** — handled inside `verify_pin` via `pin_attempts` + `pin_locked_until`. No external rate limiter needed.
+- **Super-admin escape hatch** — if Harsh ever locks himself out (forgot PIN, no Bhavik to reset, and super-admin protection blocks Bhavik anyway), the recovery path is: Supabase dashboard → SQL Editor → manually clear pin_hash for his row. Documented here so future-me can find it.
+
+#### Follow-ups (not blocking)
+
+- **"Reject signup" button** — currently pending users sit pending forever if not approved. Adding a reject that deletes the auth.users row + user_profiles row would need service-role access (auth.users isn't writable by anon/authenticated). Could be a Supabase Edge Function or a "leave as pending" convention.
+- **PIN-required for sensitive actions** — re-prompt PIN before deleting/deactivating to confirm? Not asked for, would add friction.
+- **Email notification to admin on new signup** — currently admin has to check the Users page periodically. A Supabase webhook → email would be nice.
+- **Forgot-PIN email reset** — would let user self-serve without admin involvement. User said admin-only; flag for revisit.
+- **Show last sign-in / PIN-set-at timestamps** on the Users page so admin can spot dormant accounts.
+- **PIN gate inactivity timeout** — auto-lock after N minutes of no clicks. Not asked; matches the "once per session" intent so probably not needed.
+- **Apply consistent date display** — currently the migration uses `to_char(..., 'HH24:MI')` for the lockout-until message; should use a more friendly relative-time format on the client.
+
+---
+
 ### 2026-05-21 — ABC analysis + Dead-stock reports (both placeholders → real)
 
 **User ask:** "analyse everything in stock-app-v2 and then build abc analysis and deadstock and ship them or push them, u have all the permissions to push it to git."
