@@ -183,7 +183,7 @@ begin
     raise exception 'PIN must be exactly 4 digits';
   end if;
   update user_profiles
-     set pin_hash         = crypt(p_pin, gen_salt('bf')),
+     set pin_hash         = extensions.crypt(p_pin, extensions.gen_salt('bf')),
          pin_set_at       = now(),
          pin_attempts     = 0,
          pin_locked_until = null
@@ -236,7 +236,7 @@ begin
       to_char(v_locked at time zone 'Asia/Kolkata', 'HH24:MI');
   end if;
 
-  v_ok := (v_hash = crypt(p_pin, v_hash));
+  v_ok := (v_hash = extensions.crypt(p_pin, v_hash));
 
   if v_ok then
     update user_profiles
@@ -279,10 +279,10 @@ begin
   end if;
   select pin_hash into v_hash from user_profiles where id = v_uid;
   if v_hash is null then raise exception 'no current PIN to change'; end if;
-  if v_hash <> crypt(p_old_pin, v_hash) then return false; end if;
+  if v_hash <> extensions.crypt(p_old_pin, v_hash) then return false; end if;
 
   update user_profiles
-     set pin_hash         = crypt(p_new_pin, gen_salt('bf')),
+     set pin_hash         = extensions.crypt(p_new_pin, extensions.gen_salt('bf')),
          pin_set_at       = now(),
          pin_attempts     = 0,
          pin_locked_until = null
