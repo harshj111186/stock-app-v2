@@ -36,4 +36,37 @@
     background-size: 400px 100%;
     animation: shimmer 1.5s infinite;
   }
+
+  /* ── Print styles ───────────────────────────────────────────────────
+     Used by the Reports section (Sales register etc). Kills app chrome,
+     forces black-on-white so dark-mode users get a legible printout,
+     reflows scroll containers so long tables print across pages, and
+     adds borders to table cells so the output reads like a real report.
+     `.no-print` is the custom class used by report pages; sidebar gets
+     hidden via the `aside` selector (the app only has one). */
+  @media print {
+    *, *::before, *::after {
+      background-color: transparent !important;
+      color: #000 !important;
+      border-color: #ccc !important;
+      box-shadow: none !important;
+    }
+    html, body { background: #fff !important; }
+    aside, .no-print { display: none !important; }
+    .h-screen { height: auto !important; }
+    main, .overflow-auto, .overflow-x-auto { overflow: visible !important; }
+    .p-8 { padding: 0.5rem !important; }
+    table {
+      width: 100% !important;
+      min-width: 0 !important;
+      font-size: 10px !important;
+      border-collapse: collapse !important;
+      page-break-inside: auto;
+    }
+    thead { display: table-header-group; }
+    tfoot { display: table-footer-group; }
+    tr { page-break-inside: avoid; page-break-after: auto; }
+    th, td { border: 1px solid #ddd !important; padding: 3px 5px !important; }
+    .shimmer { animation: none !important; }
+  }
 }

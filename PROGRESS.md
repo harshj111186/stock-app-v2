@@ -230,6 +230,71 @@ If you must touch one of these files: **read first, edit surgically, never repla
 
 ## 11. Changelog (latest first — add new entries at the top)
 
+### 2026-05-21 — Sales register report (first real Reports page)
+
+**User ask:** "now i want you to work on sales register."
+
+**Context.** Reports was three placeholder pages all reading "Coming next session" since the v2 scaffold went live. Sales register is the highest-priority one — it's what the user actually needs to file GSTR-1 and tally daily revenue. The placeholder copy from May 14 promised "date range, party filter, GSTIN summary, and Excel/PDF export"; this turn delivers all four (PDF via browser Print → Save as PDF, Excel via CSV which opens directly in Excel).
+
+**What the page does**
+
+- **Date range picker** with presets — Today / Yesterday / This week / This month / Last month / This FY (Apr–Mar, computed for India) / Custom range. Preset + custom dates persist in `localStorage` so a refresh doesn't kick the user back to "This month" mid-investigation. Range label in the header reads short for same-day, long for multi-day.
+- **Server-side range filter.** Supabase query is `transactions where action='Sale' and txn_date between [from, to]`, limited to 5,000 rows with a banner if the limit is hit. Ordered by `txn_date desc, created_at desc` so newest sale on each day comes first. Filtered by `txn_date` (the business date the user entered), NOT `created_at` (when the system received the entry).
+- **Client-side filters** stacked on top: godown (A / B / both), free-text search (item label, invoice, party name, HSN, note), and a "Show reversals" toggle (default ON). The toggle lets the user hide reversal pairs when reconciling, but they're visible by default because for GST you want to see them.
+- **5 KPI cards**: Sales count · Units sold (net of reversals) · Taxable amount · GST collected · Total inc. GST. All update live as filters change. Reversal count surfaces as the Sales card subtitle when present.
+- **HSN / GST summary** — collapsible card grouping rows by `(HSN code, GST rate)`. Each row: sales count, units, taxable, GST, total. Bottom totals row. This IS the GSTR-1 / "consolidated tax filing" view — paste into the portal directly.
+- **Detail table** — one row per transaction in DB order (newest first). Columns: Date · Invoice · Item (with brand chip + size + colour) · HSN · Godown · Qty · Rate · Taxable · GST % + amount · Total · Party. Reversal rows are tinted rose with a `REV` badge and a negative qty.
+- **Rate resolution** — three-tier fallback because the current Transactions page bundles invoice / party / rate / reason into one `p_note` string (the structured columns `rate`, `invoice_no`, `party_id`, `reason` are populated only on legacy v1 rows). The report tries them in order:
+  1. `t.rate` (the column) — used when populated
+  2. `parseNote(t.reason || t.status || t.note)` — extracts `rate: N` from the bundled string
+  3. Current `pricing.lp * (1 - discount)` — labelled `est` in the table because it's an estimate, not what was actually charged
+  4. Nothing — row excluded from totals, shown as `—` with an amber banner above the table counting how many rows lack a rate
+- **GST resolution** — pricing → item → 18% fallback. So a sale of an item without a pricing row but with `items.gst_rate` set still computes correctly.
+- **Note parser** is defensive: only parses as a key/value bundle (`"reason: X • inv: Y • party: Z • rate: N"`) when at least one segment matches the prefix shape. Otherwise treats the whole string as a freeform reason. The literal `"OK"` status is skipped (it's the SQL success marker, not user data).
+- **CSV export** — UTF-8 BOM (so Excel reads it correctly), Excel-safe quoting, filename `sales-register-{from}-to-{to}.csv`. Columns are GSTR-1 aligned: Date · Type · Invoice · Party · Brand · Model · Size · Colour · Item Code · HSN · Godown · Qty · Rate · Taxable · GST % · GST · Total · Note. Reversal rows go in as `Type=Reversal` with a negative qty.
+- **Print / PDF** — `window.print()` triggers the browser print dialog; "Save as PDF" works on every modern browser. New print stylesheet in `app/globals.css` hides the sidebar + topbar + filters + buttons, forces black-on-white (the app's dark-mode default would otherwise print as dark-on-dark), reflows scroll containers so long tables print across pages, and adds gridlines to table cells. Print-only header (`hidden print:block`) shows "Sales register · Rye Electricals · [range]" at the top of the printout.
+
+**Files patched**
+
+- `app/reports/sales/page.tsx` — was a 19-line `Construction` placeholder, now 568 lines real.
+- `app/globals.css` — +33 lines of print rules in the `@layer base` block. `.no-print` class definition; targets `aside`, `.h-screen`, `.overflow-auto`, `.p-8`, tables, rows, cells. Resets every element's `background-color` / `color` / `border-color` so the dark-mode UI prints as B&W.
+- `components/topbar.tsx` — one additive class (`print:hidden`) on the root div. The sidebar is hidden via the generic `aside` selector in print CSS; this complements that.
+- `PROGRESS.md` — this entry.
+
+**Files NOT touched**
+
+- All other pages, `lib/`, `components/sidebar.tsx`, the DB. The Sales register is read-only by design — it never calls `process_transaction()` or any write RPC.
+- No SQL migration. The page works with whatever the live schema is (`transactions`, `items`, `pricing`, `parties`).
+
+**Edge cases handled**
+
+- **Empty date range.** Empty state in detail + HSN summary, KPIs all zero, Export / Print buttons disabled.
+- **Range hits 5,000-row cap.** Amber banner above the KPIs telling the user to pick a shorter range. No silent truncation.
+- **Reversal sales.** Original sale and its reversal both appear with opposite signs. Reversals contribute negative `taxable` / `gst` / `total` so KPIs net out correctly. Reversals where the original is outside the date range still show (e.g. you reversed a Feb sale on May 15 — the reversal shows in May's register, with negative qty, exactly as accounting wants it).
+- **Items archived after sale.** Still shows — we look up by `item_id`. If the item is entirely missing (deleted, not archived), the label is `?` and HSN is `—`.
+- **No pricing row for an item.** Rate falls back to note parsing or shows `—`; banner above the table counts how many such rows exist so the user can fix them on Pricing.
+- **Item with explicit `gst_rate = 0`** (e.g. a future tax-exempt SKU): the GST column shows `0% · ₹0`. Correct, not treated as missing.
+- **`txn_date` vs `created_at`.** Filtering on `txn_date` means a sale entered today for yesterday's date sits in yesterday's register — matches what the user sees on the Transactions form.
+- **Dark mode print.** The print CSS uses `*` background-color overrides instead of relying on the user toggling theme first. Works regardless of what mode the screen is in.
+- **localStorage corruption.** Reads are wrapped in try/catch; bad values just fall back to defaults.
+
+**Build verified** — `npm run build` produces a clean static export. The `/reports/sales` route is 6.54 kB / 188 kB First Load JS.
+
+**Manual deploy step**
+
+None — this commit pushes to `main`, which triggers `.github/workflows/deploy.yml`. GitHub Action will rebuild and republish to Pages in ~1–2 min. Verify at https://harshj111186.github.io/stock-app-v2/reports/sales/.
+
+**Follow-ups (not blocking)**
+
+- The remaining two reports (ABC analysis, Dead stock) are still placeholders. Same shell + filters pattern would carry over.
+- Once `parties` table starts getting populated and `process_transaction` is taught to set `party_id` / `invoice_no` / `rate` as structured columns (instead of stuffing them into `p_note`), the report can drop the note-parser branch and use the columns directly. The fallback chain stays as-is so old rows keep displaying.
+- CGST/SGST split — needs customer state on `parties` to know intra-state vs inter-state. Currently shown as a single "GST" line. The footnote in the page calls this out.
+- Excel native (.xlsx) instead of CSV — would need a small library like `xlsx` (~700 KB). CSV opens fine in Excel for now; skipping the dep.
+- Sort by column header (Qty, Rate, Date desc/asc) — currently rows are in DB order. Easy add when needed.
+- "Top customers" / "Top items by revenue" mini-tables similar to the dashboard's top movers — postponed; the HSN summary covers most reporting needs.
+
+---
+
 ### 2026-05-21 — Transactions page: case-size popup on Add-to-queue + repo hygiene
 
 **User ask:** "in transaction for adjustment or purchase etc, if an item with no case size is purchased or sold or adjusted, then before processing directly to loose, a popup should appear asking for case size, once entered the case size for that item, it should process things accordingly."

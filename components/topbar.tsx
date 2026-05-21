@@ -14,7 +14,7 @@ export function Topbar({ title }: { title: string }) {
   };
 
   return (
-    <div className="h-14 bg-white/70 dark:bg-zinc-900/50 border-b border-zinc-200 dark:border-zinc-800 px-6 flex items-center gap-4 backdrop-blur">
+    <div className="h-14 bg-white/70 dark:bg-zinc-900/50 border-b border-zinc-200 dark:border-zinc-800 px-6 flex items-center gap-4 backdrop-blur print:hidden">
       <div className="flex items-center gap-2 text-sm">
         <span className="text-zinc-500">Home</span>
         <span className="text-zinc-400">›</span>
