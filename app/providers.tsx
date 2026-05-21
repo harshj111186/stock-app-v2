@@ -1,7 +1,7 @@
 "use client";
 import { createContext, useCallback, useContext, useEffect, useState, type ReactNode } from "react";
 import { useRouter, usePathname } from "next/navigation";
-import { sb, type Profile } from "@/lib/supabase";
+import { sb, type Profile, PROFILE_COLUMNS } from "@/lib/supabase";
 import { PinGate } from "@/components/pin-gate";
 import { PendingApproval } from "@/components/pending-approval";
 
@@ -71,9 +71,15 @@ export function clearPinUnlocked(userId?: string) {
 
 async function fetchProfile(userId: string): Promise<Profile | null> {
   try {
+    // Explicit column list, NOT "*" — see PROFILE_COLUMNS doc-comment in
+    // lib/supabase.ts for why. Using "*" here was the cause of a redirect-
+    // bounce-to-login regression after the PIN migration shipped: the
+    // pin_hash column-revoke made "SELECT *" fail with "permission denied
+    // for table user_profiles", fetchProfile returned null, providers'
+    // redirect effect punted to /login.
     const { data, error } = await sb()
       .from("user_profiles")
-      .select("*")
+      .select(PROFILE_COLUMNS)
       .eq("id", userId)
       .single();
     if (error) console.warn("[fetchProfile] error", error);

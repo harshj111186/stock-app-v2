@@ -112,4 +112,16 @@ export type Profile = {
   pin_set_at: string | null;
   pin_attempts: number;
   pin_locked_until: string | null;
+  created_at: string;
 };
+
+// Use this with .select(...) instead of .select("*") on user_profiles.
+//
+// Why not "*"? Because the 2026-05-22 migration revokes column-level SELECT
+// on pin_hash for the `authenticated` role. PostgreSQL rejects `SELECT *`
+// outright when the caller can't read every column ("permission denied for
+// table user_profiles"), even if the missing column is one we never wanted
+// the client to see. Explicit column list = pin_hash isn't requested =
+// query succeeds with everything we actually need.
+export const PROFILE_COLUMNS =
+  "id, email, name, role, active, is_super_admin, approved_at, approved_by, pin_set_at, pin_attempts, pin_locked_until, created_at";

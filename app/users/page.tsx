@@ -1,7 +1,7 @@
 "use client";
 import { Shell } from "@/components/shell";
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { sb, type Profile } from "@/lib/supabase";
+import { sb, type Profile, PROFILE_COLUMNS } from "@/lib/supabase";
 import { useAuth } from "@/app/providers";
 import {
   Shield, CheckCircle2, KeyRound, UserMinus, UserCheck, Pencil,
@@ -24,9 +24,11 @@ export default function UsersPage() {
   };
 
   const load = useCallback(async () => {
+    // Explicit column list (no "*") because pin_hash is column-revoked. See
+    // PROFILE_COLUMNS in lib/supabase.ts. "SELECT *" would fail outright.
     const { data, error } = await sb()
       .from("user_profiles")
-      .select("*")
+      .select(PROFILE_COLUMNS)
       .order("created_at", { ascending: false });
     if (error) {
       showToast("bad", error.message);
@@ -154,7 +156,7 @@ export default function UsersPage() {
                   <tr key={u.id} className="border-t border-zinc-200/50 dark:border-zinc-800/50">
                     <td className="px-5 py-2.5">{u.email}</td>
                     <td className="px-3 py-2.5 text-zinc-500 tnum text-xs">
-                      {(u as any).created_at ? new Date((u as any).created_at).toLocaleDateString("en-IN") : "—"}
+                      {u.created_at ? new Date(u.created_at).toLocaleDateString("en-IN") : "—"}
                     </td>
                     <td className="px-5 py-2.5 text-right">
                       <button
