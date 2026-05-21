@@ -75,13 +75,13 @@ export default function Dashboard() {
 
   return (
     <Shell title="Dashboard">
-      <div className="mb-8">
-        <h1 className="text-2xl font-semibold tracking-tight">Welcome back.</h1>
+      <div className="mb-6 md:mb-8">
+        <h1 className="text-2xl md:text-2xl font-semibold tracking-tight">Welcome back.</h1>
         <p className="text-sm text-zinc-500 mt-1">Live snapshot of your shop — pulled from Supabase.</p>
       </div>
 
       {/* KPIs */}
-      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3 mb-8">
+      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3 mb-6 md:mb-8">
         <Kpi icon={<Boxes className="w-3.5 h-3.5" />} label="SKUs" value={data.loaded ? String(data.items.length) : ""} note="in catalogue" />
         <Kpi icon={<Layers3 className="w-3.5 h-3.5" />} label="Stock A" value={data.loaded ? fmtN(totA) : ""} note="units" />
         <Kpi icon={<Layers3 className="w-3.5 h-3.5" />} label="Stock B" value={data.loaded ? fmtN(totB) : ""} note="units" />
@@ -116,35 +116,53 @@ export default function Dashboard() {
         </Card>
       </div>
 
-      {/* Recent activity */}
-      <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg overflow-hidden">
+      {/* Recent activity — table on md+, stacked cards on mobile */}
+      <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-2xl md:rounded-lg shadow-sm md:shadow-none overflow-hidden">
         <div className="px-5 py-3 border-b border-zinc-200 dark:border-zinc-800 text-sm font-medium">Recent activity</div>
-        {!data.loaded ? <Skeleton rows={6} /> : (
-          <table className="w-full text-sm">
-            <thead className="bg-zinc-50 dark:bg-zinc-900/50">
-              <tr className="text-zinc-500 text-[11px] uppercase tracking-wider">
-                <th className="text-left px-5 py-2 font-medium">When</th>
-                <th className="text-left px-3 py-2 font-medium">Action</th>
-                <th className="text-left px-3 py-2 font-medium">Item</th>
-                <th className="text-left px-3 py-2 font-medium">Godown</th>
-                <th className="text-right px-5 py-2 font-medium">Qty</th>
-              </tr>
-            </thead>
-            <tbody>
-              {data.txn.slice(0, 10).map((t) => (
-                <tr key={t.id} className="border-t border-zinc-200/50 dark:border-zinc-800/50 hover:bg-zinc-50 dark:hover:bg-zinc-800/30">
-                  <td className="px-5 py-2.5 text-zinc-500 tnum">{formatTxnTime(t.created_at)}</td>
-                  <td className="px-3 py-2.5"><span className={`px-2 py-0.5 rounded text-xs ${actionStyle(t.action)}`}>{t.action}</span></td>
-                  <td className="px-3 py-2.5">{itemLabel(t.item_id)}</td>
-                  <td className="px-3 py-2.5 text-zinc-500">{t.godown}</td>
-                  <td className="px-5 py-2.5 text-right tnum">{t.qty}</td>
+        {!data.loaded ? <Skeleton rows={6} /> : data.txn.length === 0 ? (
+          <div className="py-10 text-center text-sm text-zinc-500">No transactions logged yet.</div>
+        ) : (
+          <>
+            {/* Desktop / tablet table */}
+            <table className="w-full text-sm hidden md:table">
+              <thead className="bg-zinc-50 dark:bg-zinc-900/50">
+                <tr className="text-zinc-500 text-[11px] uppercase tracking-wider">
+                  <th className="text-left px-5 py-2 font-medium">When</th>
+                  <th className="text-left px-3 py-2 font-medium">Action</th>
+                  <th className="text-left px-3 py-2 font-medium">Item</th>
+                  <th className="text-left px-3 py-2 font-medium">Godown</th>
+                  <th className="text-right px-5 py-2 font-medium">Qty</th>
                 </tr>
+              </thead>
+              <tbody>
+                {data.txn.slice(0, 10).map((t) => (
+                  <tr key={t.id} className="border-t border-zinc-200/50 dark:border-zinc-800/50 hover:bg-zinc-50 dark:hover:bg-zinc-800/30">
+                    <td className="px-5 py-2.5 text-zinc-500 tnum">{formatTxnTime(t.created_at)}</td>
+                    <td className="px-3 py-2.5"><span className={`px-2 py-0.5 rounded text-xs ${actionStyle(t.action)}`}>{t.action}</span></td>
+                    <td className="px-3 py-2.5">{itemLabel(t.item_id)}</td>
+                    <td className="px-3 py-2.5 text-zinc-500">{t.godown}</td>
+                    <td className="px-5 py-2.5 text-right tnum">{t.qty}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            {/* Mobile cards */}
+            <ul className="md:hidden divide-y divide-zinc-200/60 dark:divide-zinc-800/60">
+              {data.txn.slice(0, 10).map((t) => (
+                <li key={t.id} className="px-4 py-3.5 hover:bg-zinc-50 dark:hover:bg-zinc-800/30">
+                  <div className="flex items-center justify-between gap-2 mb-1.5">
+                    <span className={`px-2 py-0.5 rounded text-xs ${actionStyle(t.action)}`}>{t.action}</span>
+                    <span className="text-xs text-zinc-500 tnum">{formatTxnTime(t.created_at)}</span>
+                  </div>
+                  <div className="text-sm font-medium truncate">{itemLabel(t.item_id)}</div>
+                  <div className="text-xs text-zinc-500 mt-1 flex items-center justify-between">
+                    <span>Godown {t.godown}</span>
+                    <span className="tnum text-zinc-900 dark:text-zinc-100 font-semibold text-sm">{t.qty}</span>
+                  </div>
+                </li>
               ))}
-              {data.txn.length === 0 && (
-                <tr><td colSpan={5} className="py-10 text-center text-sm text-zinc-500">No transactions logged yet.</td></tr>
-              )}
-            </tbody>
-          </table>
+            </ul>
+          </>
         )}
       </div>
     </Shell>
@@ -154,7 +172,7 @@ export default function Dashboard() {
 function Kpi({ icon, label, value, note, tone }: { icon: React.ReactNode; label: string; value: string; note: string; tone?: "warn" | "bad" }) {
   const valueColour = tone === "bad" ? "text-rose-500" : tone === "warn" ? "text-amber-500" : "";
   return (
-    <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg p-4">
+    <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-2xl md:rounded-lg shadow-sm md:shadow-none p-4">
       <div className="flex items-center gap-2 text-xs text-zinc-500 mb-2">{icon} {label}</div>
       <div className={`text-2xl font-semibold tnum ${valueColour}`}>{value || <span className="shimmer inline-block h-7 w-16 rounded" />}</div>
       <div className="text-[11px] text-zinc-500 mt-1">{note}</div>
@@ -164,7 +182,7 @@ function Kpi({ icon, label, value, note, tone }: { icon: React.ReactNode; label:
 
 function Card({ title, icon, children }: { title: string; icon?: React.ReactNode; children: React.ReactNode }) {
   return (
-    <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg p-5">
+    <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-2xl md:rounded-lg shadow-sm md:shadow-none p-5">
       <div className="flex items-center gap-2 mb-4">{icon}<div className="text-sm font-medium">{title}</div></div>
       {children}
     </div>

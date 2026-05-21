@@ -213,15 +213,15 @@ export default function ItemsPage() {
   return (
     <Shell title="Items">
       {/* ─── Header ──────────────────────────────────────────── */}
-      <div className="flex items-center justify-between mb-6">
-        <div>
-          <h1 className="text-2xl font-semibold tracking-tight">Items</h1>
+      <div className="flex items-center justify-between mb-6 gap-3">
+        <div className="min-w-0">
+          <h1 className="text-xl sm:text-2xl font-semibold tracking-tight">Items</h1>
           <p className="text-sm text-zinc-500 mt-1">
             {loaded ? `${items.length} products in catalogue` : "Loading…"}
           </p>
         </div>
-        <button className="bg-cyan-500 hover:bg-cyan-400 text-zinc-900 px-3 py-1.5 rounded-md text-sm font-medium flex items-center gap-1.5">
-          <Plus className="w-4 h-4" /> New item
+        <button className="bg-cyan-500 hover:bg-cyan-400 text-zinc-900 px-3 py-1.5 rounded-md text-sm font-medium flex items-center gap-1.5 flex-shrink-0">
+          <Plus className="w-4 h-4" /> <span className="hidden sm:inline">New item</span><span className="sm:hidden">New</span>
         </button>
       </div>
 
@@ -405,14 +405,15 @@ function Card({ item, statusOf, canWrite, onEdit }: {
   const statusColour = s === "out" ? "text-rose-500" : s === "low" ? "text-amber-500" : "text-emerald-500";
   return (
     <div className="group relative bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg p-3 hover:border-cyan-500/50 hover:shadow-sm dark:hover:shadow-cyan-500/5 transition-all cursor-pointer flex flex-col">
-      {/* Manual override edit button (only for admin/staff) */}
+      {/* Manual override edit button (only for admin/staff) — always visible
+          on touch so mobile users can find it; hover-reveal kept on md+. */}
       {canWrite && (
         <button
           type="button"
           onClick={(e) => { e.stopPropagation(); onEdit(item); }}
           title="Edit stock (manual override)"
           aria-label="Edit stock (manual override)"
-          className="absolute top-2 right-2 z-10 p-1.5 rounded-md bg-white/90 dark:bg-zinc-900/90 border border-zinc-200 dark:border-zinc-700 text-zinc-500 hover:text-cyan-600 dark:hover:text-cyan-300 hover:border-cyan-500/50 opacity-0 group-hover:opacity-100 transition-opacity shadow-sm"
+          className="absolute top-2 right-2 z-10 p-1.5 rounded-md bg-white/90 dark:bg-zinc-900/90 border border-zinc-200 dark:border-zinc-700 text-zinc-500 hover:text-cyan-600 dark:hover:text-cyan-300 hover:border-cyan-500/50 opacity-100 md:opacity-0 md:group-hover:opacity-100 transition-opacity shadow-sm"
         >
           <Pencil className="w-3.5 h-3.5" />
         </button>
@@ -478,6 +479,9 @@ function Card({ item, statusOf, canWrite, onEdit }: {
 }
 
 // ─── table view (grouped) ─────────────────────────────────────────────────
+// On md+ this is a real <table>. On mobile it collapses to a stacked card
+// list with the same grouping. Both render from the same tree so the toggle
+// state and counts stay in sync.
 function TableBody({
   tree, depth, isOpen, toggle, statusBadge, canWrite, onEdit,
 }: {
@@ -489,6 +493,83 @@ function TableBody({
   canWrite: boolean;
   onEdit: (i: Combined) => void;
 }) {
+  // ── mobile card row ────────────────────────────────────────────────────
+  const renderMobileItem = (i: Combined) => {
+    const total = i.totalA + i.totalB;
+    const s = total === 0 ? "out" : total <= 2 ? "low" : "ok";
+    const statusColour = s === "out" ? "text-rose-500" : s === "low" ? "text-amber-500" : "text-emerald-500";
+    const swatch = colourCss(i.colour);
+    return (
+      <div key={i.id} className="border-t border-zinc-200/60 dark:border-zinc-800/60 px-4 py-4 active:bg-zinc-50 dark:active:bg-zinc-800/30 flex gap-3">
+        {/* Colour swatch chip */}
+        <div
+          className="w-11 h-11 rounded-xl flex-shrink-0 flex items-center justify-center text-[10px] font-medium"
+          style={swatch ? { background: swatch.bg, color: swatch.fg } : undefined}
+        >
+          {!swatch && <Package className="w-5 h-5 text-zinc-400" strokeWidth={1.5} />}
+        </div>
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2 mb-1">
+            {i.brand && (
+              <span className="bg-cyan-500/15 text-cyan-600 dark:text-cyan-300 px-1.5 py-0.5 rounded text-[10px] uppercase tracking-wider font-medium flex-shrink-0">{i.brand}</span>
+            )}
+            <span className="text-[15px] font-semibold truncate">{i.model}</span>
+          </div>
+          <div className="text-xs text-zinc-500 mb-2 truncate">
+            {[i.size, i.colour].filter(Boolean).join(" · ") || "—"}
+            <span className="text-zinc-400"> · {i.item_code}</span>
+          </div>
+          <div className="flex items-center justify-between gap-2 text-sm tnum">
+            <div className="flex gap-3">
+              <span className="text-zinc-500">A <b className="text-zinc-900 dark:text-zinc-100">{fmtN(i.totalA)}</b></span>
+              <span className="text-zinc-500">B <b className="text-zinc-900 dark:text-zinc-100">{fmtN(i.totalB)}</b></span>
+              <span className={`${statusColour} font-semibold`}>● {fmtN(total)}</span>
+            </div>
+            {canWrite && (
+              <button
+                type="button"
+                onClick={(e) => { e.stopPropagation(); onEdit(i); }}
+                className="p-2 -mr-2 rounded text-zinc-400 hover:text-cyan-600 dark:hover:text-cyan-300"
+                aria-label="Edit stock (manual override)"
+              >
+                <Pencil className="w-4 h-4" />
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  // Flatten tree into a stack of (header | card) entries for mobile.
+  const renderMobile = (nodes: Node[], level: number): React.ReactNode[] => {
+    const out: React.ReactNode[] = [];
+    for (const n of nodes) {
+      if (depth === 0 && n.items) {
+        n.items.forEach(i => out.push(renderMobileItem(i)));
+        continue;
+      }
+      const open = isOpen(n.key);
+      out.push(
+        <button
+          key={`hdr-${n.key}`}
+          onClick={() => toggle(n.key)}
+          className="w-full flex items-center gap-2 px-3 py-2 text-left border-t border-zinc-200 dark:border-zinc-800 bg-zinc-50/50 dark:bg-zinc-900/50 hover:bg-zinc-100/60 dark:hover:bg-zinc-800/60"
+          style={{ paddingLeft: `${level * 12 + 12}px` }}
+        >
+          {open ? <ChevronDown className="w-3.5 h-3.5 text-zinc-500 flex-shrink-0" /> : <ChevronRight className="w-3.5 h-3.5 text-zinc-500 flex-shrink-0" />}
+          <span className="text-xs font-semibold uppercase tracking-wider text-zinc-700 dark:text-zinc-300 truncate">{n.label}</span>
+          <span className="text-[10px] bg-zinc-200/70 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-400 px-1.5 py-0.5 rounded tabular-nums ml-auto flex-shrink-0">{n.count}</span>
+        </button>
+      );
+      if (open) {
+        if (n.children) out.push(...renderMobile(n.children, level + 1));
+        if (n.items) n.items.forEach(i => out.push(renderMobileItem(i)));
+      }
+    }
+    return out;
+  };
+
   const renderItemRow = (i: Combined, indent: number) => {
     const c = colourCss(i.colour);
     return (
@@ -555,26 +636,33 @@ function TableBody({
   };
 
   return (
-    <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg overflow-hidden">
-      <table className="w-full text-sm">
-        <thead className="bg-zinc-50 dark:bg-zinc-900/50 border-b border-zinc-200 dark:border-zinc-800">
-          <tr className="text-zinc-500 text-[11px] uppercase tracking-wider">
-            <th className="text-left px-5 py-2.5 font-medium">Brand</th>
-            <th className="text-left px-3 py-2.5 font-medium">Model</th>
-            <th className="text-left px-3 py-2.5 font-medium">Size</th>
-            <th className="text-left px-3 py-2.5 font-medium">Colour</th>
-            <th className="text-right px-3 py-2.5 font-medium">Stock A</th>
-            <th className="text-right px-3 py-2.5 font-medium">Stock B</th>
-            <th className="text-right px-3 py-2.5 font-medium">Total</th>
-            <th className="text-right px-3 py-2.5 font-medium">Status</th>
-            <th className="px-5 py-2.5 font-medium w-10" aria-label="actions" />
-          </tr>
-        </thead>
-        <tbody>
-          {tree.map(n => renderNode(n, 0))}
-        </tbody>
-      </table>
-    </div>
+    <>
+      {/* Desktop / tablet table */}
+      <div className="hidden md:block bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg overflow-hidden">
+        <table className="w-full text-sm">
+          <thead className="bg-zinc-50 dark:bg-zinc-900/50 border-b border-zinc-200 dark:border-zinc-800">
+            <tr className="text-zinc-500 text-[11px] uppercase tracking-wider">
+              <th className="text-left px-5 py-2.5 font-medium">Brand</th>
+              <th className="text-left px-3 py-2.5 font-medium">Model</th>
+              <th className="text-left px-3 py-2.5 font-medium">Size</th>
+              <th className="text-left px-3 py-2.5 font-medium">Colour</th>
+              <th className="text-right px-3 py-2.5 font-medium">Stock A</th>
+              <th className="text-right px-3 py-2.5 font-medium">Stock B</th>
+              <th className="text-right px-3 py-2.5 font-medium">Total</th>
+              <th className="text-right px-3 py-2.5 font-medium">Status</th>
+              <th className="px-5 py-2.5 font-medium w-10" aria-label="actions" />
+            </tr>
+          </thead>
+          <tbody>
+            {tree.map(n => renderNode(n, 0))}
+          </tbody>
+        </table>
+      </div>
+      {/* Mobile card stack */}
+      <div className="md:hidden bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-2xl overflow-hidden shadow-sm">
+        {renderMobile(tree, 0)}
+      </div>
+    </>
   );
 }
 
@@ -718,18 +806,18 @@ function EditStockModal({
 
   return (
     <div
-      className="fixed inset-0 z-50 bg-black/50 dark:bg-black/70 flex items-center justify-center p-4 overflow-y-auto"
+      className="fixed inset-0 z-50 bg-black/50 dark:bg-black/70 flex items-end sm:items-center justify-center p-0 sm:p-4"
       role="dialog"
       aria-modal="true"
       aria-label="Manual stock override"
       onClick={onClose}
     >
       <div
-        className="bg-white dark:bg-zinc-900 rounded-lg w-full max-w-2xl shadow-2xl border border-zinc-200 dark:border-zinc-800 my-8"
+        className="bg-white dark:bg-zinc-900 rounded-t-2xl sm:rounded-lg w-full max-w-2xl shadow-2xl border border-zinc-200 dark:border-zinc-800 flex flex-col max-h-[95vh] sm:max-h-[90vh]"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
-        <div className="px-5 py-4 border-b border-zinc-200 dark:border-zinc-800 flex items-start justify-between gap-4">
+        <div className="px-5 py-4 border-b border-zinc-200 dark:border-zinc-800 flex items-start justify-between gap-4 flex-shrink-0">
           <div className="min-w-0">
             <h2 className="text-base font-semibold">Manual stock override</h2>
             <p className="text-xs text-zinc-500 mt-0.5 truncate">
@@ -741,14 +829,14 @@ function EditStockModal({
             type="button"
             onClick={onClose}
             aria-label="Close"
-            className="text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200 -mr-1.5"
+            className="text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200 -mr-1.5 p-1"
           >
             <X className="w-5 h-5" />
           </button>
         </div>
 
-        {/* Body */}
-        <div className="p-5 space-y-5">
+        {/* Body — scrolls within the modal so header+footer stay anchored */}
+        <div className="p-5 space-y-5 overflow-y-auto flex-1">
           <div className="bg-amber-50 dark:bg-amber-500/10 border border-amber-200 dark:border-amber-500/30 rounded-md p-3 text-[12px] text-amber-800 dark:text-amber-200 leading-relaxed">
             Use this only to <b>fix discrepancies</b> between the system and the actual physical count.
             For everyday Purchase / Sale / Transfer, use the Transactions page instead.
@@ -823,17 +911,20 @@ function EditStockModal({
         </div>
 
         {/* Footer */}
-        <div className="px-5 py-3 border-t border-zinc-200 dark:border-zinc-800 flex items-center justify-between gap-3 bg-zinc-50 dark:bg-zinc-900/50 rounded-b-lg">
-          <div className="text-[11px] text-zinc-500">
+        <div
+          className="px-5 py-3 border-t border-zinc-200 dark:border-zinc-800 flex flex-wrap items-center justify-between gap-3 bg-zinc-50 dark:bg-zinc-900/50 rounded-b-none sm:rounded-b-lg flex-shrink-0"
+          style={{ paddingBottom: "calc(0.75rem + env(safe-area-inset-bottom))" }}
+        >
+          <div className="text-[11px] text-zinc-500 w-full sm:w-auto sm:flex-1 min-w-0">
             {nothingChanged
               ? "No changes yet."
               : `Will write ${[csChanged && "case-size update", deltaA !== 0 && "A adjustment", deltaB !== 0 && "B adjustment"].filter(Boolean).join(" + ")}.`}
           </div>
-          <div className="flex gap-2">
+          <div className="flex gap-2 ml-auto">
             <button
               type="button"
               onClick={onClose}
-              className="px-3 py-1.5 text-sm text-zinc-600 dark:text-zinc-300 hover:bg-zinc-200 dark:hover:bg-zinc-800 rounded-md"
+              className="px-3 py-2 text-sm text-zinc-600 dark:text-zinc-300 hover:bg-zinc-200 dark:hover:bg-zinc-800 rounded-md"
             >
               Cancel
             </button>
@@ -841,7 +932,7 @@ function EditStockModal({
               type="button"
               onClick={save}
               disabled={saving || nothingChanged}
-              className="bg-cyan-500 hover:bg-cyan-400 disabled:opacity-40 disabled:cursor-not-allowed text-zinc-900 px-3.5 py-1.5 rounded-md text-sm font-medium flex items-center gap-1.5"
+              className="bg-cyan-500 hover:bg-cyan-400 disabled:opacity-40 disabled:cursor-not-allowed text-zinc-900 px-3.5 py-2 rounded-md text-sm font-medium flex items-center gap-1.5"
             >
               {saving ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Save className="w-3.5 h-3.5" />}
               {saving ? "Saving…" : "Save override"}

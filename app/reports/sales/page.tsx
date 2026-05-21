@@ -4,6 +4,7 @@ import {
   Calendar, Download, RotateCcw, ShoppingCart, Boxes, ListChecks, AlertCircle,
 } from "lucide-react";
 import { Shell } from "@/components/shell";
+import { ReportsSubnav } from "@/components/reports-subnav";
 import { sb, type Txn } from "@/lib/supabase";
 import { fmtN } from "@/lib/utils";
 
@@ -267,8 +268,9 @@ export default function SalesRegisterPage() {
 
   return (
     <Shell title="Sales register">
+      <ReportsSubnav />
       <div className="mb-6">
-        <h1 className="text-2xl font-semibold tracking-tight">Sales register</h1>
+        <h1 className="text-xl sm:text-2xl font-semibold tracking-tight">Sales register</h1>
         <p className="text-sm text-zinc-500 mt-1 tabular-nums">
           {loaded
             ? <>{rangeLabel} · {fmtN(visibleRows.length)} {visibleRows.length === 1 ? "row" : "rows"} shown</>
@@ -365,8 +367,8 @@ export default function SalesRegisterPage() {
         />
       </div>
 
-      {/* Table */}
-      <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg overflow-hidden">
+      {/* Table — desktop */}
+      <div className="hidden md:block bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg overflow-hidden">
         <table className="w-full text-sm">
           <thead className="bg-zinc-50 dark:bg-zinc-900/50 border-b border-zinc-200 dark:border-zinc-800">
             <tr className="text-zinc-500 text-[11px] uppercase tracking-wider">
@@ -446,6 +448,64 @@ export default function SalesRegisterPage() {
             </tfoot>
           )}
         </table>
+      </div>
+
+      {/* Mobile cards */}
+      <div className="md:hidden bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-2xl overflow-hidden shadow-sm">
+        {!loaded && <div className="py-10 text-center text-sm text-zinc-500">Loading…</div>}
+        {loaded && visibleRows.length === 0 && !err && (
+          <div className="py-12 text-center text-sm text-zinc-500 px-4">
+            {rows.length === 0
+              ? "No sales in this range."
+              : "No active sales in this range. Tick “Show reversed entries” to see the audit rows."}
+          </div>
+        )}
+        <ul className="divide-y divide-zinc-200/60 dark:divide-zinc-800/60">
+          {loaded && visibleRows.map(r => (
+            <li key={r.id} className={[
+              "px-4 py-3",
+              r.state === "reversal" ? "bg-amber-500/5" : "",
+            ].join(" ")}>
+              <div className="flex items-center justify-between gap-2 mb-1">
+                <span className="text-[11px] text-zinc-500 tnum">{fmtDateDisplay(r.txn_date)}</span>
+                <span className="text-xs">
+                  {r.state === "active" && <span className="text-emerald-600 dark:text-emerald-400">● Active</span>}
+                  {r.state === "reversed" && (
+                    <span className="text-rose-500 inline-flex items-center gap-1">
+                      <RotateCcw className="w-3 h-3" /> Reversed
+                    </span>
+                  )}
+                  {r.state === "reversal" && (
+                    <span className="text-amber-600 dark:text-amber-400 inline-flex items-center gap-1">
+                      <RotateCcw className="w-3 h-3" /> Reverses…
+                    </span>
+                  )}
+                </span>
+              </div>
+              <div className={["text-sm truncate", r.state === "reversed" ? "line-through text-zinc-500" : ""].join(" ")}>
+                {r.itemLabel}
+              </div>
+              <div className="flex items-center justify-between mt-1 text-xs text-zinc-500">
+                <span className="tnum">{r.itemCode} · Godown {r.godown}</span>
+                <span className={[
+                  "tnum font-medium",
+                  r.state === "reversed" ? "line-through text-zinc-500" : "",
+                  r.state === "reversal" ? "text-amber-600 dark:text-amber-400" : "text-zinc-700 dark:text-zinc-200",
+                ].join(" ")}>
+                  {fmtN(r.qty)}
+                </span>
+              </div>
+            </li>
+          ))}
+        </ul>
+        {loaded && activeRows.length > 0 && (
+          <div className="border-t-2 border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-900/40 px-4 py-2.5 flex items-center justify-between text-xs">
+            <span className="uppercase tracking-wider text-zinc-500 font-medium">Totals (active)</span>
+            <span className="tnum">
+              <b>{fmtN(totals.qty)}</b> units · {fmtN(totals.count)} sale{totals.count === 1 ? "" : "s"}
+            </span>
+          </div>
+        )}
       </div>
     </Shell>
   );

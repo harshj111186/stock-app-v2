@@ -251,7 +251,7 @@ export default function PricingPage() {
       {/* ─── Header ─────────────────────────────────────────────── */}
       <div className="flex items-center justify-between mb-6">
         <div>
-          <h1 className="text-2xl font-semibold tracking-tight">Pricing</h1>
+          <h1 className="text-xl sm:text-2xl font-semibold tracking-tight">Pricing</h1>
           <p className="text-sm text-zinc-500 mt-1">
             {loaded
               ? <>{priced} of {rows.length} items priced · LP, stacked discounts, GST. Edits save on blur.</>
@@ -328,6 +328,8 @@ export default function PricingPage() {
 }
 
 // ─── Table ──────────────────────────────────────────────────────────────
+// Desktop: real <table>. Mobile: stacked cards, one per item, with the same
+// edit handlers so blur-save behaviour is identical.
 function PricingTable({
   rows, canWrite, saveStates,
   onLpChange, onGstChange, onDiscChange, onDiscAdd, onDiscRemove, onCommit,
@@ -343,38 +345,209 @@ function PricingTable({
   onCommit: (id: string) => void;
 }) {
   return (
-    // overflow-x-auto so a row with many stacked discounts can scroll
-    // horizontally rather than forcing the whole layout to widen.
-    <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg overflow-x-auto">
-      <table className="w-full text-sm min-w-[900px]">
-        <thead className="bg-zinc-50 dark:bg-zinc-900/50 border-b border-zinc-200 dark:border-zinc-800">
-          <tr className="text-zinc-500 text-[11px] uppercase tracking-wider">
-            <th className="text-left px-5 py-2.5 font-medium">Item</th>
-            <th className="text-right px-3 py-2.5 font-medium w-28">LP (₹)</th>
-            <th className="text-left px-3 py-2.5 font-medium">Discounts (%)</th>
-            <th className="text-right px-3 py-2.5 font-medium w-28">Taxable (₹)</th>
-            <th className="text-right px-3 py-2.5 font-medium w-24">GST %</th>
-            <th className="text-right px-3 py-2.5 font-medium w-28">Final (₹)</th>
-            <th className="text-center px-3 py-2.5 font-medium w-10" aria-label="save status" />
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map(r => (
-            <PricingRow
-              key={r.id}
-              row={r}
-              canWrite={canWrite}
-              saveState={saveStates[r.id] ?? "idle"}
-              onLpChange={onLpChange}
-              onGstChange={onGstChange}
-              onDiscChange={onDiscChange}
-              onDiscAdd={onDiscAdd}
-              onDiscRemove={onDiscRemove}
-              onCommit={onCommit}
-            />
+    <>
+      {/* Desktop / tablet table — overflow-x-auto so a row with many stacked
+          discounts can scroll horizontally rather than forcing the layout to
+          widen. */}
+      <div className="hidden md:block bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg overflow-x-auto">
+        <table className="w-full text-sm min-w-[900px]">
+          <thead className="bg-zinc-50 dark:bg-zinc-900/50 border-b border-zinc-200 dark:border-zinc-800">
+            <tr className="text-zinc-500 text-[11px] uppercase tracking-wider">
+              <th className="text-left px-5 py-2.5 font-medium">Item</th>
+              <th className="text-right px-3 py-2.5 font-medium w-28">LP (₹)</th>
+              <th className="text-left px-3 py-2.5 font-medium">Discounts (%)</th>
+              <th className="text-right px-3 py-2.5 font-medium w-28">Taxable (₹)</th>
+              <th className="text-right px-3 py-2.5 font-medium w-24">GST %</th>
+              <th className="text-right px-3 py-2.5 font-medium w-28">Final (₹)</th>
+              <th className="text-center px-3 py-2.5 font-medium w-10" aria-label="save status" />
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map(r => (
+              <PricingRow
+                key={r.id}
+                row={r}
+                canWrite={canWrite}
+                saveState={saveStates[r.id] ?? "idle"}
+                onLpChange={onLpChange}
+                onGstChange={onGstChange}
+                onDiscChange={onDiscChange}
+                onDiscAdd={onDiscAdd}
+                onDiscRemove={onDiscRemove}
+                onCommit={onCommit}
+              />
+            ))}
+          </tbody>
+        </table>
+      </div>
+      {/* Mobile cards */}
+      <div className="md:hidden space-y-2">
+        {rows.map(r => (
+          <PricingMobileCard
+            key={r.id}
+            row={r}
+            canWrite={canWrite}
+            saveState={saveStates[r.id] ?? "idle"}
+            onLpChange={onLpChange}
+            onGstChange={onGstChange}
+            onDiscChange={onDiscChange}
+            onDiscAdd={onDiscAdd}
+            onDiscRemove={onDiscRemove}
+            onCommit={onCommit}
+          />
+        ))}
+      </div>
+    </>
+  );
+}
+
+function PricingMobileCard({
+  row, canWrite, saveState,
+  onLpChange, onGstChange, onDiscChange, onDiscAdd, onDiscRemove, onCommit,
+}: {
+  row: Row;
+  canWrite: boolean;
+  saveState: SaveState;
+  onLpChange: (id: string, v: string) => void;
+  onGstChange: (id: string, v: string) => void;
+  onDiscChange: (id: string, idx: number, v: string) => void;
+  onDiscAdd: (id: string) => void;
+  onDiscRemove: (id: string, idx: number) => void;
+  onCommit: (id: string) => void;
+}) {
+  const lpN = num(row.lp);
+  const discFracs = row.discPcts.map(pctToFrac).filter(f => f > 0);
+  const combined = combinedDisc(discFracs);
+  const gstN = pctToFrac(row.gstPct);
+  const taxable = lpN * (1 - combined);
+  const final = taxable * (1 + gstN);
+
+  const commit = () => onCommit(row.id);
+  const handleKey = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+  };
+  const lastIsEmpty = row.discPcts.length > 0 && !row.discPcts[row.discPcts.length - 1].trim();
+  const canAddDisc = canWrite && !lastIsEmpty;
+
+  return (
+    <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-2xl shadow-sm p-4">
+      {/* Header */}
+      <div className="flex items-start justify-between gap-2 mb-3">
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2 mb-0.5">
+            {row.brand
+              ? <span className="bg-cyan-500/15 text-cyan-600 dark:text-cyan-300 px-1.5 py-0.5 rounded text-[10px] uppercase tracking-wider font-medium flex-shrink-0">{row.brand}</span>
+              : <span className="text-zinc-400 text-[10px] italic">no brand</span>}
+            <span className="text-sm font-medium truncate">{row.model}</span>
+          </div>
+          <div className="text-[11px] text-zinc-500 truncate">
+            {[row.size, row.colour].filter(Boolean).join(" · ") || "—"}
+            <span className="text-zinc-400"> · {row.item_code}</span>
+            {!row.hasRow && <span className="ml-1 text-amber-500 uppercase tracking-wider">unpriced</span>}
+          </div>
+        </div>
+        <SaveIndicator state={saveState} />
+      </div>
+
+      {/* LP + GST in a row */}
+      <div className="grid grid-cols-2 gap-3 mb-3">
+        <div>
+          <div className="text-[10px] uppercase tracking-wider text-zinc-500 mb-1">LP (₹)</div>
+          <input
+            type="number" inputMode="decimal" min="0" step="0.01"
+            value={row.lp}
+            placeholder="0"
+            disabled={!canWrite}
+            onChange={(e) => onLpChange(row.id, e.target.value)}
+            onBlur={commit}
+            onKeyDown={handleKey}
+            onFocus={(e) => e.target.select()}
+            className="w-full bg-zinc-50 dark:bg-zinc-800/60 border border-zinc-200 dark:border-zinc-700 rounded-md px-2 py-2 text-sm tnum focus:outline-none focus:border-cyan-500 disabled:opacity-60 [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
+          />
+        </div>
+        <div>
+          <div className="text-[10px] uppercase tracking-wider text-zinc-500 mb-1">GST %</div>
+          <input
+            type="number" inputMode="decimal" min="0" step="0.01"
+            value={row.gstPct}
+            placeholder="18"
+            disabled={!canWrite}
+            onChange={(e) => onGstChange(row.id, e.target.value)}
+            onBlur={commit}
+            onKeyDown={handleKey}
+            onFocus={(e) => e.target.select()}
+            className="w-full bg-zinc-50 dark:bg-zinc-800/60 border border-zinc-200 dark:border-zinc-700 rounded-md px-2 py-2 text-sm tnum focus:outline-none focus:border-cyan-500 disabled:opacity-60 [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
+          />
+        </div>
+      </div>
+
+      {/* Stacked discounts */}
+      <div className="mb-3">
+        <div className="text-[10px] uppercase tracking-wider text-zinc-500 mb-1.5">Discounts (%)</div>
+        <div className="flex flex-wrap items-center gap-1.5">
+          {row.discPcts.map((pct, idx) => (
+            <span key={idx} className="flex items-center gap-1 group/disc">
+              {idx > 0 && <span className="text-zinc-400 text-[11px] select-none">×</span>}
+              <div className="relative">
+                <input
+                  type="number" inputMode="decimal" min="0" step="0.01"
+                  value={pct}
+                  placeholder="0"
+                  disabled={!canWrite}
+                  autoFocus={idx === row.discPcts.length - 1 && !pct}
+                  onChange={(e) => onDiscChange(row.id, idx, e.target.value)}
+                  onBlur={commit}
+                  onKeyDown={handleKey}
+                  onFocus={(e) => e.target.select()}
+                  className="w-16 bg-zinc-50 dark:bg-zinc-800/60 border border-zinc-200 dark:border-zinc-700 rounded-md px-2 py-1.5 text-sm tnum text-right focus:outline-none focus:border-cyan-500 disabled:opacity-60 [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
+                />
+                {canWrite && (
+                  <button
+                    type="button"
+                    onClick={() => onDiscRemove(row.id, idx)}
+                    aria-label={`Remove discount ${idx + 1}`}
+                    className="absolute -top-1.5 -right-1.5 w-4 h-4 rounded-full bg-zinc-200 dark:bg-zinc-700 text-zinc-500 hover:bg-rose-500 hover:text-white flex items-center justify-center"
+                  >
+                    <X className="w-2.5 h-2.5" strokeWidth={3} />
+                  </button>
+                )}
+              </div>
+            </span>
           ))}
-        </tbody>
-      </table>
+          {canWrite && (
+            <button
+              type="button"
+              onClick={() => onDiscAdd(row.id)}
+              disabled={!canAddDisc}
+              aria-label="Add stacked discount"
+              className="w-8 h-8 rounded border border-dashed border-zinc-300 dark:border-zinc-700 text-zinc-500 hover:border-cyan-500 hover:text-cyan-500 disabled:opacity-30 flex items-center justify-center"
+            >
+              <Plus className="w-3.5 h-3.5" />
+            </button>
+          )}
+          {discFracs.length > 1 && (
+            <span className="ml-1 text-[10px] tabular-nums text-zinc-400 dark:text-zinc-500 self-center" title="Combined effective discount">
+              = {(combined * 100).toFixed(combined * 100 < 10 ? 2 : 1)}%
+            </span>
+          )}
+        </div>
+      </div>
+
+      {/* Derived values */}
+      <div className="grid grid-cols-2 gap-3 pt-3 border-t border-zinc-100 dark:border-zinc-800/60 text-sm">
+        <div>
+          <div className="text-[10px] uppercase tracking-wider text-zinc-500 mb-0.5">Taxable</div>
+          <div className="tnum text-zinc-700 dark:text-zinc-300">
+            {lpN > 0 ? fmtMoney(taxable) : <span className="text-zinc-400">—</span>}
+          </div>
+        </div>
+        <div className="text-right">
+          <div className="text-[10px] uppercase tracking-wider text-zinc-500 mb-0.5">Final</div>
+          <div className="tnum font-semibold">
+            {lpN > 0 ? fmtMoney(final) : <span className="text-zinc-400 font-normal">—</span>}
+          </div>
+        </div>
+      </div>
     </div>
   );
 }

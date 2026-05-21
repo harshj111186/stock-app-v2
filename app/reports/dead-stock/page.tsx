@@ -5,6 +5,7 @@ import {
   AlertCircle, Clock,
 } from "lucide-react";
 import { Shell } from "@/components/shell";
+import { ReportsSubnav } from "@/components/reports-subnav";
 import { sb, type Item, type Stock, type Pricing, type Txn } from "@/lib/supabase";
 import { fmtN, fmtMoney } from "@/lib/utils";
 
@@ -363,8 +364,9 @@ export default function DeadStockPage() {
 
   return (
     <Shell title="Dead stock">
+      <ReportsSubnav />
       <div className="mb-6">
-        <h1 className="text-2xl font-semibold tracking-tight">Dead stock</h1>
+        <h1 className="text-xl sm:text-2xl font-semibold tracking-tight">Dead stock</h1>
         <p className="text-sm text-zinc-500 mt-1 tabular-nums">
           {loaded
             ? <>Items in stock with no {basis === "salesOnly" ? "sales" : "outward movement"} in the last {thresholdDays} days · {fmtN(totals.skus)} SKU{totals.skus === 1 ? "" : "s"} · {fmtMoney(totals.capital)} blocked</>
@@ -507,8 +509,8 @@ export default function DeadStockPage() {
         </div>
       </div>
 
-      {/* Table */}
-      <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg overflow-hidden">
+      {/* Table — desktop */}
+      <div className="hidden md:block bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg overflow-hidden">
         <table className="w-full text-sm">
           <thead className="bg-zinc-50 dark:bg-zinc-900/50 border-b border-zinc-200 dark:border-zinc-800">
             <tr className="text-zinc-500 text-[11px] uppercase tracking-wider">
@@ -595,6 +597,60 @@ export default function DeadStockPage() {
             </tfoot>
           )}
         </table>
+      </div>
+
+      {/* Mobile cards */}
+      <div className="md:hidden bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-2xl overflow-hidden shadow-sm">
+        {!loaded && <div className="py-10 text-center text-sm text-zinc-500">Loading…</div>}
+        {loaded && visibleRows.length === 0 && !err && (
+          <div className="py-12 text-center text-sm text-zinc-500 px-4">
+            {deadRows.length === 0
+              ? "No dead stock at this threshold. Everything is moving."
+              : "No items match the current filters."}
+          </div>
+        )}
+        <ul className="divide-y divide-zinc-200/60 dark:divide-zinc-800/60">
+          {loaded && visibleRows.map(r => {
+            const daysToneCls =
+              r.neverMoved || (r.daysSinceMovement ?? 0) >= 180 ? "text-rose-500" :
+              (r.daysSinceMovement ?? 0) >= 90 ? "text-amber-500" :
+              "text-zinc-500";
+            return (
+              <li key={r.itemId} className="px-4 py-3">
+                <div className="flex items-start justify-between gap-2 mb-1">
+                  <div className="text-sm font-medium truncate">{r.itemLabel}</div>
+                  <span className={`text-[11px] tnum flex-shrink-0 ${daysToneCls}`}>
+                    {r.neverMoved ? "never sold" : `${fmtN(r.daysSinceMovement ?? 0)}d idle`}
+                  </span>
+                </div>
+                <div className="text-[11px] text-zinc-400 tnum flex flex-wrap items-center gap-x-2 gap-y-0.5 mb-2">
+                  <span>{r.itemCode}</span>
+                  {r.brand && <span className="text-zinc-500">· {r.brand}</span>}
+                  {r.category && <span className="text-zinc-500">· {r.category}</span>}
+                  {!r.hasPricing && <span className="text-amber-500">· no pricing</span>}
+                </div>
+                <div className="flex items-center justify-between text-xs">
+                  <div className="flex gap-3 tabular-nums">
+                    <span className="text-zinc-500">A <b className="text-zinc-700 dark:text-zinc-200">{fmtN(r.unitsA)}</b></span>
+                    <span className="text-zinc-500">B <b className="text-zinc-700 dark:text-zinc-200">{fmtN(r.unitsB)}</b></span>
+                    <span className="text-zinc-500">= <b className="text-zinc-700 dark:text-zinc-200">{fmtN(r.totalUnits)}</b></span>
+                  </div>
+                  <span className="tnum font-semibold">
+                    {r.hasPricing ? fmtMoney(r.blockedCapital) : "—"}
+                  </span>
+                </div>
+              </li>
+            );
+          })}
+        </ul>
+        {loaded && visibleRows.length > 0 && (
+          <div className="border-t-2 border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-900/40 px-4 py-2.5 flex items-center justify-between text-xs">
+            <span className="uppercase tracking-wider text-zinc-500 font-medium">Visible totals</span>
+            <span className="tnum font-semibold">
+              {fmtN(visibleRows.reduce((s, r) => s + r.totalUnits, 0))} units · {fmtMoney(visibleRows.reduce((s, r) => s + r.blockedCapital, 0))}
+            </span>
+          </div>
+        )}
       </div>
 
       <div className="mt-4 text-[11px] text-zinc-500 leading-relaxed max-w-3xl">

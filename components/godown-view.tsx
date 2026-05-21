@@ -214,16 +214,16 @@ export function GodownView({ godown }: { godown: Godown }) {
     <Shell title={`Godown ${godown}`}>
       {/* Header */}
       <div className="flex items-center justify-between mb-6">
-        <div>
-          <h1 className="text-2xl font-semibold tracking-tight">Godown {godown}</h1>
+        <div className="min-w-0">
+          <h1 className="text-xl sm:text-2xl font-semibold tracking-tight">Godown {godown}</h1>
           <p className="text-sm text-zinc-500 mt-1 tabular-nums">
             {loaded
-              ? <>
+              ? <span className="block sm:inline">
                   {fmtN(stats.countInStock)} items in stock ·{" "}
-                  <span className="text-zinc-700 dark:text-zinc-300">{fmtN(stats.totalCases)}</span> cases +{" "}
-                  <span className="text-zinc-700 dark:text-zinc-300">{fmtN(stats.totalLoose)}</span> loose ={" "}
+                  <span className="text-zinc-700 dark:text-zinc-300">{fmtN(stats.totalCases)}</span> c +{" "}
+                  <span className="text-zinc-700 dark:text-zinc-300">{fmtN(stats.totalLoose)}</span> L ={" "}
                   <span className="text-zinc-700 dark:text-zinc-300 font-medium">{fmtN(stats.totalUnits)}</span> units
-                </>
+                </span>
               : "Loading…"}
           </p>
         </div>
@@ -458,6 +458,8 @@ function GodownCard({
 }
 
 // ─── table view (grouped) ────────────────────────────────────────────────
+// Desktop: real <table>. Mobile: stacked cards using the same tree so the
+// expand/collapse state stays in sync with the desktop view.
 function TableBody({
   tree, depth, isOpen, toggle, statusOf,
 }: {
@@ -467,6 +469,86 @@ function TableBody({
   toggle: (key: string) => void;
   statusOf: (i: ItemHere) => "never" | "out" | "low" | "ok";
 }) {
+  // ── mobile card ────────────────────────────────────────────────────────
+  const renderMobileItem = (i: ItemHere) => {
+    const s = statusOf(i);
+    const statusColour =
+      s === "never" ? "text-zinc-400 dark:text-zinc-500"
+      : s === "out" ? "text-rose-500"
+      : s === "low" ? "text-amber-500"
+      : "text-emerald-500";
+    const statusLabel =
+      s === "never" ? "Never" : s === "out" ? "Out" : s === "low" ? "Low" : "Healthy";
+    const swatch = colourCss(i.colour);
+    return (
+      <div key={i.id} className="border-t border-zinc-200/60 dark:border-zinc-800/60 px-4 py-4 active:bg-zinc-50 dark:active:bg-zinc-800/30 flex gap-3">
+        <div
+          className="w-11 h-11 rounded-xl flex-shrink-0 flex items-center justify-center"
+          style={swatch ? { background: swatch.bg, color: swatch.fg } : undefined}
+        >
+          {!swatch && <Package className="w-5 h-5 text-zinc-400" strokeWidth={1.5} />}
+        </div>
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2 mb-1">
+            {i.brand && (
+              <span className="bg-cyan-500/15 text-cyan-600 dark:text-cyan-300 px-1.5 py-0.5 rounded text-[10px] uppercase tracking-wider font-medium flex-shrink-0">{i.brand}</span>
+            )}
+            <span className="text-[15px] font-semibold truncate">{i.model}</span>
+          </div>
+          <div className="text-xs text-zinc-500 mb-2 truncate">
+            {[i.size, i.colour].filter(Boolean).join(" · ") || "—"}
+            <span className="text-zinc-400"> · {i.item_code}</span>
+          </div>
+          <div className="flex items-center justify-between text-sm">
+            <div className="flex items-center gap-1.5 tabular-nums">
+              {s === "never" ? (
+                <span className="text-zinc-400 dark:text-zinc-500 italic text-xs">no entry</span>
+              ) : (
+                <>
+                  <span className="bg-zinc-100 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-300 px-1.5 py-0.5 rounded text-xs font-medium">{fmtN(i.cases)}c</span>
+                  <span className="bg-zinc-100 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-300 px-1.5 py-0.5 rounded text-xs font-medium">{fmtN(i.loose)}L</span>
+                  <span className="text-zinc-400 text-xs">=</span>
+                  <span className="text-zinc-900 dark:text-zinc-100 font-semibold">{fmtN(i.total)}</span>
+                </>
+              )}
+            </div>
+            <span className={`${statusColour} font-semibold text-xs`}>● {statusLabel}</span>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  const renderMobile = (nodes: Node[], level: number): React.ReactNode[] => {
+    const out: React.ReactNode[] = [];
+    for (const n of nodes) {
+      if (depth === 0 && n.items) {
+        n.items.forEach(i => out.push(renderMobileItem(i)));
+        continue;
+      }
+      const open = isOpen(n.key);
+      out.push(
+        <button
+          key={`hdr-${n.key}`}
+          onClick={() => toggle(n.key)}
+          className="w-full flex items-center gap-2 px-3 py-2 text-left border-t border-zinc-200 dark:border-zinc-800 bg-zinc-50/50 dark:bg-zinc-900/50 hover:bg-zinc-100/60 dark:hover:bg-zinc-800/60"
+          style={{ paddingLeft: `${level * 12 + 12}px` }}
+        >
+          {open
+            ? <ChevronDown className="w-3.5 h-3.5 text-zinc-500 flex-shrink-0" />
+            : <ChevronRight className="w-3.5 h-3.5 text-zinc-500 flex-shrink-0" />}
+          <span className="text-xs font-semibold uppercase tracking-wider text-zinc-700 dark:text-zinc-300 truncate">{n.label}</span>
+          <span className="text-[10px] bg-zinc-200/70 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-400 px-1.5 py-0.5 rounded tabular-nums ml-auto flex-shrink-0">{n.count}</span>
+        </button>
+      );
+      if (open) {
+        if (n.children) out.push(...renderMobile(n.children, level + 1));
+        if (n.items) n.items.forEach(i => out.push(renderMobileItem(i)));
+      }
+    }
+    return out;
+  };
+
   const renderItemRow = (i: ItemHere, indent: number) => {
     const c = colourCss(i.colour);
     const s = statusOf(i);
@@ -532,25 +614,30 @@ function TableBody({
   };
 
   return (
-    <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg overflow-hidden">
-      <table className="w-full text-sm">
-        <thead className="bg-zinc-50 dark:bg-zinc-900/50 border-b border-zinc-200 dark:border-zinc-800">
-          <tr className="text-zinc-500 text-[11px] uppercase tracking-wider">
-            <th className="text-left px-5 py-2.5 font-medium">Brand</th>
-            <th className="text-left px-3 py-2.5 font-medium">Model</th>
-            <th className="text-left px-3 py-2.5 font-medium">Size</th>
-            <th className="text-left px-3 py-2.5 font-medium">Colour</th>
-            <th className="text-right px-3 py-2.5 font-medium">Cases</th>
-            <th className="text-right px-3 py-2.5 font-medium">Loose</th>
-            <th className="text-right px-3 py-2.5 font-medium">Total</th>
-            <th className="text-right px-5 py-2.5 font-medium">Status</th>
-          </tr>
-        </thead>
-        <tbody>
-          {tree.map(n => renderNode(n, 0))}
-        </tbody>
-      </table>
-    </div>
+    <>
+      <div className="hidden md:block bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg overflow-hidden">
+        <table className="w-full text-sm">
+          <thead className="bg-zinc-50 dark:bg-zinc-900/50 border-b border-zinc-200 dark:border-zinc-800">
+            <tr className="text-zinc-500 text-[11px] uppercase tracking-wider">
+              <th className="text-left px-5 py-2.5 font-medium">Brand</th>
+              <th className="text-left px-3 py-2.5 font-medium">Model</th>
+              <th className="text-left px-3 py-2.5 font-medium">Size</th>
+              <th className="text-left px-3 py-2.5 font-medium">Colour</th>
+              <th className="text-right px-3 py-2.5 font-medium">Cases</th>
+              <th className="text-right px-3 py-2.5 font-medium">Loose</th>
+              <th className="text-right px-3 py-2.5 font-medium">Total</th>
+              <th className="text-right px-5 py-2.5 font-medium">Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            {tree.map(n => renderNode(n, 0))}
+          </tbody>
+        </table>
+      </div>
+      <div className="md:hidden bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-2xl overflow-hidden shadow-sm">
+        {renderMobile(tree, 0)}
+      </div>
+    </>
   );
 }
 

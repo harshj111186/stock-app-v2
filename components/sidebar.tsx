@@ -30,6 +30,7 @@ const NAV = [
   ]},
 ];
 
+// Desktop-only sidebar (md+). Mobile uses BottomTabBar instead.
 export function Sidebar() {
   const pathname = usePathname();
   const { profile, signOut } = useAuth();
@@ -37,7 +38,7 @@ export function Sidebar() {
     href === "/" ? pathname === "/" || pathname === "" : pathname?.startsWith(href);
 
   return (
-    <aside className="w-60 flex-shrink-0 bg-zinc-50 dark:bg-zinc-900 border-r border-zinc-200 dark:border-zinc-800 flex flex-col">
+    <aside className="hidden md:flex w-60 flex-shrink-0 bg-zinc-50 dark:bg-zinc-900 border-r border-zinc-200 dark:border-zinc-800 flex-col">
       {/* Brand */}
       <div className="px-5 py-4 border-b border-zinc-200 dark:border-zinc-800 flex items-center gap-2.5">
         <div className="w-7 h-7 bg-cyan-500 rounded-md flex items-center justify-center">

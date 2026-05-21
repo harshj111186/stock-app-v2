@@ -493,15 +493,15 @@ export default function TransactionsPage() {
     <Shell title="Transactions">
       <div className="flex items-center justify-between mb-6">
         <div>
-          <h1 className="text-2xl font-semibold tracking-tight">Transactions</h1>
+          <h1 className="text-xl sm:text-2xl font-semibold tracking-tight">Transactions</h1>
           <p className="text-sm text-zinc-500 mt-1">
-            {loaded ? `${txns.length} recent entries` : "Loading…"} — batch entry: queue everything first, process in safe order so a Sale never fails before its Purchase has landed.
+            {loaded ? `${txns.length} recent entries` : "Loading…"} — batch entry: queue first, then process in safe order so a Sale never fails before its Purchase has landed.
           </p>
         </div>
       </div>
 
       {/* ── Entry form ─────────────────────────────────────────────────── */}
-      <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg overflow-hidden mb-8">
+      <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-2xl md:rounded-lg shadow-sm md:shadow-none overflow-hidden mb-6 md:mb-8">
         <div className="flex border-b border-zinc-200 dark:border-zinc-800">
           {ALL_ACTIONS.map((a) => {
             const active = f.action === a;
@@ -515,21 +515,23 @@ export default function TransactionsPage() {
                 key={a}
                 type="button"
                 onClick={() => setF((x) => ({ ...x, action: a }))}
+                title={a}
+                aria-label={a}
                 className={[
-                  "flex-1 flex items-center justify-center gap-2 py-3 text-sm border-b-2 transition-colors",
+                  "flex-1 flex items-center justify-center gap-1.5 sm:gap-2 py-3 text-xs sm:text-sm border-b-2 transition-colors",
                   active
                     ? "text-cyan-600 dark:text-cyan-400 border-cyan-500 bg-cyan-500/5"
                     : "text-zinc-600 dark:text-zinc-400 border-transparent hover:bg-zinc-50 dark:hover:bg-zinc-800/40",
                 ].join(" ")}
               >
-                <Icon className="w-4 h-4" />
-                <span>{a}</span>
+                <Icon className="w-4 h-4 flex-shrink-0" />
+                <span className="truncate">{a}</span>
               </button>
             );
           })}
         </div>
 
-        <div className="p-6 grid gap-4 md:grid-cols-2">
+        <div className="p-4 sm:p-6 grid gap-4 md:grid-cols-2">
           <div className="md:col-span-2">
             <Label>Item</Label>
             <ItemPicker
@@ -764,12 +766,12 @@ export default function TransactionsPage() {
 
       {/* ── Queue panel ────────────────────────────────────────────────── */}
       {queueCount > 0 && (
-        <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg overflow-hidden mb-8">
+        <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-2xl md:rounded-lg shadow-sm md:shadow-none overflow-hidden mb-6 md:mb-8">
           <div className="flex flex-wrap items-center gap-3 px-5 py-3 border-b border-zinc-200 dark:border-zinc-800">
             <ListChecks className="w-4 h-4 text-cyan-500" />
-            <div className="flex-1 min-w-[180px]">
+            <div className="flex-1 min-w-[140px]">
               <div className="text-sm font-medium">Queue · {queueCount} {queueCount === 1 ? "entry" : "entries"}</div>
-              <div className="text-[11px] text-zinc-500">
+              <div className="text-[11px] text-zinc-500 hidden md:block">
                 Order: <b>Purchase → Adj UP → Customer return → Transfer → Adj DOWN → Sale → Supplier return.</b>
               </div>
             </div>
@@ -815,7 +817,8 @@ export default function TransactionsPage() {
             </div>
           )}
 
-          <table className="w-full text-sm">
+          {/* Desktop / tablet table */}
+          <table className="w-full text-sm hidden md:table">
             <thead className="bg-zinc-50 dark:bg-zinc-900/50">
               <tr className="text-zinc-500 text-[11px] uppercase tracking-wider">
                 <th className="text-left px-5 py-2 font-medium">#</th>
@@ -883,8 +886,9 @@ export default function TransactionsPage() {
                         type="button"
                         onClick={() => removeFromQueue(t.uid)}
                         disabled={processing}
-                        className="text-zinc-400 hover:text-rose-500 disabled:opacity-40"
+                        className="text-zinc-400 hover:text-rose-500 disabled:opacity-40 p-1 -m-1"
                         title="Remove from queue"
+                        aria-label="Remove from queue"
                       >
                         <X className="w-4 h-4" />
                       </button>
@@ -894,6 +898,70 @@ export default function TransactionsPage() {
               })}
             </tbody>
           </table>
+          {/* Mobile cards */}
+          <ul className="md:hidden divide-y divide-zinc-200/60 dark:divide-zinc-800/60">
+            {sortedQueue.map((t, i) => {
+              const it = itemById.get(t.item_id);
+              const snap = preflight.snapshots[i];
+              const procErr = errorMap.get(t.uid);
+              const dir = t.action === "Purchase" ? 1
+                : t.action === "Sale" ? -1
+                : t.action === "Transfer" ? -1
+                : t.direction;
+              const status = procErr
+                ? <span className="text-rose-600 dark:text-rose-300 inline-flex items-center gap-1"><AlertCircle className="w-3 h-3 flex-shrink-0" /> <span className="truncate">{procErr}</span></span>
+                : snap?.warning
+                ? <span className="text-rose-600 dark:text-rose-300 inline-flex items-center gap-1"><AlertCircle className="w-3 h-3 flex-shrink-0" /> <span className="truncate">{snap.warning}</span></span>
+                : processing && i < processIdx
+                ? <span className="text-emerald-600 dark:text-emerald-400 inline-flex items-center gap-1"><CheckCircle2 className="w-3 h-3" /> done</span>
+                : processing && i === processIdx
+                ? <span className="text-cyan-600 dark:text-cyan-400 inline-flex items-center gap-1"><Loader2 className="w-3 h-3 animate-spin" /> running</span>
+                : <span className="text-zinc-400">queued</span>;
+              return (
+                <li key={t.uid} className={[
+                  "px-4 py-3",
+                  snap?.warning ? "bg-rose-500/5" : procErr ? "bg-rose-500/10" : "",
+                ].join(" ")}>
+                  <div className="flex items-center justify-between gap-2 mb-1.5">
+                    <span className="text-[10px] text-zinc-400 tnum truncate">{PRIORITY_LABEL[priorityOf(t)]}</span>
+                    <button
+                      type="button"
+                      onClick={() => removeFromQueue(t.uid)}
+                      disabled={processing}
+                      className="text-zinc-400 hover:text-rose-500 disabled:opacity-40 p-1 -m-1 flex-shrink-0"
+                      aria-label="Remove from queue"
+                    >
+                      <X className="w-4 h-4" />
+                    </button>
+                  </div>
+                  <div className="flex items-center gap-2 mb-1.5 flex-wrap">
+                    <ActionBadge action={t.action} />
+                    <span className="inline-flex items-center gap-1 tnum text-sm">
+                      {dir === 1
+                        ? <span className="text-[10px] text-emerald-600 dark:text-emerald-400 font-medium">+ in</span>
+                        : <span className="text-[10px] text-rose-600 dark:text-rose-400 font-medium">− out</span>}
+                      <span className="font-medium">{fmtN(t.total_qty)}</span>
+                    </span>
+                    <span className="text-xs text-zinc-500 ml-auto">
+                      {t.godown}{t.action === "Transfer" && <span className="text-zinc-400"> → {t.to_godown}</span>}
+                    </span>
+                  </div>
+                  <div className="text-sm truncate mb-1.5">
+                    {it
+                      ? <>{it.brand && <span className="text-zinc-400">{it.brand} · </span>}{it.model} <span className="text-zinc-500">· {it.size} · {it.colour}</span></>
+                      : <span className="text-zinc-500">?</span>}
+                  </div>
+                  <div className="flex items-center justify-between gap-2 text-xs tnum">
+                    <div className="flex gap-3 text-zinc-500">
+                      <span>A: <b className={snap && snap.A < 0 ? "text-rose-500 font-medium" : "text-zinc-700 dark:text-zinc-200"}>{snap ? fmtN(snap.A) : "—"}</b></span>
+                      <span>B: <b className={snap && snap.B < 0 ? "text-rose-500 font-medium" : "text-zinc-700 dark:text-zinc-200"}>{snap ? fmtN(snap.B) : "—"}</b></span>
+                    </div>
+                    <div className="text-xs min-w-0">{status}</div>
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
         </div>
       )}
 
@@ -922,10 +990,10 @@ export default function TransactionsPage() {
       )}
 
       {/* ── Transaction log ────────────────────────────────────────────── */}
-      <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg overflow-hidden">
-        <div className="flex items-center gap-3 px-5 py-3 border-b border-zinc-200 dark:border-zinc-800">
-          <div className="text-sm font-medium">Transaction log</div>
-          <div className="flex-1" />
+      <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-2xl md:rounded-lg shadow-sm md:shadow-none overflow-hidden">
+        <div className="flex flex-wrap items-center gap-2 sm:gap-3 px-4 sm:px-5 py-3 border-b border-zinc-200 dark:border-zinc-800">
+          <div className="text-sm font-medium w-full sm:w-auto">Transaction log</div>
+          <div className="hidden sm:block flex-1" />
           <select
             value={logFilter}
             onChange={(e) => setLogFilter(e.target.value as ActionKind | "")}
@@ -938,18 +1006,19 @@ export default function TransactionsPage() {
             <option value="Adjustment">Adjustments</option>
             <option value="Return">Returns</option>
           </select>
-          <div className="relative">
+          <div className="relative flex-1 sm:flex-none">
             <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-zinc-500" />
             <input
               value={logQuery}
               onChange={(e) => setLogQuery(e.target.value)}
               placeholder="Search…"
-              className="bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-md pl-8 pr-3 py-1 text-xs"
+              className="w-full bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-md pl-8 pr-3 py-1 text-xs"
             />
           </div>
         </div>
 
-        <table className="w-full text-sm">
+        {/* Desktop / tablet table */}
+        <table className="w-full text-sm hidden md:table">
           <thead className="bg-zinc-50 dark:bg-zinc-900/50">
             <tr className="text-zinc-500 text-[11px] uppercase tracking-wider">
               <th className="text-left px-5 py-2 font-medium">Date</th>
@@ -1014,6 +1083,65 @@ export default function TransactionsPage() {
             })}
           </tbody>
         </table>
+        {/* Mobile cards */}
+        <div className="md:hidden">
+          {!loaded && <div className="py-10 text-center text-sm text-zinc-500">Loading…</div>}
+          {loaded && visibleTxns.length === 0 && (
+            <div className="py-10 text-center text-sm text-zinc-500">No transactions match these filters.</div>
+          )}
+          <ul className="divide-y divide-zinc-200/60 dark:divide-zinc-800/60">
+            {loaded && visibleTxns.map((t) => {
+              const it = itemById.get(t.item_id);
+              const isReversal = !!t.reverses_id;
+              const alreadyReversed = txns.some((x) => x.reverses_id === t.id);
+              const showDirHint = t.action === "Adjustment" || t.action === "Return";
+              const note = t.reason || t.invoice_no || t.status || "";
+              return (
+                <li key={t.id} className="px-4 py-3">
+                  <div className="flex items-center justify-between gap-2 mb-1">
+                    <ActionBadge action={t.action} reversal={isReversal} />
+                    <span className="text-[11px] text-zinc-500 tnum">{(t.txn_date || "").slice(0, 10)}</span>
+                  </div>
+                  <div className="text-sm truncate mb-1">
+                    {it ? <>{it.model} <span className="text-zinc-500">· {it.size} · {it.colour}</span></> : "?"}
+                  </div>
+                  <div className="flex items-center justify-between gap-2 text-xs text-zinc-500">
+                    <span>Godown {t.godown}</span>
+                    <span className="inline-flex items-center gap-1 tnum">
+                      {showDirHint && (
+                        t.direction === 1
+                          ? <span className="text-[10px] text-emerald-600 dark:text-emerald-400 font-medium">+ in</span>
+                          : <span className="text-[10px] text-rose-600 dark:text-rose-400 font-medium">− out</span>
+                      )}
+                      <span className="text-zinc-700 dark:text-zinc-200 font-medium">{fmtN(t.qty)}</span>
+                    </span>
+                  </div>
+                  {note && (
+                    <div className="text-[11px] text-zinc-500 mt-1.5 truncate">{note}</div>
+                  )}
+                  {(canWrite && !isReversal && !alreadyReversed) || alreadyReversed || isReversal ? (
+                    <div className="mt-1.5 text-[11px]">
+                      {canWrite && !isReversal && !alreadyReversed ? (
+                        <button
+                          onClick={() => reverseRow(t.id)}
+                          disabled={reversingId === t.id}
+                          className="text-zinc-500 hover:text-rose-500 inline-flex items-center gap-1 disabled:opacity-50"
+                        >
+                          {reversingId === t.id ? <Loader2 className="w-3 h-3 animate-spin" /> : <RotateCcw className="w-3 h-3" />}
+                          Reverse
+                        </button>
+                      ) : alreadyReversed ? (
+                        <span className="text-zinc-400">reversed</span>
+                      ) : (
+                        <span className="text-zinc-400">reversal of {(t.reverses_id || "").slice(0, 6)}…</span>
+                      )}
+                    </div>
+                  ) : null}
+                </li>
+              );
+            })}
+          </ul>
+        </div>
       </div>
     </Shell>
   );
@@ -1072,14 +1200,14 @@ function SegBtn({
   options: { v: string; l: string }[];
 }) {
   return (
-    <div className="inline-flex bg-zinc-100 dark:bg-zinc-800 rounded-md p-0.5 gap-0.5 flex-wrap">
+    <div className="flex flex-wrap bg-zinc-100 dark:bg-zinc-800 rounded-md p-0.5 gap-0.5 w-full sm:w-auto sm:inline-flex">
       {options.map((o) => (
         <button
           key={o.v}
           type="button"
           onClick={() => onChange(o.v)}
           className={[
-            "px-4 py-1.5 rounded text-sm font-medium transition-colors",
+            "flex-1 sm:flex-none px-4 py-1.5 rounded text-sm font-medium transition-colors",
             value === o.v
               ? "bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 shadow-sm"
               : "text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-300",
@@ -1199,12 +1327,13 @@ function CaseSizeModal({
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm px-4"
+      className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/60 backdrop-blur-sm p-0 sm:p-4"
       onClick={() => { if (!saving) onCancel(); }}
     >
       <div
         onClick={(e) => e.stopPropagation()}
-        className="w-full max-w-md bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg shadow-xl overflow-hidden"
+        className="w-full max-w-md bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-t-2xl sm:rounded-lg shadow-xl overflow-hidden"
+        style={{ paddingBottom: "env(safe-area-inset-bottom)" }}
       >
         <div className="px-5 py-4 border-b border-zinc-200 dark:border-zinc-800 flex items-start gap-3">
           <div className="w-9 h-9 bg-amber-500/15 rounded-lg flex items-center justify-center flex-shrink-0">

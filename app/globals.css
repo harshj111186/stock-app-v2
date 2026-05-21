@@ -27,6 +27,20 @@
   }
   ::selection { background: rgba(34, 211, 238, 0.3); }
   .tnum { font-variant-numeric: tabular-nums; }
+  /* Hide scrollbar but keep functionality — used for horizontal-scroll
+     sub-nav strips on mobile (Reports sub-tabs etc). */
+  .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+  .no-scrollbar::-webkit-scrollbar { display: none; }
+
+  /* Touch-target hardening on mobile — form controls hit ~40px height so
+     they're comfortably tappable. No effect on md+. */
+  @media (max-width: 767px) {
+    select, input[type="text"], input[type="email"], input[type="password"],
+    input[type="number"], input[type="date"], input[type="search"],
+    input[type="tel"], textarea {
+      min-height: 40px;
+    }
+  }
   @keyframes shimmer {
     0% { background-position: -200px 0; }
     100% { background-position: 200px 0; }

@@ -48,12 +48,13 @@ export default function AuditPage() {
   return (
     <Shell title="Audit log">
       <div className="mb-6">
-        <h1 className="text-2xl font-semibold tracking-tight">Audit log</h1>
+        <h1 className="text-xl sm:text-2xl font-semibold tracking-tight">Audit log</h1>
         <p className="text-sm text-zinc-500 mt-1">
           {loaded ? `${rows.length} most recent changes` : "Loading…"} — auto-recorded by the database.
         </p>
       </div>
-      <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg overflow-hidden">
+      {/* Desktop table */}
+      <div className="hidden md:block bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg overflow-hidden">
         <table className="w-full text-sm">
           <thead className="bg-zinc-50 dark:bg-zinc-900/50 border-b border-zinc-200 dark:border-zinc-800">
             <tr className="text-zinc-500 text-[11px] uppercase tracking-wider">
@@ -88,6 +89,32 @@ export default function AuditPage() {
             )}
           </tbody>
         </table>
+      </div>
+      {/* Mobile cards */}
+      <div className="md:hidden bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-2xl overflow-hidden shadow-sm">
+        {!loaded && (
+          <div className="p-4 space-y-3">
+            {Array.from({ length: 6 }).map((_, i) => <div key={i} className="h-3 rounded shimmer" />)}
+          </div>
+        )}
+        {loaded && rows.length === 0 && (
+          <div className="py-12 text-center text-sm text-zinc-500">No audit entries yet.</div>
+        )}
+        <ul className="divide-y divide-zinc-200/60 dark:divide-zinc-800/60">
+          {loaded && rows.map(r => (
+            <li key={r.id} className="px-4 py-3">
+              <div className="flex items-center justify-between gap-2 mb-1">
+                <span className={`px-2 py-0.5 rounded text-[11px] ${opColour(r.operation)}`}>{r.operation}</span>
+                <span className="text-[11px] text-zinc-500 tnum">{new Date(r.occurred_at).toLocaleString("en-IN")}</span>
+              </div>
+              <div className="text-sm">{r.table_name}</div>
+              <div className="flex items-center justify-between text-[11px] text-zinc-500 mt-0.5">
+                <span>Row <code className="text-zinc-500">{(r.row_id || "").slice(0, 8)}</code></span>
+                <span>User {r.user_id ? r.user_id.slice(0, 8) + "…" : "—"}</span>
+              </div>
+            </li>
+          ))}
+        </ul>
       </div>
     </Shell>
   );

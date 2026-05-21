@@ -8,6 +8,7 @@ import {
   Cell,
 } from "recharts";
 import { Shell } from "@/components/shell";
+import { ReportsSubnav } from "@/components/reports-subnav";
 import { sb, type Item, type Pricing, type Txn } from "@/lib/supabase";
 import { fmtN, fmtMoney } from "@/lib/utils";
 
@@ -388,8 +389,9 @@ export default function ABCAnalysisPage() {
 
   return (
     <Shell title="ABC analysis">
+      <ReportsSubnav />
       <div className="mb-6">
-        <h1 className="text-2xl font-semibold tracking-tight">ABC analysis</h1>
+        <h1 className="text-xl sm:text-2xl font-semibold tracking-tight">ABC analysis</h1>
         <p className="text-sm text-zinc-500 mt-1 tabular-nums">
           {loaded
             ? <>{rangeLabel} · {fmtN(rows.length)} item{rows.length === 1 ? "" : "s"} with sales · {fmtMoney(totals.totalRevenue)} revenue</>
@@ -639,8 +641,8 @@ export default function ABCAnalysisPage() {
         </div>
       </div>
 
-      {/* Table */}
-      <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg overflow-hidden">
+      {/* Table — desktop */}
+      <div className="hidden md:block bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg overflow-hidden">
         <table className="w-full text-sm">
           <thead className="bg-zinc-50 dark:bg-zinc-900/50 border-b border-zinc-200 dark:border-zinc-800">
             <tr className="text-zinc-500 text-[11px] uppercase tracking-wider">
@@ -716,6 +718,55 @@ export default function ABCAnalysisPage() {
             </tfoot>
           )}
         </table>
+      </div>
+
+      {/* Mobile cards */}
+      <div className="md:hidden bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-2xl overflow-hidden shadow-sm">
+        {!loaded && <div className="py-10 text-center text-sm text-zinc-500">Loading…</div>}
+        {loaded && visibleRows.length === 0 && !err && (
+          <div className="py-12 text-center text-sm text-zinc-500 px-4">
+            {rows.length === 0 ? "No sales in this range." : "No items match the current filters."}
+          </div>
+        )}
+        <ul className="divide-y divide-zinc-200/60 dark:divide-zinc-800/60">
+          {loaded && visibleRows.map((r, idx) => (
+            <li key={r.itemId} className="px-4 py-3">
+              <div className="flex items-center justify-between gap-2 mb-1">
+                <div className="flex items-center gap-2">
+                  <span className="text-[11px] text-zinc-500 tnum">#{idx + 1}</span>
+                  <ClassBadge cls={r.cls} />
+                </div>
+                <span className="text-[11px] text-zinc-500 tnum">
+                  {r.pctShare.toFixed(1)}% · cum {r.cumPct.toFixed(1)}%
+                </span>
+              </div>
+              <div className="text-sm truncate mb-0.5">{r.itemLabel}</div>
+              <div className="text-[11px] text-zinc-400 tnum flex flex-wrap items-center gap-x-2 gap-y-0.5 mb-2">
+                <span>{r.itemCode}</span>
+                {r.brand && <span className="text-zinc-500">· {r.brand}</span>}
+                {r.category && <span className="text-zinc-500">· {r.category}</span>}
+                {!r.hasPricing && <span className="text-amber-500">· no pricing</span>}
+              </div>
+              <div className="flex items-center justify-between text-xs tnum">
+                <span className="text-zinc-500">
+                  <span className="text-zinc-700 dark:text-zinc-200 font-medium">{fmtN(r.units)}</span> units
+                  {r.hasPricing && <> @ {fmtMoney(r.rate)}</>}
+                </span>
+                <span className="font-semibold">
+                  {r.hasPricing ? fmtMoney(r.revenue) : "—"}
+                </span>
+              </div>
+            </li>
+          ))}
+        </ul>
+        {loaded && visibleRows.length > 0 && (
+          <div className="border-t-2 border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-900/40 px-4 py-2.5 flex items-center justify-between text-xs">
+            <span className="uppercase tracking-wider text-zinc-500 font-medium">Visible totals</span>
+            <span className="tnum font-semibold">
+              {fmtN(visibleRows.reduce((s, r) => s + r.units, 0))} units · {fmtMoney(visibleRows.reduce((s, r) => s + r.revenue, 0))}
+            </span>
+          </div>
+        )}
       </div>
 
       <div className="mt-4 text-[11px] text-zinc-500 leading-relaxed max-w-3xl">
