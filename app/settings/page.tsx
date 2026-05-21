@@ -1,9 +1,13 @@
 "use client";
 import { Shell } from "@/components/shell";
 import { useAuth } from "@/app/providers";
+import { useInstall } from "@/components/install-provider";
 import { useState } from "react";
 import { sb } from "@/lib/supabase";
-import { KeyRound, Loader2, CheckCircle2, AlertCircle, ShieldCheck } from "lucide-react";
+import {
+  KeyRound, Loader2, CheckCircle2, AlertCircle, ShieldCheck,
+  Download, Smartphone, Monitor,
+} from "lucide-react";
 
 export default function SettingsPage() {
   const { profile } = useAuth();
@@ -26,6 +30,8 @@ export default function SettingsPage() {
         </div>
 
         <ChangePinCard />
+
+        <InstallCard />
 
         <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg p-5">
           <div className="text-xs text-zinc-500 uppercase tracking-wider mb-3">About</div>
@@ -168,6 +174,92 @@ function PinField({
         autoComplete="off"
         className="w-full bg-zinc-50 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-cyan-500 tnum tracking-[0.4em] text-center"
       />
+    </div>
+  );
+}
+
+// ─── Install app ───────────────────────────────────────────────────────────
+// Three states:
+//   1. isStandalone → already installed. Show a confirmation row, no button.
+//   2. canInstall   → Chrome/Edge fired beforeinstallprompt. Show button that
+//                     calls install().
+//   3. neither      → fall back to per-platform instructions. iOS Safari has
+//                     no install API; user has to use the Share menu. Other
+//                     browsers may need to wait for Chrome to decide the site
+//                     meets criteria (a few seconds after page load, usually).
+function InstallCard() {
+  const { canInstall, install, isStandalone } = useInstall();
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState<"accepted" | "dismissed" | "unavailable" | null>(null);
+
+  const onClick = async () => {
+    setBusy(true);
+    setResult(null);
+    const outcome = await install();
+    setResult(outcome);
+    setBusy(false);
+  };
+
+  return (
+    <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg p-5">
+      <div className="flex items-center gap-2 mb-3">
+        <Download className="w-3.5 h-3.5 text-cyan-500" />
+        <div className="text-xs text-zinc-500 uppercase tracking-wider">Install app</div>
+      </div>
+
+      {isStandalone ? (
+        <div className="text-sm text-emerald-600 dark:text-emerald-400 inline-flex items-center gap-2">
+          <CheckCircle2 className="w-4 h-4" />
+          Installed — you're running the app version.
+        </div>
+      ) : canInstall ? (
+        <>
+          <p className="text-xs text-zinc-500 mb-3 leading-relaxed">
+            Install Stock Manager as a real app — opens in its own window, no
+            browser tabs, no address bar. Faster to find, faster to launch.
+          </p>
+          <button
+            type="button"
+            onClick={onClick}
+            disabled={busy}
+            className="bg-cyan-500 hover:bg-cyan-400 disabled:opacity-40 text-zinc-900 px-4 py-2 rounded-md text-sm font-medium inline-flex items-center gap-2"
+          >
+            {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />}
+            {busy ? "Working…" : "Install app"}
+          </button>
+          {result === "dismissed" && (
+            <div className="text-[11px] text-zinc-500 mt-2">
+              Cancelled. You can try again anytime.
+            </div>
+          )}
+        </>
+      ) : (
+        <div className="space-y-3 text-xs text-zinc-500 leading-relaxed">
+          <p>
+            The install option appears here once your browser recognises Stock
+            Manager as installable. Below are the manual paths if it doesn't
+            show up after a few seconds.
+          </p>
+          <div className="bg-zinc-50 dark:bg-zinc-800/40 border border-zinc-200 dark:border-zinc-700/50 rounded p-3">
+            <div className="flex items-center gap-2 mb-1.5 text-zinc-700 dark:text-zinc-200 font-medium">
+              <Monitor className="w-3.5 h-3.5" /> Desktop (Chrome / Edge)
+            </div>
+            <ol className="list-decimal list-inside space-y-0.5 ml-1">
+              <li>Look for the install icon (a small monitor with a down arrow) on the right of the address bar.</li>
+              <li>Or open the browser menu (⋮ in the top right) → <b>Install Stock Manager</b>.</li>
+            </ol>
+          </div>
+          <div className="bg-zinc-50 dark:bg-zinc-800/40 border border-zinc-200 dark:border-zinc-700/50 rounded p-3">
+            <div className="flex items-center gap-2 mb-1.5 text-zinc-700 dark:text-zinc-200 font-medium">
+              <Smartphone className="w-3.5 h-3.5" /> Phone
+            </div>
+            <ol className="list-decimal list-inside space-y-0.5 ml-1">
+              <li><b>iPhone (Safari):</b> tap the Share icon → <b>Add to Home Screen</b>.</li>
+              <li><b>Android (Chrome):</b> tap the menu (⋮) → <b>Install app</b> or <b>Add to Home screen</b>.</li>
+            </ol>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

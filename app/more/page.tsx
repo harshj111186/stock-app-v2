@@ -2,10 +2,11 @@
 import Link from "next/link";
 import {
   Warehouse, Receipt, ShieldCheck, Users, Settings, LogOut,
-  ChevronRight,
+  ChevronRight, Download,
 } from "lucide-react";
 import { Shell } from "@/components/shell";
 import { useAuth } from "@/app/providers";
+import { useInstall } from "@/components/install-provider";
 
 // Mobile "More" hub. Lists every route that isn't on the bottom tab bar.
 // Admin-only rows render only for admin users. Desktop sidebar still shows
@@ -29,6 +30,7 @@ const ROWS: Row[] = [
 
 export default function MorePage() {
   const { profile, signOut } = useAuth();
+  const { canInstall, install, isStandalone } = useInstall();
   const isAdmin = profile?.role === "admin";
 
   return (
@@ -47,6 +49,27 @@ export default function MorePage() {
             </div>
           </div>
         </div>
+
+        {/* Install banner — only when the browser will accept the prompt and
+            the app isn't already running standalone. iOS Safari / desktop
+            Firefox don't fire beforeinstallprompt, so this stays hidden for
+            them; Settings page has the manual instructions for those cases. */}
+        {canInstall && !isStandalone && (
+          <button
+            type="button"
+            onClick={() => { void install(); }}
+            className="w-full bg-cyan-500 hover:bg-cyan-400 active:bg-cyan-600 text-zinc-900 rounded-2xl px-4 py-4 flex items-center gap-4 shadow-sm"
+          >
+            <span className="w-10 h-10 bg-zinc-900/10 rounded-xl flex items-center justify-center flex-shrink-0">
+              <Download className="w-5 h-5" />
+            </span>
+            <span className="flex-1 text-left">
+              <span className="block text-sm font-semibold">Install Stock Manager</span>
+              <span className="block text-xs text-zinc-900/70 mt-0.5">Faster launch, opens in its own window</span>
+            </span>
+            <ChevronRight className="w-4 h-4 text-zinc-900/60 flex-shrink-0" />
+          </button>
+        )}
 
         {/* Nav list */}
         <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-2xl overflow-hidden shadow-sm">

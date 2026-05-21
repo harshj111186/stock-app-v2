@@ -4,9 +4,10 @@ import { usePathname } from "next/navigation";
 import {
   LayoutDashboard, Boxes, Warehouse, ArrowLeftRight, Receipt,
   BarChart3, TrendingUp, AlertOctagon, ShieldCheck, Users, Settings, LogOut,
-  Package,
+  Package, Download,
 } from "lucide-react";
 import { useAuth } from "@/app/providers";
+import { useInstall } from "@/components/install-provider";
 import { cn } from "@/lib/utils";
 
 const NAV = [
@@ -34,6 +35,7 @@ const NAV = [
 export function Sidebar() {
   const pathname = usePathname();
   const { profile, signOut } = useAuth();
+  const { canInstall, install, isStandalone } = useInstall();
   const isActive = (href: string) =>
     href === "/" ? pathname === "/" || pathname === "" : pathname?.startsWith(href);
 
@@ -73,6 +75,22 @@ export function Sidebar() {
           </div>
         ))}
       </nav>
+
+      {/* Install banner — only shows when Chrome/Edge fired
+          beforeinstallprompt AND the app isn't already in standalone mode.
+          Silent when the browser doesn't support PWA install (Safari etc).
+          Sidebar is wide enough to carry one extra row; Settings page has
+          the full explanation if the user clicks through. */}
+      {canInstall && !isStandalone && (
+        <button
+          type="button"
+          onClick={() => { void install(); }}
+          className="mx-3 mb-2 px-3 py-2 rounded-md bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-700 dark:text-cyan-300 text-xs font-medium inline-flex items-center gap-2 border border-cyan-500/20"
+        >
+          <Download className="w-3.5 h-3.5" />
+          Install as app
+        </button>
+      )}
 
       {/* User */}
       <div className="border-t border-zinc-200 dark:border-zinc-800 p-3 flex items-center gap-3">

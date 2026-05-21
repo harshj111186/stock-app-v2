@@ -19,8 +19,12 @@ export default function manifest(): MetadataRoute.Manifest {
     background_color: "#09090b",
     theme_color: "#0891b2",
     icons: [
-      { src: "/icon.svg", sizes: "any", type: "image/svg+xml", purpose: "any" },
-      { src: "/icon-maskable.svg", sizes: "any", type: "image/svg+xml", purpose: "maskable" },
+      // Explicit 192/512 declarations so Chrome's desktop install checker
+      // finds the required sizes. The SVG actually renders at any size, but
+      // the manifest validator looks for the literal "192x192" / "512x512"
+      // tokens in `sizes`. Leaving "any" too covers higher-DPI surfaces.
+      { src: "/icon.svg",          sizes: "192x192 512x512 any", type: "image/svg+xml", purpose: "any" },
+      { src: "/icon-maskable.svg", sizes: "192x192 512x512 any", type: "image/svg+xml", purpose: "maskable" },
     ],
     categories: ["business", "productivity"],
   };

@@ -1,6 +1,7 @@
 import type { Metadata, Viewport } from "next";
 import "./globals.css";
 import { Providers } from "./providers";
+import { InstallProvider } from "@/components/install-provider";
 
 export const metadata: Metadata = {
   title: "Stock Manager",
@@ -48,7 +49,13 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         />
       </head>
       <body>
-        <Providers>{children}</Providers>
+        {/* InstallProvider registers /sw.js and captures the
+            beforeinstallprompt event so the in-app Install button can fire
+            it later. Wraps Providers so the auth context can use the install
+            hook if we ever surface "install" inside login/pending screens. */}
+        <InstallProvider>
+          <Providers>{children}</Providers>
+        </InstallProvider>
       </body>
     </html>
   );
