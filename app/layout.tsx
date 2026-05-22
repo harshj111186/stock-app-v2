@@ -3,35 +3,38 @@ import "./globals.css";
 import { Providers } from "./providers";
 import { InstallProvider } from "@/components/install-provider";
 
+// PWA URL hardcoding — see also public/manifest.webmanifest.
+//
 // Next.js Metadata API does NOT auto-prefix `manifest` and `icons` hrefs
-// with basePath. The generated HTML ends up with:
+// with basePath, AND `process.env.NODE_ENV` evaluates to `undefined`
+// (or something falsy) inside this file at static-export build time, so a
+// conditional `isProd ? "/stock-app-v2" : ""` resolves to "" — empirically
+// confirmed by inspecting the deployed HTML after commit f6c5807.
 //
+// Net effect of trying to be clever: the generated HTML ended up with
 //   <link rel="manifest" href="/manifest.webmanifest"/>
-//   <link rel="icon" href="/icon.svg" type="image/svg+xml"/>
+// which browsers resolve against the host root, hit 404, and DevTools
+// shows "No manifest detected" → Chrome refuses install.
 //
-// which the browser resolves against the host root, not the basePath —
-// so on `harshj111186.github.io/stock-app-v2/` it fetches
-// `harshj111186.github.io/manifest.webmanifest` and 404s. Chrome DevTools
-// then says "No manifest detected" and silently disables install.
-//
-// We hardcode the basePath here (matches `repo` in next.config.mjs +
-// `BASE` in app/manifest.ts). NODE_ENV gates so dev (basePath="") still
-// works locally.
-const isProd = process.env.NODE_ENV === "production";
-const BASE   = isProd ? "/stock-app-v2" : "";
+// Fix: hardcode the basePath as a plain string. This means dev mode
+// (basePath="") will have a slightly wrong link, but dev is for `next dev`
+// where install/PWA isn't being tested anyway. If `repo` in
+// next.config.mjs ever changes from "stock-app-v2", update both this file
+// and public/manifest.webmanifest.
+const BASE = "/stock-app-v2";
 
 export const metadata: Metadata = {
   title: "Stock Manager",
   description: "Two-godown stock manager — v2",
   applicationName: "Stock Manager",
-  // Explicit basePath-prefixed manifest URL — see header comment.
+  // Points at the static file in public/. Next no longer auto-generates a
+  // manifest because app/manifest.ts has been removed in favour of the
+  // static file — see commit log.
   manifest: `${BASE}/manifest.webmanifest`,
   appleWebApp: {
     capable: true,
     title: "Stock Manager",
     statusBarStyle: "black-translucent",
-    // Explicit apple-touch-icon link — file-based auto-detection isn't
-    // reliable for apple-icon.svg in Next 15.0.3 dev mode.
     startupImage: undefined,
   },
   icons: {

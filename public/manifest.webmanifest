@@ -1,0 +1,26 @@
+{
+  "name": "Stock Manager — Rye Electricals",
+  "short_name": "Stock",
+  "description": "Two-godown stock manager — inventory, transactions, pricing, reports.",
+  "start_url": "/stock-app-v2/",
+  "scope": "/stock-app-v2/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#09090b",
+  "theme_color": "#0891b2",
+  "icons": [
+    {
+      "src": "/stock-app-v2/icon.svg",
+      "sizes": "192x192 512x512 any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    },
+    {
+      "src": "/stock-app-v2/icon-maskable.svg",
+      "sizes": "192x192 512x512 any",
+      "type": "image/svg+xml",
+      "purpose": "maskable"
+    }
+  ],
+  "categories": ["business", "productivity"]
+}
