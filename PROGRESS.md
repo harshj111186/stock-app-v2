@@ -230,6 +230,77 @@ If you must touch one of these files: **read first, edit surgically, never repla
 
 ## 11. Changelog (latest first — add new entries at the top)
 
+### 2026-05-22 — Desktop PWA install (service worker + install buttons)
+
+**User ask:** "now i want installable app for this for both computer and mobile. for mobile we used add to homescreen but for pc and laptop the download option doesnt show in web browser"
+
+**Why mobile worked but desktop didn't.** Mobile browsers will offer Add-to-Home-Screen off the web manifest alone. Chrome and Edge on desktop have a stricter install check: **manifest + service worker with a fetch event handler**, all served over HTTPS, with the declared icons actually loading. Without the SW and with the icons 404ing, Chrome silently disables the install icon — no error in the UI, just nothing.
+
+**What landed (after four iterations to get the paths right):**
+
+1. **Service worker** at `public/sw.js`. Install/activate/fetch handlers; the fetch handler is pass-through (no caching). The only reason it exists is to satisfy the install check. Chrome will log a warning about the no-op handler causing "navigation overhead" — that's expected, and the cost is tiny. If we ever want offline support we can layer a real cache strategy in here.
+
+2. **`components/install-provider.tsx`** — React context that:
+   - registers `/stock-app-v2/sw.js` on mount in production (skipped in dev)
+   - captures `beforeinstallprompt` and parks the deferred event in state
+   - detects `display-mode: standalone` so we hide the install button when already installed
+   - exposes `useInstall()` returning `{ canInstall, install(), isStandalone }`
+   - mounted in `app/layout.tsx` outside `Providers`
+
+3. **Three install button surfaces.** Chrome's URL-bar icon is easy to miss, so we surface the deferred prompt explicitly in three places:
+   - **Settings page** — full Install card with three states (already-installed / canInstall+button / manual-instructions fallback for iOS Safari and others)
+   - **Desktop sidebar** — small "Install as app" pill above the user row when `canInstall && !isStandalone`
+   - **Mobile More page** — prominent cyan install row at the top when `canInstall && !isStandalone`
+
+4. **Static manifest** at `public/manifest.webmanifest`. Originally lived at `app/manifest.ts` (Next 13+ file-based metadata route) but Next's auto-injected `<link rel="manifest">` kept overriding our `metadata.manifest` setting, so we moved to a plain static file in `public/` and pointed `layout.tsx`'s metadata at it explicitly.
+
+#### The path-prefix mess (four commits to get right)
+
+**Root cause of the iteration loop:** Next.js does NOT auto-prefix paths inside the manifest file OR `<link>` tags emitted via the Metadata API with `basePath`. This bites the v2 app because it's served under `/stock-app-v2/`, not `/`.
+
+The four-commit arc:
+
+1. **`7adb5cf`** — initial PWA work. SW, install buttons, manifest paths left as `/icon.svg` etc.
+2. **`b60132a`** — fixed paths INSIDE `app/manifest.ts` itself (start_url, scope, icon srcs) to be basePath-prefixed. Confirmed by WebFetching the deployed manifest JSON.
+3. **`f6c5807`** — tried to fix HTML `<link rel="manifest">` and icon links by setting `metadata.manifest` and `metadata.icons` with a `process.env.NODE_ENV`-gated prefix. **Didn't take effect** — `NODE_ENV` evaluates to undefined/falsy inside `layout.tsx` during static-export build, so the conditional collapsed to `""`. Confirmed by `curl`ing the deployed HTML which still had un-prefixed paths.
+4. **`be82ed3`** — final fix. Dropped the conditional, hardcoded `BASE = "/stock-app-v2"`. Also deleted `app/manifest.ts` and replaced with `public/manifest.webmanifest` (plain JSON) to remove the Next auto-link interference.
+
+**Lesson for future basePath-affected work:**
+- Don't trust `process.env.NODE_ENV` inside server components for static export. Hardcode prefixes.
+- Inspect the deployed HTML with `curl` AND the deployed manifest with `curl` separately. Each has its own paths.
+- Chrome's "No manifest detected" in DevTools really means the `<link rel="manifest">` href is 404ing — not that the manifest file is missing.
+- The default Next 15 auto-generation from `app/manifest.ts` cannot be reliably overridden; use a static file in `public/` if you need precise control.
+
+#### Files patched
+
+- **`public/sw.js`** *(new)* — minimal SW.
+- **`public/manifest.webmanifest`** *(new)* — static manifest replacing `app/manifest.ts`. All paths basePath-prefixed.
+- **`components/install-provider.tsx`** *(new)* — InstallProvider context + useInstall hook.
+- **`app/layout.tsx`** — wraps children in `<InstallProvider>`; metadata.manifest + metadata.icons hardcoded to `/stock-app-v2/...`.
+- **`app/manifest.ts`** *(deleted)* — replaced by the static file.
+- **`app/settings/page.tsx`** — Install card with three states + per-platform fallback instructions.
+- **`components/sidebar.tsx`** — install pill above user row.
+- **`app/more/page.tsx`** — prominent install row when available.
+
+#### Deploy
+
+Pure code-side; no SQL. Just `git push origin main`, wait for the Action.
+
+#### Verification (works as of `be82ed3`)
+
+- `curl -s https://harshj111186.github.io/stock-app-v2/ | grep -oE 'rel="manifest"[^>]*'` returns `rel="manifest" href="/stock-app-v2/manifest.webmanifest"/`
+- `curl -sI https://harshj111186.github.io/stock-app-v2/manifest.webmanifest` returns 200
+- Chrome desktop: install icon appears in URL bar within ~5s of page load; in-app pill in sidebar also lights up.
+- User confirmed: "yes, the install button showed up"
+
+#### Follow-ups (not blocking)
+
+- **No-op fetch handler warning** — Chrome logs "Fetch event handler is recognized as no-op" on each navigation. Two options: (a) remove the fetch handler entirely (newer Chrome accepts SW without fetch handler for install), or (b) add real cache-first strategy for static assets so the warning becomes accurate. Either is a 10-line change.
+- **PWA app shell caching** — for true offline launch + faster cold start, the SW can pre-cache the HTML + JS shell on install and serve it from cache. Doesn't affect Supabase data (those should always go to network).
+- **Update prompt** — when a new build deploys, show a banner "New version available — refresh to update" by listening for SW's `updatefound` event. Currently users see the new version after they close + reopen the standalone window.
+
+---
+
 ### 2026-05-22 — PIN-based auth + signup-approval workflow + super-admin
 
 **User ask:** "make changes to user setup, where harsh.j111186@gmail.com is ultimate admin and bhavik9347@gmail.com acts as admin too, any signups needs admin approval, also want a pin based setup, where each account is set to a pin which is setup when signed up and gets linked to that account so launching app again wont require email and password but the 4 digit pin. same account sign in to different device should ask for that pin too, all the user accts can be overridden by admin"
