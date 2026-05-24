@@ -201,15 +201,70 @@ export default function ReconciliationPage() {
 
   useEffect(() => { void load(); }, [load]);
 
+  // ─── pending saves (debounced upserts) ─────────────────────────────────
+  // One timer per (user, item) — we coalesce keystrokes locally and fire a
+  // single upsert ~200 ms after the last keystroke for that row. Tracked
+  // up here so the polling refresh below can check whether a row is
+  // mid-save and skip it.
+  const saveTimers = useRef<Map<DraftKey, number>>(new Map());
+
   // Refresh drafts on tab visibility regain + every 30s so other users'
-  // edits show up without a full page reload. Keeps it cheap by only
-  // refetching the drafts table (not items / stock / last-reconciled).
+  // edits show up without a full page reload. CRITICAL: this merges
+  // server rows into local state — it does NOT replace the map. The
+  // current user's rows are protected from being clobbered while typing
+  // (the 5-second "input resets" bug came from blindly overwriting them).
+  //
+  // Rules:
+  //   - Other users' rows: trust the server completely (replace + drop
+  //     missing).
+  //   - My own rows with a pending save timer: leave alone — local is
+  //     in flight.
+  //   - My own rows without a pending save: adopt server value only when
+  //     server's updated_at is strictly newer (so a slightly-out-of-date
+  //     poll doesn't roll my latest keystroke back).
+  //   - My own rows missing from the server (admin committed them):
+  //     drop locally unless a pending save is still in flight or the row
+  //     is local-only (never persisted yet).
   const refreshDrafts = useCallback(async () => {
+    const myId = profile?.id;
+    if (!myId) return;
     const { data } = await sb().from("reconciliation_drafts_with_user").select("*");
-    const next = new Map<DraftKey, DBDraft>();
-    (data || []).forEach((d: any) => next.set(dkey(d.user_id, d.item_id), d as DBDraft));
-    setDrafts(next);
-  }, []);
+    const serverByKey = new Map<string, DBDraft>();
+    (data || []).forEach((d: any) => serverByKey.set(dkey(d.user_id, d.item_id), d as DBDraft));
+
+    setDrafts(prev => {
+      const next = new Map(prev);
+
+      // 1) Other users' rows — server is the source of truth.
+      for (const [k, local] of [...prev]) {
+        if (local.user_id !== myId && !serverByKey.has(k)) next.delete(k);
+      }
+      for (const [k, server] of serverByKey) {
+        if (server.user_id !== myId) next.set(k, server);
+      }
+
+      // 2) My own rows — protect in-flight edits.
+      for (const [k, server] of serverByKey) {
+        if (server.user_id !== myId) continue;
+        if (saveTimers.current.has(k)) continue; // mid-save, don't touch
+        const local = next.get(k);
+        if (!local || (local.updated_at && server.updated_at > local.updated_at) || !local.updated_at) {
+          next.set(k, server);
+        }
+      }
+
+      // 3) My own rows that no longer exist on the server (admin committed).
+      for (const [k, local] of [...next]) {
+        if (local.user_id !== myId) continue;
+        if (serverByKey.has(k)) continue;
+        if (saveTimers.current.has(k)) continue;
+        if (local.id.startsWith("local-")) continue; // never persisted, keep
+        next.delete(k);
+      }
+
+      return next;
+    });
+  }, [profile?.id]);
   useEffect(() => {
     if (!loaded) return;
     const onVis = () => { if (document.visibilityState === "visible") void refreshDrafts(); };
@@ -220,11 +275,6 @@ export default function ReconciliationPage() {
       window.clearInterval(id);
     };
   }, [loaded, refreshDrafts]);
-
-  // ─── pending saves (debounced upserts) ─────────────────────────────────
-  // One timer per (user, item, field) — we coalesce keystrokes locally and
-  // fire a single upsert ~350 ms after the last keystroke for that row.
-  const saveTimers = useRef<Map<DraftKey, number>>(new Map());
 
   // Optimistic local mutation; the actual DB write happens debounced below.
   const setField = useCallback((userId: string, itemId: string, field: Field, value: string) => {
@@ -253,16 +303,29 @@ export default function ReconciliationPage() {
       return next;
     });
 
-    // Debounced DB write.
+    // Debounced DB write — 200 ms after the last keystroke for this row.
     const k = dkey(userId, itemId);
     const existing = saveTimers.current.get(k);
     if (existing) clearTimeout(existing);
     const timer = window.setTimeout(() => {
       saveTimers.current.delete(k);
       void persistDraft(userId, itemId);
-    }, 350);
+    }, 200);
     saveTimers.current.set(k, timer);
   }, [profile?.email, profile?.name, profile?.role]);
+
+  // Immediate flush — called on input blur so a value can't be lost if the
+  // user closes the tab or switches away inside the debounce window. Fires
+  // every pending save (usually 0 or 1 at any moment); simpler than
+  // threading per-row callbacks through every component level.
+  const flushAllPendingSaves = useCallback(() => {
+    for (const [k, timer] of saveTimers.current) {
+      clearTimeout(timer);
+      saveTimers.current.delete(k);
+      const [userId, itemId] = k.split("::");
+      void persistDraft(userId, itemId);
+    }
+  }, []);
 
   // Read the latest local draft for (user, item) and either upsert (if any
   // field non-empty) or delete (if all empty).
@@ -714,6 +777,7 @@ export default function ReconciliationPage() {
             currentUserId={profile?.id ?? ""}
             computeDiff={computeDiff}
             setField={setField}
+            flushSaves={flushAllPendingSaves}
             resetMyRow={(itemId) => { if (profile?.id) void deleteDraft(profile.id, itemId); }}
             errorsByItem={errorsByItem(errors)}
             otherUsersByItem={(itemId) => {
@@ -734,6 +798,7 @@ export default function ReconciliationPage() {
             computeDiff={computeDiff}
             computeItemConflict={computeItemConflict}
             setField={setField}
+            flushSaves={flushAllPendingSaves}
             deleteDraft={deleteDraft}
             currentUserId={profile?.id ?? ""}
             errorsByItem={errorsByItem(errors)}
@@ -975,7 +1040,7 @@ type ItemConflictType = {
 // ─── MyView (default for everyone) ───────────────────────────────────────
 function MyView({
   items, appStock, drafts, lastRecon, currentUserId,
-  computeDiff, setField, resetMyRow, errorsByItem,
+  computeDiff, setField, flushSaves, resetMyRow, errorsByItem,
   otherUsersByItem, conflictByItem,
 }: {
   items: (Item & { categoryName: string | null })[];
@@ -985,6 +1050,7 @@ function MyView({
   currentUserId: string;
   computeDiff: (i: Item, app: { A: AppStock; B: AppStock }, d: DBDraft) => RowDiffType;
   setField: (uid: string, iid: string, f: Field, v: string) => void;
+  flushSaves: () => void;
   resetMyRow: (itemId: string) => void;
   errorsByItem: Map<string, string[]>;
   otherUsersByItem: (itemId: string) => DBDraft[];
@@ -1000,6 +1066,7 @@ function MyView({
         currentUserId={currentUserId}
         computeDiff={computeDiff}
         setField={setField}
+        flushSaves={flushSaves}
         resetMyRow={resetMyRow}
         errorsByItem={errorsByItem}
         otherUsersByItem={otherUsersByItem}
@@ -1013,6 +1080,7 @@ function MyView({
         currentUserId={currentUserId}
         computeDiff={computeDiff}
         setField={setField}
+        flushSaves={flushSaves}
         resetMyRow={resetMyRow}
         errorsByItem={errorsByItem}
         otherUsersByItem={otherUsersByItem}
@@ -1025,7 +1093,7 @@ function MyView({
 // ─── DesktopTable (My view) ──────────────────────────────────────────────
 function DesktopTable({
   items, appStock, drafts, lastRecon, currentUserId,
-  computeDiff, setField, resetMyRow, errorsByItem,
+  computeDiff, setField, flushSaves, resetMyRow, errorsByItem,
   otherUsersByItem, conflictByItem,
 }: {
   items: (Item & { categoryName: string | null })[];
@@ -1035,6 +1103,7 @@ function DesktopTable({
   currentUserId: string;
   computeDiff: (i: Item, app: { A: AppStock; B: AppStock }, d: DBDraft) => RowDiffType;
   setField: (uid: string, iid: string, f: Field, v: string) => void;
+  flushSaves: () => void;
   resetMyRow: (itemId: string) => void;
   errorsByItem: Map<string, string[]>;
   otherUsersByItem: (itemId: string) => DBDraft[];
@@ -1071,6 +1140,7 @@ function DesktopTable({
                 conflict={conflict}
                 last={last}
                 onChange={(field, value) => setField(currentUserId, i.id, field, value)}
+                onBlur={flushSaves}
                 onReset={() => resetMyRow(i.id)}
                 errors={errorsByItem.get(i.id)}
               />
@@ -1094,7 +1164,7 @@ function makeEmptyDraft(uid: string, iid: string): DBDraft {
 }
 
 function MyDesktopRow({
-  i, app, d, rd, others, conflict, last, onChange, onReset, errors,
+  i, app, d, rd, others, conflict, last, onChange, onBlur, onReset, errors,
 }: {
   i: Item & { categoryName: string | null };
   app: { A: AppStock; B: AppStock };
@@ -1104,6 +1174,7 @@ function MyDesktopRow({
   conflict: ItemConflictType | null;
   last?: LastReconciled;
   onChange: (field: Field, value: string) => void;
+  onBlur: () => void;
   onReset: () => void;
   errors?: string[];
 }) {
@@ -1144,6 +1215,7 @@ function MyDesktopRow({
             value={d.case_size_raw}
             placeholder={String(rd.csOld)}
             onChange={(v) => onChange("case_size", v)}
+            onBlur={onBlur}
             tone={rd.caseSizeChanged ? "amber" : (!rd.caseSizeValid ? "rose" : "neutral")}
             ariaLabel={`Case size for ${i.model}`}
           />
@@ -1151,24 +1223,28 @@ function MyDesktopRow({
         <td className="px-2 py-2">
           <ExprInput value={d.a_cases_raw} placeholder="—"
             onChange={(v) => onChange("a_cases", v)}
+            onBlur={onBlur}
             tone={rd.A.userTouched ? (rd.A.valid ? "amber" : "rose") : "neutral"}
             ariaLabel={`Godown A cases for ${i.model}`} />
         </td>
         <td className="px-2 py-2">
           <ExprInput value={d.a_loose_raw} placeholder="—"
             onChange={(v) => onChange("a_loose", v)}
+            onBlur={onBlur}
             tone={rd.A.userTouched ? (rd.A.valid ? "amber" : "rose") : "neutral"}
             ariaLabel={`Godown A loose for ${i.model}`} />
         </td>
         <td className="px-2 py-2">
           <ExprInput value={d.b_cases_raw} placeholder="—"
             onChange={(v) => onChange("b_cases", v)}
+            onBlur={onBlur}
             tone={rd.B.userTouched ? (rd.B.valid ? "amber" : "rose") : "neutral"}
             ariaLabel={`Godown B cases for ${i.model}`} />
         </td>
         <td className="px-2 py-2">
           <ExprInput value={d.b_loose_raw} placeholder="—"
             onChange={(v) => onChange("b_loose", v)}
+            onBlur={onBlur}
             tone={rd.B.userTouched ? (rd.B.valid ? "amber" : "rose") : "neutral"}
             ariaLabel={`Godown B loose for ${i.model}`} />
         </td>
@@ -1221,11 +1297,12 @@ function RowMeta({ last, others, conflict }: { last?: LastReconciled; others: DB
 
 // ─── ExprInput ───────────────────────────────────────────────────────────
 function ExprInput({
-  value, placeholder, onChange, tone, ariaLabel, compact = false,
+  value, placeholder, onChange, onBlur, tone, ariaLabel, compact = false,
 }: {
   value: string;
   placeholder: string;
   onChange: (v: string) => void;
+  onBlur?: () => void;
   tone: "neutral" | "amber" | "rose";
   ariaLabel: string;
   compact?: boolean;
@@ -1242,7 +1319,9 @@ function ExprInput({
   return (
     <div className="relative">
       <input type="text" inputMode="numeric" value={value} placeholder={placeholder}
-        onChange={(e) => onChange(e.target.value)} className={cls} aria-label={ariaLabel} />
+        onChange={(e) => onChange(e.target.value)}
+        onBlur={onBlur}
+        className={cls} aria-label={ariaLabel} />
       {showsTotal && (
         <span className="pointer-events-none absolute -bottom-3.5 left-1/2 -translate-x-1/2 text-[9px] text-zinc-500 tabular-nums whitespace-nowrap">
           = {fmtN(parsed!)}
@@ -1255,7 +1334,7 @@ function ExprInput({
 // ─── mobile cards (My view) ──────────────────────────────────────────────
 function MobileCards({
   items, appStock, drafts, lastRecon, currentUserId,
-  computeDiff, setField, resetMyRow, errorsByItem,
+  computeDiff, setField, flushSaves, resetMyRow, errorsByItem,
   otherUsersByItem, conflictByItem,
 }: {
   items: (Item & { categoryName: string | null })[];
@@ -1265,6 +1344,7 @@ function MobileCards({
   currentUserId: string;
   computeDiff: (i: Item, app: { A: AppStock; B: AppStock }, d: DBDraft) => RowDiffType;
   setField: (uid: string, iid: string, f: Field, v: string) => void;
+  flushSaves: () => void;
   resetMyRow: (itemId: string) => void;
   errorsByItem: Map<string, string[]>;
   otherUsersByItem: (itemId: string) => DBDraft[];
@@ -1318,6 +1398,7 @@ function MobileCards({
                 value={my.case_size_raw}
                 placeholder={String(rd.csOld)}
                 onChange={(v) => setField(currentUserId, i.id, "case_size", v)}
+                onBlur={flushSaves}
                 tone={rd.caseSizeChanged ? "amber" : (!rd.caseSizeValid ? "rose" : "neutral")}
                 ariaLabel={`Case size for ${i.model}`}
               />
@@ -1332,6 +1413,7 @@ function MobileCards({
                 touched={rd.A.userTouched || rd.caseSizeChanged}
                 onCases={(v) => setField(currentUserId, i.id, "a_cases", v)}
                 onLoose={(v) => setField(currentUserId, i.id, "a_loose", v)}
+                onBlur={flushSaves}
                 modelHint={`${i.model} A`}
               />
               <GodownBlock
@@ -1342,6 +1424,7 @@ function MobileCards({
                 touched={rd.B.userTouched || rd.caseSizeChanged}
                 onCases={(v) => setField(currentUserId, i.id, "b_cases", v)}
                 onLoose={(v) => setField(currentUserId, i.id, "b_loose", v)}
+                onBlur={flushSaves}
                 modelHint={`${i.model} B`}
               />
             </div>
@@ -1361,7 +1444,7 @@ function MobileCards({
 
 function GodownBlock({
   label, appCases, appLoose, d_cases, d_loose, side, touched,
-  onCases, onLoose, modelHint,
+  onCases, onLoose, onBlur, modelHint,
 }: {
   label: string;
   appCases: number; appLoose: number;
@@ -1369,6 +1452,7 @@ function GodownBlock({
   side: RowDiffType["A"];
   touched: boolean;
   onCases: (v: string) => void; onLoose: (v: string) => void;
+  onBlur: () => void;
   modelHint: string;
 }) {
   void appCases; void appLoose;
@@ -1380,12 +1464,12 @@ function GodownBlock({
       <div className="space-y-1.5">
         <div className="grid grid-cols-[auto_1fr] gap-1.5 items-center">
           <span className="text-[10px] text-zinc-500 w-12">Cases</span>
-          <ExprInput value={d_cases} placeholder="—" onChange={onCases}
+          <ExprInput value={d_cases} placeholder="—" onChange={onCases} onBlur={onBlur}
             tone={touched ? (side.valid ? "amber" : "rose") : "neutral"} ariaLabel={`${modelHint} cases`} />
         </div>
         <div className="grid grid-cols-[auto_1fr] gap-1.5 items-center">
           <span className="text-[10px] text-zinc-500 w-12">Loose</span>
-          <ExprInput value={d_loose} placeholder="—" onChange={onLoose}
+          <ExprInput value={d_loose} placeholder="—" onChange={onLoose} onBlur={onBlur}
             tone={touched ? (side.valid ? "amber" : "rose") : "neutral"} ariaLabel={`${modelHint} loose`} />
         </div>
       </div>
@@ -1396,7 +1480,7 @@ function GodownBlock({
 // ─── ReviewerView (admin only) ───────────────────────────────────────────
 function ReviewerView({
   items, appStock, draftsByItem, lastRecon, computeDiff, computeItemConflict,
-  setField, deleteDraft, currentUserId, errorsByItem,
+  setField, flushSaves, deleteDraft, currentUserId, errorsByItem,
 }: {
   items: (Item & { categoryName: string | null })[];
   appStock: Map<string, { A: AppStock; B: AppStock }>;
@@ -1405,6 +1489,7 @@ function ReviewerView({
   computeDiff: (i: Item, app: { A: AppStock; B: AppStock }, d: DBDraft) => RowDiffType;
   computeItemConflict: (drs: DBDraft[]) => ItemConflictType;
   setField: (uid: string, iid: string, f: Field, v: string) => void;
+  flushSaves: () => void;
   deleteDraft: (uid: string, iid: string) => void;
   currentUserId: string;
   errorsByItem: Map<string, string[]>;
@@ -1466,6 +1551,7 @@ function ReviewerView({
                     isMe={d.user_id === currentUserId}
                     computeDiff={computeDiff}
                     onChange={(field, value) => setField(d.user_id, i.id, field, value)}
+                    onBlur={flushSaves}
                     onClear={() => deleteDraft(d.user_id, i.id)}
                   />
                 ))}
@@ -1486,7 +1572,7 @@ function ReviewerView({
 }
 
 function ReviewerUserRow({
-  i, app, d, conflict, isMe, computeDiff, onChange, onClear,
+  i, app, d, conflict, isMe, computeDiff, onChange, onBlur, onClear,
 }: {
   i: Item;
   app: { A: AppStock; B: AppStock };
@@ -1495,6 +1581,7 @@ function ReviewerUserRow({
   isMe: boolean;
   computeDiff: (i: Item, app: { A: AppStock; B: AppStock }, d: DBDraft) => RowDiffType;
   onChange: (field: Field, value: string) => void;
+  onBlur: () => void;
   onClear: () => void;
 }) {
   const rd = computeDiff(i, app, d);
@@ -1513,19 +1600,19 @@ function ReviewerUserRow({
 
       <div className="grid grid-cols-5 gap-1.5">
         <ReviewerCell label="Case sz" value={d.case_size_raw} placeholder={String(i.case_size || 0)}
-          onChange={(v) => onChange("case_size", v)} conflict={!!conflict?.case_size}
+          onChange={(v) => onChange("case_size", v)} onBlur={onBlur} conflict={!!conflict?.case_size}
           tone={tonefor(d.case_size_raw, rd.caseSizeValid, rd.caseSizeChanged)} ariaLabel={`Case size by ${name}`} />
         <ReviewerCell label="A c" value={d.a_cases_raw} placeholder={String(app.A.cases)}
-          onChange={(v) => onChange("a_cases", v)} conflict={!!conflict?.a_cases}
+          onChange={(v) => onChange("a_cases", v)} onBlur={onBlur} conflict={!!conflict?.a_cases}
           tone={tonefor(d.a_cases_raw, rd.A.valid, rd.A.userTouched)} ariaLabel={`A cases by ${name}`} />
         <ReviewerCell label="A L" value={d.a_loose_raw} placeholder={String(app.A.loose)}
-          onChange={(v) => onChange("a_loose", v)} conflict={!!conflict?.a_loose}
+          onChange={(v) => onChange("a_loose", v)} onBlur={onBlur} conflict={!!conflict?.a_loose}
           tone={tonefor(d.a_loose_raw, rd.A.valid, rd.A.userTouched)} ariaLabel={`A loose by ${name}`} />
         <ReviewerCell label="B c" value={d.b_cases_raw} placeholder={String(app.B.cases)}
-          onChange={(v) => onChange("b_cases", v)} conflict={!!conflict?.b_cases}
+          onChange={(v) => onChange("b_cases", v)} onBlur={onBlur} conflict={!!conflict?.b_cases}
           tone={tonefor(d.b_cases_raw, rd.B.valid, rd.B.userTouched)} ariaLabel={`B cases by ${name}`} />
         <ReviewerCell label="B L" value={d.b_loose_raw} placeholder={String(app.B.loose)}
-          onChange={(v) => onChange("b_loose", v)} conflict={!!conflict?.b_loose}
+          onChange={(v) => onChange("b_loose", v)} onBlur={onBlur} conflict={!!conflict?.b_loose}
           tone={tonefor(d.b_loose_raw, rd.B.valid, rd.B.userTouched)} ariaLabel={`B loose by ${name}`} />
       </div>
 
@@ -1544,12 +1631,13 @@ function tonefor(raw: string, valid: boolean, touched: boolean): "neutral" | "am
 }
 
 function ReviewerCell({
-  label, value, placeholder, onChange, conflict, tone, ariaLabel,
+  label, value, placeholder, onChange, onBlur, conflict, tone, ariaLabel,
 }: {
   label: string;
   value: string;
   placeholder: string;
   onChange: (v: string) => void;
+  onBlur: () => void;
   conflict: boolean;
   tone: "neutral" | "amber" | "rose";
   ariaLabel: string;
@@ -1558,7 +1646,7 @@ function ReviewerCell({
   return (
     <div className="flex flex-col items-center gap-0.5">
       <span className={cn("text-[9px] uppercase tracking-wider font-medium", conflict ? "text-rose-500" : "text-zinc-500")}>{label}</span>
-      <ExprInput value={value} placeholder={placeholder} onChange={onChange} tone={effectiveTone} ariaLabel={ariaLabel} compact />
+      <ExprInput value={value} placeholder={placeholder} onChange={onChange} onBlur={onBlur} tone={effectiveTone} ariaLabel={ariaLabel} compact />
     </div>
   );
 }
