@@ -724,12 +724,17 @@ export default function ReconciliationPage() {
             continue;
           }
         }
-        const { error: upErr } = await sb()
-          .from("godown_stock")
-          .upsert(
-            { item_id: j.itemId, godown: s.godown, cases: s.physCases, loose: s.physLoose },
-            { onConflict: "item_id,godown" }
-          );
+        // godown_stock has RLS that only the process_transaction
+        // SECURITY DEFINER path can satisfy — so we can't direct-upsert
+        // from the client. reconcile_stock_split is the sanctioned RPC
+        // (admin-gated inside the function body) that forces the
+        // cases/loose split to match the physical count.
+        const { error: upErr } = await sb().rpc("reconcile_stock_split", {
+          p_item_id: j.itemId,
+          p_godown:  s.godown,
+          p_cases:   s.physCases,
+          p_loose:   s.physLoose,
+        });
         if (upErr) {
           newErrors.push({ itemId: j.itemId, godown: s.godown, message: `Split sync failed: ${upErr.message}` });
           failedItems.add(j.itemId);
