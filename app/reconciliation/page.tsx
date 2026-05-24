@@ -115,6 +115,17 @@ export default function ReconciliationPage() {
   const [appStock, setAppStock] = useState<Map<string, { A: AppStock; B: AppStock }>>(new Map());
   const [catNameById, setCatNameById] = useState<Map<string, string>>(new Map());
   const [drafts, setDrafts] = useState<Map<DraftKey, DBDraft>>(new Map());
+  // Mirror of `drafts` that survives component unmount. persistDraft reads
+  // from this ref so a pending save fired by a timer (or by the
+  // unmount-flush below) still sees the latest input even after the user
+  // navigated away and React state went stale. Helper writeDrafts() keeps
+  // both in sync — call it everywhere drafts changes (load, refresh,
+  // setField, deleteDraft, etc.) instead of bare setDrafts.
+  const draftsRef = useRef<Map<DraftKey, DBDraft>>(new Map());
+  const writeDrafts = useCallback((next: Map<DraftKey, DBDraft>) => {
+    draftsRef.current = next;
+    setDrafts(next);
+  }, []);
   const [lastRecon, setLastRecon] = useState<Map<string, LastReconciled>>(new Map());
   const [loaded, setLoaded] = useState(false);
 
@@ -194,10 +205,10 @@ export default function ReconciliationPage() {
     setItems((rows || []) as Item[]);
     setAppStock(stockMap);
     setCatNameById(new Map((cats || []).map((c: any) => [c.id, c.name])));
-    setDrafts(draftsMap);
+    writeDrafts(draftsMap);
     setLastRecon(lastMap);
     setLoaded(true);
-  }, []);
+  }, [writeDrafts]);
 
   useEffect(() => { void load(); }, [load]);
 
@@ -232,79 +243,80 @@ export default function ReconciliationPage() {
     const serverByKey = new Map<string, DBDraft>();
     (data || []).forEach((d: any) => serverByKey.set(dkey(d.user_id, d.item_id), d as DBDraft));
 
-    setDrafts(prev => {
-      const next = new Map(prev);
+    const prev = draftsRef.current;
+    const next = new Map(prev);
 
-      // 1) Other users' rows — server is the source of truth.
-      for (const [k, local] of [...prev]) {
-        if (local.user_id !== myId && !serverByKey.has(k)) next.delete(k);
-      }
-      for (const [k, server] of serverByKey) {
-        if (server.user_id !== myId) next.set(k, server);
-      }
+    // 1) Other users' rows — server is the source of truth.
+    for (const [k, local] of [...prev]) {
+      if (local.user_id !== myId && !serverByKey.has(k)) next.delete(k);
+    }
+    for (const [k, server] of serverByKey) {
+      if (server.user_id !== myId) next.set(k, server);
+    }
 
-      // 2) My own rows — protect in-flight edits.
-      for (const [k, server] of serverByKey) {
-        if (server.user_id !== myId) continue;
-        if (saveTimers.current.has(k)) continue; // mid-save, don't touch
-        const local = next.get(k);
-        if (!local || (local.updated_at && server.updated_at > local.updated_at) || !local.updated_at) {
-          next.set(k, server);
-        }
+    // 2) My own rows — protect in-flight edits.
+    for (const [k, server] of serverByKey) {
+      if (server.user_id !== myId) continue;
+      if (saveTimers.current.has(k)) continue; // mid-save, don't touch
+      const local = next.get(k);
+      if (!local || (local.updated_at && server.updated_at > local.updated_at) || !local.updated_at) {
+        next.set(k, server);
       }
+    }
 
-      // 3) My own rows that no longer exist on the server (admin committed).
-      for (const [k, local] of [...next]) {
-        if (local.user_id !== myId) continue;
-        if (serverByKey.has(k)) continue;
-        if (saveTimers.current.has(k)) continue;
-        if (local.id.startsWith("local-")) continue; // never persisted, keep
-        next.delete(k);
-      }
+    // 3) My own rows that no longer exist on the server (admin committed).
+    for (const [k, local] of [...next]) {
+      if (local.user_id !== myId) continue;
+      if (serverByKey.has(k)) continue;
+      if (saveTimers.current.has(k)) continue;
+      if (local.id.startsWith("local-")) continue; // never persisted, keep
+      next.delete(k);
+    }
 
-      return next;
-    });
-  }, [profile?.id]);
+    writeDrafts(next);
+  }, [profile?.id, writeDrafts]);
   useEffect(() => {
     if (!loaded) return;
     const onVis = () => { if (document.visibilityState === "visible") void refreshDrafts(); };
     document.addEventListener("visibilitychange", onVis);
-    const id = window.setInterval(() => { void refreshDrafts(); }, 30000);
+    // Admin actively reviewing — refresh fast (3s) so staff typing shows up
+    // near-live. Otherwise (My count for everyone) drop to 30s; the user
+    // doesn't need to see other counters' updates while they're entering
+    // their own count.
+    const intervalMs = mode === "reviewer" ? 3000 : 30000;
+    const id = window.setInterval(() => { void refreshDrafts(); }, intervalMs);
     return () => {
       document.removeEventListener("visibilitychange", onVis);
       window.clearInterval(id);
     };
-  }, [loaded, refreshDrafts]);
+  }, [loaded, refreshDrafts, mode]);
 
   // Optimistic local mutation; the actual DB write happens debounced below.
   const setField = useCallback((userId: string, itemId: string, field: Field, value: string) => {
-    setDrafts(prev => {
-      const next = new Map(prev);
-      const k = dkey(userId, itemId);
-      const cur = next.get(k);
-      const merged: DBDraft = cur
-        ? { ...cur, [FIELDS_RAW[field]]: value, updated_at: new Date().toISOString() }
-        : {
-          id: "local-" + k,
-          user_id: userId,
-          item_id: itemId,
-          case_size_raw: "",
-          a_cases_raw: "",
-          a_loose_raw: "",
-          b_cases_raw: "",
-          b_loose_raw: "",
-          updated_at: new Date().toISOString(),
-          user_email: profile?.email ?? null,
-          user_name: profile?.name ?? null,
-          user_role: profile?.role ?? null,
-          [FIELDS_RAW[field]]: value,
-        } as DBDraft;
-      next.set(k, merged);
-      return next;
-    });
+    const k = dkey(userId, itemId);
+    const cur = draftsRef.current.get(k);
+    const merged: DBDraft = cur
+      ? { ...cur, [FIELDS_RAW[field]]: value, updated_at: new Date().toISOString() }
+      : {
+        id: "local-" + k,
+        user_id: userId,
+        item_id: itemId,
+        case_size_raw: "",
+        a_cases_raw: "",
+        a_loose_raw: "",
+        b_cases_raw: "",
+        b_loose_raw: "",
+        updated_at: new Date().toISOString(),
+        user_email: profile?.email ?? null,
+        user_name: profile?.name ?? null,
+        user_role: profile?.role ?? null,
+        [FIELDS_RAW[field]]: value,
+      } as DBDraft;
+    const next = new Map(draftsRef.current);
+    next.set(k, merged);
+    writeDrafts(next);
 
     // Debounced DB write — 200 ms after the last keystroke for this row.
-    const k = dkey(userId, itemId);
     const existing = saveTimers.current.get(k);
     if (existing) clearTimeout(existing);
     const timer = window.setTimeout(() => {
@@ -312,7 +324,7 @@ export default function ReconciliationPage() {
       void persistDraft(userId, itemId);
     }, 200);
     saveTimers.current.set(k, timer);
-  }, [profile?.email, profile?.name, profile?.role]);
+  }, [profile?.email, profile?.name, profile?.role, writeDrafts]);
 
   // Immediate flush — called on input blur so a value can't be lost if the
   // user closes the tab or switches away inside the debounce window. Fires
@@ -328,13 +340,13 @@ export default function ReconciliationPage() {
   }, []);
 
   // Read the latest local draft for (user, item) and either upsert (if any
-  // field non-empty) or delete (if all empty).
+  // field non-empty) or delete (if all empty). Reads from `draftsRef`
+  // rather than React state so a timer that fires AFTER the component has
+  // unmounted (during a route transition) still sees the user's latest
+  // keystrokes and can persist them.
   const persistDraft = useCallback(async (userId: string, itemId: string) => {
     const k = dkey(userId, itemId);
-    // Snapshot the latest state directly off the React state via a
-    // functional getter — avoids stale-closure bugs.
-    let snap: DBDraft | undefined;
-    setDrafts(prev => { snap = prev.get(k); return prev; });
+    const snap = draftsRef.current.get(k);
     if (!snap) return;
 
     const allEmpty =
@@ -342,9 +354,10 @@ export default function ReconciliationPage() {
       !snap.b_cases_raw.trim() && !snap.b_loose_raw.trim();
 
     if (allEmpty) {
-      // Drop the row entirely; only delete server-side if it existed.
       const isLocal = snap.id.startsWith("local-");
-      setDrafts(prev => { const next = new Map(prev); next.delete(k); return next; });
+      const next = new Map(draftsRef.current);
+      next.delete(k);
+      writeDrafts(next);
       if (!isLocal) {
         await sb().from("reconciliation_drafts").delete().eq("user_id", userId).eq("item_id", itemId);
       }
@@ -368,26 +381,42 @@ export default function ReconciliationPage() {
       .select("id, updated_at")
       .single();
     if (error) {
+      // Don't toast if component already unmounted — but useState setters
+      // are no-ops post-unmount, so calling showToast is safe.
       showToast("bad", `Save failed: ${error.message}`);
       return;
     }
     if (data) {
-      // Patch id/updated_at into the local copy.
-      setDrafts(prev => {
-        const next = new Map(prev);
-        const cur = next.get(k);
-        if (!cur) return prev;
-        next.set(k, { ...cur, id: data.id, updated_at: data.updated_at });
-        return next;
-      });
+      const cur = draftsRef.current.get(k);
+      if (!cur) return;
+      const next = new Map(draftsRef.current);
+      next.set(k, { ...cur, id: data.id, updated_at: data.updated_at });
+      writeDrafts(next);
     }
-  }, []);
+  }, [writeDrafts]);
 
   const deleteDraft = useCallback(async (userId: string, itemId: string) => {
     const k = dkey(userId, itemId);
-    setDrafts(prev => { const next = new Map(prev); next.delete(k); return next; });
+    const next = new Map(draftsRef.current);
+    next.delete(k);
+    writeDrafts(next);
     await sb().from("reconciliation_drafts").delete().eq("user_id", userId).eq("item_id", itemId);
-  }, []);
+  }, [writeDrafts]);
+
+  // Unmount cleanup — fire every pending save BEFORE the route transition
+  // tears React state down. persistDraft reads from the ref, so the actual
+  // upsert request still goes out cleanly even after the component is gone
+  // (the network request survives unmount on its own).
+  useEffect(() => {
+    return () => {
+      for (const [k, timer] of saveTimers.current) {
+        clearTimeout(timer);
+        saveTimers.current.delete(k);
+        const [userId, itemId] = k.split("::");
+        void persistDraft(userId, itemId);
+      }
+    };
+  }, [persistDraft]);
 
   // ─── derived: drafts grouped by item ───────────────────────────────────
   const draftsByItem = useMemo(() => {
@@ -853,11 +882,14 @@ function Header({
       <div className="flex items-center gap-3 mb-1">
         <ClipboardCheck className="w-5 h-5 text-cyan-600 dark:text-cyan-400" />
         <h1 className="text-xl sm:text-2xl font-semibold tracking-tight">Reconciliation</h1>
-        {isAdmin && (
-          <span className="bg-violet-500/15 text-violet-700 dark:text-violet-300 px-2 py-0.5 rounded text-[10px] uppercase tracking-wider font-medium">
-            {mode === "reviewer" ? "Reviewer" : "My count"}
-          </span>
-        )}
+        <span className={cn(
+          "px-2 py-0.5 rounded text-[10px] uppercase tracking-wider font-medium",
+          isAdmin && mode === "reviewer"
+            ? "bg-violet-500/15 text-violet-700 dark:text-violet-300"
+            : "bg-cyan-500/15 text-cyan-700 dark:text-cyan-300"
+        )}>
+          {isAdmin && mode === "reviewer" ? "Reviewer" : "My count"}
+        </span>
       </div>
       <p className="text-sm text-zinc-500 tabular-nums">
         {!loaded ? "Loading…" : (

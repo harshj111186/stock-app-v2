@@ -47,10 +47,16 @@ export const metadata: Metadata = {
 // Two theme-colors: light/dark via prefers-color-scheme so the address bar
 // and standalone status bar match the active theme. interactiveWidget keeps
 // inputs visible above the keyboard on mobile.
+//
+// userScalable=false + maximumScale=1: kills iOS Safari's auto-zoom on
+// input focus (which kept yanking the page around when staff tapped the
+// reconciliation cells) and disables manual pinch-zoom. The app is a
+// data-entry tool, not a document; zoom isn't useful here.
 export const viewport: Viewport = {
   width: "device-width",
   initialScale: 1,
-  maximumScale: 5,
+  maximumScale: 1,
+  userScalable: false,
   viewportFit: "cover",
   interactiveWidget: "resizes-content",
   themeColor: [
