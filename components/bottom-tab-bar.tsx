@@ -41,6 +41,7 @@ const TABS = [
     match: (p: string) =>
       p.startsWith("/more") ||
       p.startsWith("/godown") ||
+      p.startsWith("/reconciliation") ||
       p.startsWith("/pricing") ||
       p.startsWith("/audit") ||
       p.startsWith("/users") ||

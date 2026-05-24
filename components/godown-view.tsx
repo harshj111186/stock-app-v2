@@ -424,7 +424,6 @@ function GodownCard({
         ) : (
           <span className="text-zinc-400 text-[10px] italic">no brand</span>
         )}
-        <span className="text-[10px] text-zinc-400 tabular-nums">{item.item_code}</span>
       </div>
 
       <div className="text-sm font-medium truncate" title={item.model}>{item.model}</div>
@@ -497,7 +496,6 @@ function TableBody({
           </div>
           <div className="text-xs text-zinc-500 mb-2 truncate">
             {[i.size, i.colour].filter(Boolean).join(" · ") || "—"}
-            <span className="text-zinc-400"> · {i.item_code}</span>
           </div>
           <div className="flex items-center justify-between text-sm">
             <div className="flex items-center gap-1.5 tabular-nums">

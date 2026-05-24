@@ -541,7 +541,6 @@ export default function TransactionsPage() {
             />
             {selectedItem && (
               <div className="mt-2 text-xs text-zinc-500 flex flex-wrap gap-3">
-                <Badge>{selectedItem.item_code}</Badge>
                 {selectedItem.brand && <Badge>{selectedItem.brand}</Badge>}
                 <span>case size: <b className="tnum">{selectedItem.case_size || "—"}</b></span>
                 <span>Stock A: <b className="tnum">{stockTotalFor(selectedItem, stock, "A")}</b></span>
@@ -1280,7 +1279,7 @@ function ItemPicker({
             >
               <div className="min-w-0 flex-1">
                 <div className="truncate">{i.brand && <span className="text-zinc-400">{i.brand} · </span>}{i.model}</div>
-                <div className="text-[11px] text-zinc-500 truncate">{i.size} · {i.colour} · {i.item_code}</div>
+                <div className="text-[11px] text-zinc-500 truncate">{[i.size, i.colour].filter(Boolean).join(" · ")}</div>
               </div>
               {i.case_size > 0
                 ? <span className="text-[10px] text-zinc-400 tnum whitespace-nowrap">case×{i.case_size}</span>

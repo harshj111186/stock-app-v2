@@ -2,7 +2,7 @@
 import Link from "next/link";
 import {
   Warehouse, Receipt, ShieldCheck, Users, Settings, LogOut,
-  ChevronRight, Download,
+  ChevronRight, Download, ClipboardCheck,
 } from "lucide-react";
 import { Shell } from "@/components/shell";
 import { useAuth } from "@/app/providers";
@@ -22,6 +22,7 @@ type Row = {
 const ROWS: Row[] = [
   { href: "/godown-a", label: "Godown A", sub: "Stock at warehouse A", icon: Warehouse },
   { href: "/godown-b", label: "Godown B", sub: "Stock at warehouse B", icon: Warehouse },
+  { href: "/reconciliation", label: "Reconciliation", sub: "Physical stock-take + paper count sheet", icon: ClipboardCheck },
   { href: "/pricing",  label: "Pricing",  sub: "LP, stacked discounts, GST", icon: Receipt },
   { href: "/audit",    label: "Audit log", sub: "Every DB change, auto-logged", icon: ShieldCheck, adminOnly: true },
   { href: "/users",    label: "Users",    sub: "Manage staff and roles", icon: Users, adminOnly: true },

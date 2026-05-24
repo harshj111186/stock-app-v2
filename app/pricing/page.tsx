@@ -442,7 +442,6 @@ function PricingMobileCard({
           </div>
           <div className="text-[11px] text-zinc-500 truncate">
             {[row.size, row.colour].filter(Boolean).join(" · ") || "—"}
-            <span className="text-zinc-400"> · {row.item_code}</span>
             {!row.hasRow && <span className="ml-1 text-amber-500 uppercase tracking-wider">unpriced</span>}
           </div>
         </div>
@@ -598,7 +597,6 @@ function PricingRow({
         </div>
         <div className="text-[11px] text-zinc-500 mt-0.5">
           {[row.size, row.colour].filter(Boolean).join(" · ") || "—"}
-          <span className="text-zinc-400"> · {row.item_code}</span>
           {!row.hasRow && (
             <span className="ml-2 text-amber-500 text-[10px] uppercase tracking-wider">unpriced</span>
           )}

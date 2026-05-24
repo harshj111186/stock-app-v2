@@ -83,4 +83,60 @@
     th, td { border: 1px solid #ddd !important; padding: 3px 5px !important; }
     .shimmer { animation: none !important; }
   }
+
+  /* ── Reconciliation print sheet ─────────────────────────────────────
+     The page renders both an interactive UI (.no-print, hidden during
+     print) and a paper-friendly count sheet (.print-sheet, hidden on
+     screen and shown only during print). Layout is tuned for A4: tall
+     rows with a blank line for the count and the app's current value
+     in tiny grey below for reference. */
+  .print-sheet { display: none; }
+  @media print {
+    @page { margin: 12mm 10mm; size: A4; }
+    .print-sheet { display: block !important; }
+    .print-sheet .ps-header {
+      display: flex; justify-content: space-between; align-items: flex-start;
+      gap: 16px; margin-bottom: 8px; border-bottom: 1px solid #000;
+      padding-bottom: 6px;
+    }
+    .print-sheet .ps-title { font-size: 14px; font-weight: 700; }
+    .print-sheet .ps-subtitle { font-size: 10px; color: #555 !important; }
+    .print-sheet .ps-meta { font-size: 9px; text-align: right; line-height: 1.8; }
+    .print-sheet .ps-brand { margin-top: 10px; page-break-inside: auto; }
+    .print-sheet .ps-brand-h {
+      font-size: 12px; font-weight: 700; margin-top: 8px; margin-bottom: 2px;
+      border-bottom: 1px solid #000; padding-bottom: 1px;
+    }
+    .print-sheet .ps-cat-h {
+      font-size: 10px; font-weight: 600; margin-top: 4px; margin-bottom: 2px;
+      color: #333 !important;
+    }
+    .print-sheet table.ps-table {
+      width: 100% !important; border-collapse: collapse !important;
+      font-size: 9px !important; table-layout: fixed;
+    }
+    .print-sheet table.ps-table th,
+    .print-sheet table.ps-table td {
+      border: 1px solid #000 !important; padding: 2px 4px !important;
+      vertical-align: top;
+    }
+    .print-sheet table.ps-table thead th {
+      background: #eee !important; font-weight: 600;
+      -webkit-print-color-adjust: exact; print-color-adjust: exact;
+    }
+    .print-sheet table.ps-table tr { page-break-inside: avoid; height: 32px; }
+    .print-sheet .ps-model { width: auto; }
+    .print-sheet .ps-model-name { font-weight: 600; font-size: 10px; }
+    .print-sheet .ps-model-sub { font-size: 8px; color: #555 !important; }
+    .print-sheet .ps-cs { width: 42px; text-align: center; }
+    .print-sheet .ps-cell { width: 54px; text-align: center; }
+    .print-sheet .ps-notes { width: 110px; }
+    .print-sheet .ps-blank-line {
+      border-bottom: 1px solid #666 !important; height: 22px;
+    }
+    .print-sheet .ps-footer {
+      margin-top: 8px; font-size: 8px; color: #666 !important;
+      text-align: center; border-top: 1px dashed #999; padding-top: 4px;
+    }
+  }
 }

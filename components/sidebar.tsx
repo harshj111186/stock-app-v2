@@ -4,7 +4,7 @@ import { usePathname } from "next/navigation";
 import {
   LayoutDashboard, Boxes, Warehouse, ArrowLeftRight, Receipt,
   BarChart3, TrendingUp, AlertOctagon, ShieldCheck, Users, Settings, LogOut,
-  Package, Download,
+  Package, Download, ClipboardCheck,
 } from "lucide-react";
 import { useAuth } from "@/app/providers";
 import { useInstall } from "@/components/install-provider";
@@ -17,6 +17,7 @@ const NAV = [
     { href: "/godown-a", label: "Godown A", icon: Warehouse },
     { href: "/godown-b", label: "Godown B", icon: Warehouse },
     { href: "/transactions", label: "Transactions", icon: ArrowLeftRight },
+    { href: "/reconciliation", label: "Reconciliation", icon: ClipboardCheck },
     { href: "/pricing", label: "Pricing", icon: Receipt },
   ]},
   { group: "Reports", items: [
