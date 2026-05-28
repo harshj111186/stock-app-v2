@@ -1,6 +1,6 @@
 "use client";
 import { useState } from "react";
-import { X, Save, Loader2, AlertCircle, Plus, Archive } from "lucide-react";
+import { X, Save, Loader2, AlertCircle, Plus, Archive, ArchiveRestore } from "lucide-react";
 import { sb, type Item } from "@/lib/supabase";
 import { CategoryTreePicker } from "@/components/category-tree-picker";
 import { pathById, type CatRow } from "@/lib/categories";
@@ -53,6 +53,21 @@ export function ItemFormModal({
       await onSaved();
     } catch (e: any) {
       setError(e?.message || "Failed to archive item.");
+    } finally {
+      setArchiving(false);
+    }
+  }
+
+  async function restore() {
+    if (!item) return;
+    setError(null);
+    setArchiving(true);
+    try {
+      const { error: e } = await sb().rpc("set_item_archived", { p_item_id: item.id, p_archived: false });
+      if (e) throw e;
+      await onSaved();
+    } catch (e: any) {
+      setError(e?.message || "Failed to restore item.");
     } finally {
       setArchiving(false);
     }
@@ -118,6 +133,11 @@ export function ItemFormModal({
         </div>
 
         <div className="p-5 space-y-4 overflow-y-auto flex-1">
+          {item?.archived && (
+            <div className="bg-amber-50 dark:bg-amber-500/10 border border-amber-200 dark:border-amber-500/30 rounded-md p-2.5 text-[12px] text-amber-800 dark:text-amber-200">
+              This item is <b>archived</b> — hidden from the catalogue. Restore it to bring it back.
+            </div>
+          )}
           <Field label="Model / name" required>
             <input value={model} onChange={(e) => setModel(e.target.value)} autoFocus
               placeholder="e.g. Renesa 1200mm" className={inputCls} />
@@ -180,13 +200,19 @@ export function ItemFormModal({
           className="px-5 py-3 border-t border-zinc-200 dark:border-zinc-800 flex items-center justify-end gap-2 bg-zinc-50 dark:bg-zinc-900/50 flex-shrink-0"
           style={{ paddingBottom: "calc(0.75rem + env(safe-area-inset-bottom))" }}
         >
-          {mode === "edit" && (
+          {mode === "edit" && (item?.archived ? (
+            <button type="button" onClick={restore} disabled={archiving || saving}
+              className="mr-auto px-3 py-2 text-sm text-emerald-600 dark:text-emerald-400 hover:bg-emerald-500/10 rounded-md inline-flex items-center gap-1.5 disabled:opacity-40">
+              {archiving ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ArchiveRestore className="w-3.5 h-3.5" />}
+              Restore
+            </button>
+          ) : (
             <button type="button" onClick={archive} disabled={archiving || saving}
               className="mr-auto px-3 py-2 text-sm text-rose-600 dark:text-rose-400 hover:bg-rose-500/10 rounded-md inline-flex items-center gap-1.5 disabled:opacity-40">
               {archiving ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Archive className="w-3.5 h-3.5" />}
               Archive
             </button>
-          )}
+          ))}
           <button type="button" onClick={onClose} className="px-3 py-2 text-sm text-zinc-600 dark:text-zinc-300 hover:bg-zinc-200 dark:hover:bg-zinc-800 rounded-md">Cancel</button>
           <button type="button" onClick={save} disabled={saving || !model.trim()}
             className="bg-cyan-500 hover:bg-cyan-400 disabled:opacity-40 disabled:cursor-not-allowed text-white px-3.5 py-2 rounded-md text-sm font-medium flex items-center gap-1.5">

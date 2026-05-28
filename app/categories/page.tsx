@@ -1,8 +1,8 @@
 "use client";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  FolderTree, FolderPlus, Plus, Pencil, Archive, ChevronRight, ChevronDown,
-  Loader2, Check, X, MoveRight, AlertCircle, ShieldAlert,
+  FolderTree, FolderPlus, Plus, Pencil, Archive, ArchiveRestore, ChevronRight, ChevronDown,
+  Loader2, Check, X, MoveRight, AlertCircle, ShieldAlert, Eye, EyeOff,
 } from "lucide-react";
 import { Shell } from "@/components/shell";
 import { useAuth } from "@/app/providers";
@@ -28,6 +28,7 @@ export default function CategoriesPage() {
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [draftName, setDraftName] = useState("");
   const [movingNode, setMovingNode] = useState<CatNode | null>(null);
+  const [showArchived, setShowArchived] = useState(false);
 
   const showToast = (kind: "ok" | "bad", text: string) => {
     setToast({ kind, text });
@@ -54,7 +55,7 @@ export default function CategoriesPage() {
   }, []);
   useEffect(() => { void load(); }, [load]);
 
-  const tree = useMemo(() => buildCategoryTree(rows), [rows]);
+  const tree = useMemo(() => buildCategoryTree(rows, showArchived), [rows, showArchived]);
 
   const toggle = (id: string) => setExpanded(prev => {
     const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n;
@@ -98,6 +99,9 @@ export default function CategoriesPage() {
     const ok = await runRpc("category_move", { p_id: id, p_parent_id: parentId }, "Moved.");
     if (ok) setMovingNode(null);
   };
+  const restore = async (n: CatNode) => {
+    await runRpc("category_archive", { p_id: n.id, p_archived: false }, `Restored “${n.name}”.`);
+  };
 
   if (!isAdmin) {
     return (
@@ -135,6 +139,19 @@ export default function CategoriesPage() {
           <FolderPlus className="w-4 h-4" /> Add top-level category
         </button>
         {busy && <Loader2 className="w-4 h-4 animate-spin text-zinc-400" />}
+        <button
+          type="button"
+          onClick={() => setShowArchived(s => !s)}
+          className={cn(
+            "ml-auto inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm border transition-colors",
+            showArchived
+              ? "bg-amber-500/15 border-amber-500/50 text-amber-700 dark:text-amber-300"
+              : "bg-white dark:bg-zinc-900 border-zinc-200 dark:border-zinc-800 text-zinc-600 dark:text-zinc-300"
+          )}
+        >
+          {showArchived ? <Eye className="w-3.5 h-3.5" /> : <EyeOff className="w-3.5 h-3.5" />}
+          {showArchived ? "Showing archived" : "Show archived"}
+        </button>
       </div>
 
       <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-xl overflow-hidden">
@@ -162,7 +179,7 @@ export default function CategoriesPage() {
                 renamingId={renamingId} setRenamingId={setRenamingId}
                 draftName={draftName} setDraftName={setDraftName}
                 onAdd={addCategory} onRename={rename} onArchive={archive} onMove={setMovingNode}
-                busy={busy}
+                onRestore={restore} busy={busy}
               />
             ))}
           </div>
@@ -194,7 +211,7 @@ export default function CategoriesPage() {
 function TreeRow({
   node, expanded, toggle, counts,
   addingUnder, setAddingUnder, renamingId, setRenamingId, draftName, setDraftName,
-  onAdd, onRename, onArchive, onMove, busy,
+  onAdd, onRename, onArchive, onMove, onRestore, busy,
 }: {
   node: CatNode;
   expanded: Set<string>;
@@ -210,6 +227,7 @@ function TreeRow({
   onRename: (id: string) => void;
   onArchive: (n: CatNode) => void;
   onMove: (n: CatNode) => void;
+  onRestore: (n: CatNode) => void;
   busy: boolean;
 }) {
   const hasChildren = node.children.length > 0;
@@ -239,16 +257,23 @@ function TreeRow({
           />
         ) : (
           <>
-            <span className="text-sm font-medium truncate">{node.name}</span>
+            <span className={cn("text-sm font-medium truncate", node.archived && "text-zinc-400 dark:text-zinc-600 line-through")}>{node.name}</span>
+            {node.archived && <span className="text-[10px] text-amber-600 dark:text-amber-400 flex-shrink-0">archived</span>}
             {count > 0 && (
               <span className="text-[10px] bg-zinc-200/70 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-400 px-1.5 py-0.5 rounded tabular-nums flex-shrink-0">{count}</span>
             )}
             <div className="flex-1" />
             <div className="flex items-center gap-0.5 opacity-100 md:opacity-0 md:group-hover:opacity-100 transition-opacity">
-              <IconBtn title="Add subcategory" onClick={() => { setAddingUnder(node.id); setDraftName(""); }} disabled={busy}><Plus className="w-3.5 h-3.5" /></IconBtn>
-              <IconBtn title="Rename" onClick={() => { setRenamingId(node.id); setDraftName(node.name); }} disabled={busy}><Pencil className="w-3.5 h-3.5" /></IconBtn>
-              <IconBtn title="Move" onClick={() => onMove(node)} disabled={busy}><MoveRight className="w-3.5 h-3.5" /></IconBtn>
-              <IconBtn title="Archive" onClick={() => onArchive(node)} disabled={busy} danger><Archive className="w-3.5 h-3.5" /></IconBtn>
+              {node.archived ? (
+                <IconBtn title="Restore" onClick={() => onRestore(node)} disabled={busy}><ArchiveRestore className="w-3.5 h-3.5 text-emerald-500" /></IconBtn>
+              ) : (
+                <>
+                  <IconBtn title="Add subcategory" onClick={() => { setAddingUnder(node.id); setDraftName(""); }} disabled={busy}><Plus className="w-3.5 h-3.5" /></IconBtn>
+                  <IconBtn title="Rename" onClick={() => { setRenamingId(node.id); setDraftName(node.name); }} disabled={busy}><Pencil className="w-3.5 h-3.5" /></IconBtn>
+                  <IconBtn title="Move" onClick={() => onMove(node)} disabled={busy}><MoveRight className="w-3.5 h-3.5" /></IconBtn>
+                  <IconBtn title="Archive" onClick={() => onArchive(node)} disabled={busy} danger><Archive className="w-3.5 h-3.5" /></IconBtn>
+                </>
+              )}
             </div>
           </>
         )}
@@ -265,7 +290,7 @@ function TreeRow({
           addingUnder={addingUnder} setAddingUnder={setAddingUnder}
           renamingId={renamingId} setRenamingId={setRenamingId}
           draftName={draftName} setDraftName={setDraftName}
-          onAdd={onAdd} onRename={onRename} onArchive={onArchive} onMove={onMove} busy={busy}
+          onAdd={onAdd} onRename={onRename} onArchive={onArchive} onMove={onMove} onRestore={onRestore} busy={busy}
         />
       ))}
     </div>

@@ -124,7 +124,7 @@ export default function ItemsPage() {
   const loadData = useCallback(async () => {
     const c = sb();
     const [{ data: rows }, { data: stock }, { data: cats }] = await Promise.all([
-      c.from("items").select("*").eq("archived", false).order("item_code"),
+      c.from("items").select("*").order("item_code"),
       c.from("godown_stock").select("*"),
       c.from("categories").select("*"),
     ]);
@@ -180,6 +180,9 @@ export default function ItemsPage() {
 
   // ─── derived: filtered items ────────────────────────────────────────────
   const filtered = useMemo(() => items.filter(i => {
+    // Archived items only appear under the "Archived" status filter.
+    if (status === "archived") { if (!i.archived) return false; }
+    else if (i.archived) return false;
     if (brand && i.brand !== brand) return false;
     if (cat && i.category !== cat) return false;
     const total = i.totalA + i.totalB;
@@ -242,7 +245,7 @@ export default function ItemsPage() {
         <div className="min-w-0">
           <h1 className="text-xl sm:text-2xl font-semibold tracking-tight">Items</h1>
           <p className="text-sm text-zinc-500 mt-1">
-            {loaded ? `${items.length} products in catalogue` : "Loading…"}
+            {loaded ? `${items.filter(i => !i.archived).length} products in catalogue` : "Loading…"}
           </p>
         </div>
         {isAdmin && (
@@ -286,6 +289,7 @@ export default function ItemsPage() {
             <option value="stock">In stock</option>
             <option value="out">Out of stock</option>
             <option value="low">Low (≤2)</option>
+            <option value="archived">Archived</option>
           </select>
 
           <select value={depth} onChange={(e) => setDepth(Number(e.target.value) as Depth)}
@@ -352,6 +356,7 @@ export default function ItemsPage() {
             <option value="stock">In stock</option>
             <option value="out">Out of stock</option>
             <option value="low">Low (≤2)</option>
+            <option value="archived">Archived</option>
           </select>
         </SheetField>
         <SheetField label="Grouping">
