@@ -11,7 +11,7 @@ export default function NotFound() {
         <p className="text-sm text-zinc-500 mb-6">
           We couldn&apos;t find what you were looking for. It may be a page that hasn&apos;t been built yet.
         </p>
-        <Link href="/" className="inline-flex items-center gap-2 bg-cyan-500 hover:bg-cyan-400 text-zinc-900 px-4 py-2 rounded-md text-sm font-medium transition-colors">
+        <Link href="/" className="inline-flex items-center gap-2 bg-cyan-500 hover:bg-cyan-400 text-white px-4 py-2 rounded-md text-sm font-medium transition-colors">
           <Home className="w-4 h-4" />
           Back to Dashboard
         </Link>

@@ -325,7 +325,7 @@ export default function SalesRegisterPage() {
           type="button"
           onClick={exportCsv}
           disabled={visibleRows.length === 0 || !loaded}
-          className="bg-cyan-500 hover:bg-cyan-400 disabled:opacity-40 disabled:cursor-not-allowed text-zinc-900 px-3 py-1.5 rounded-md text-xs font-medium flex items-center gap-1.5"
+          className="bg-cyan-500 hover:bg-cyan-400 disabled:opacity-40 disabled:cursor-not-allowed text-white px-3 py-1.5 rounded-md text-xs font-medium flex items-center gap-1.5"
         >
           <Download className="w-3.5 h-3.5" />
           Export CSV

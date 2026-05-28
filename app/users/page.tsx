@@ -163,7 +163,7 @@ export default function UsersPage() {
                         type="button"
                         onClick={() => approve(u)}
                         disabled={busy?.id === u.id}
-                        className="bg-emerald-500 hover:bg-emerald-400 disabled:opacity-40 text-zinc-900 px-3 py-1.5 rounded-md text-xs font-medium inline-flex items-center gap-1.5"
+                        className="bg-emerald-500 hover:bg-emerald-400 disabled:opacity-40 text-white px-3 py-1.5 rounded-md text-xs font-medium inline-flex items-center gap-1.5"
                       >
                         {busy?.id === u.id && busy.action === "approve"
                           ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
@@ -188,7 +188,7 @@ export default function UsersPage() {
                   type="button"
                   onClick={() => approve(u)}
                   disabled={busy?.id === u.id}
-                  className="w-full bg-emerald-500 hover:bg-emerald-400 disabled:opacity-40 text-zinc-900 px-3 py-2 rounded-md text-xs font-medium inline-flex items-center justify-center gap-1.5"
+                  className="w-full bg-emerald-500 hover:bg-emerald-400 disabled:opacity-40 text-white px-3 py-2 rounded-md text-xs font-medium inline-flex items-center justify-center gap-1.5"
                 >
                   {busy?.id === u.id && busy.action === "approve"
                     ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
@@ -271,7 +271,7 @@ export default function UsersPage() {
                           type="button"
                           onClick={() => reactivate(u)}
                           disabled={busy?.id === u.id || protectedRow}
-                          className="bg-cyan-500 hover:bg-cyan-400 disabled:opacity-40 disabled:cursor-not-allowed text-zinc-900 px-3 py-1.5 rounded-md text-xs font-medium inline-flex items-center gap-1.5"
+                          className="bg-cyan-500 hover:bg-cyan-400 disabled:opacity-40 disabled:cursor-not-allowed text-white px-3 py-1.5 rounded-md text-xs font-medium inline-flex items-center gap-1.5"
                         >
                           {busy?.id === u.id && busy.action === "reactivate"
                             ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
@@ -300,7 +300,7 @@ export default function UsersPage() {
                     type="button"
                     onClick={() => reactivate(u)}
                     disabled={busy?.id === u.id || protectedRow}
-                    className="w-full bg-cyan-500 hover:bg-cyan-400 disabled:opacity-40 disabled:cursor-not-allowed text-zinc-900 px-3 py-2 rounded-md text-xs font-medium inline-flex items-center justify-center gap-1.5"
+                    className="w-full bg-cyan-500 hover:bg-cyan-400 disabled:opacity-40 disabled:cursor-not-allowed text-white px-3 py-2 rounded-md text-xs font-medium inline-flex items-center justify-center gap-1.5"
                   >
                     {busy?.id === u.id && busy.action === "reactivate"
                       ? <Loader2 className="w-3.5 h-3.5 animate-spin" />

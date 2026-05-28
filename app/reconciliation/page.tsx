@@ -1039,7 +1039,7 @@ function Toolbar({
             className={cn(
               "inline-flex items-center gap-2 rounded-md px-4 py-1.5 text-sm font-medium border transition-colors",
               canCommit
-                ? "bg-cyan-500 hover:bg-cyan-400 text-zinc-900 border-cyan-500"
+                ? "bg-cyan-500 hover:bg-cyan-400 text-white border-cyan-500"
                 : "bg-zinc-200 dark:bg-zinc-800 text-zinc-500 border-zinc-200 dark:border-zinc-800 cursor-not-allowed"
             )}
           >

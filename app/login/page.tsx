@@ -117,7 +117,7 @@ export default function LoginPage() {
       <div className="w-full max-w-sm bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-xl p-8 shadow-lg shadow-zinc-200/30 dark:shadow-black/40">
         <div className="flex items-center gap-3 mb-6">
           <div className="w-9 h-9 bg-cyan-500 rounded-lg flex items-center justify-center">
-            <Package className="w-5 h-5 text-zinc-900" strokeWidth={2.5} />
+            <Package className="w-5 h-5 text-white" strokeWidth={2.5} />
           </div>
           <div>
             <h1 className="font-semibold">Stock Manager</h1>
@@ -186,7 +186,7 @@ export default function LoginPage() {
 
           <button
             type="submit" disabled={busy}
-            className="w-full bg-cyan-500 hover:bg-cyan-400 text-zinc-900 font-medium rounded-md py-2 text-sm disabled:opacity-50 transition-colors flex items-center justify-center gap-1.5"
+            className="w-full bg-cyan-500 hover:bg-cyan-400 text-white font-medium rounded-md py-2 text-sm disabled:opacity-50 transition-colors flex items-center justify-center gap-1.5"
           >
             {busy && <Loader2 className="w-4 h-4 animate-spin" />}
             {busy ? "Please wait…" : mode === "signin" ? "Sign in" : "Create account"}

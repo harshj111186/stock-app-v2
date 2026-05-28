@@ -220,7 +220,7 @@ export default function ItemsPage() {
             {loaded ? `${items.length} products in catalogue` : "Loading…"}
           </p>
         </div>
-        <button className="bg-cyan-500 hover:bg-cyan-400 text-zinc-900 px-3 py-1.5 rounded-md text-sm font-medium flex items-center gap-1.5 flex-shrink-0">
+        <button className="bg-cyan-500 hover:bg-cyan-400 text-white px-3 py-1.5 rounded-md text-sm font-medium flex items-center gap-1.5 flex-shrink-0">
           <Plus className="w-4 h-4" /> <span className="hidden sm:inline">New item</span><span className="sm:hidden">New</span>
         </button>
       </div>
@@ -977,7 +977,7 @@ function EditStockModal({
               type="button"
               onClick={save}
               disabled={saving || nothingChanged}
-              className="bg-cyan-500 hover:bg-cyan-400 disabled:opacity-40 disabled:cursor-not-allowed text-zinc-900 px-3.5 py-2 rounded-md text-sm font-medium flex items-center gap-1.5"
+              className="bg-cyan-500 hover:bg-cyan-400 disabled:opacity-40 disabled:cursor-not-allowed text-white px-3.5 py-2 rounded-md text-sm font-medium flex items-center gap-1.5"
             >
               {saving ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Save className="w-3.5 h-3.5" />}
               {saving ? "Saving…" : "Save override"}

@@ -59,16 +59,16 @@ export default function MorePage() {
           <button
             type="button"
             onClick={() => { void install(); }}
-            className="w-full bg-cyan-500 hover:bg-cyan-400 active:bg-cyan-600 text-zinc-900 rounded-2xl px-4 py-4 flex items-center gap-4 shadow-sm"
+            className="w-full bg-cyan-500 hover:bg-cyan-400 active:bg-cyan-600 text-white rounded-2xl px-4 py-4 flex items-center gap-4 shadow-sm"
           >
-            <span className="w-10 h-10 bg-zinc-900/10 rounded-xl flex items-center justify-center flex-shrink-0">
+            <span className="w-10 h-10 bg-white/15 rounded-xl flex items-center justify-center flex-shrink-0">
               <Download className="w-5 h-5" />
             </span>
             <span className="flex-1 text-left">
               <span className="block text-sm font-semibold">Install Stock Manager</span>
-              <span className="block text-xs text-zinc-900/70 mt-0.5">Faster launch, opens in its own window</span>
+              <span className="block text-xs text-white/75 mt-0.5">Faster launch, opens in its own window</span>
             </span>
-            <ChevronRight className="w-4 h-4 text-zinc-900/60 flex-shrink-0" />
+            <ChevronRight className="w-4 h-4 text-white/70 flex-shrink-0" />
           </button>
         )}
 

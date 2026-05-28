@@ -40,7 +40,7 @@ export function PendingApproval({
           <button
             type="button"
             onClick={onRefresh}
-            className="bg-cyan-500 hover:bg-cyan-400 text-zinc-900 px-4 py-2 rounded-md text-sm font-medium inline-flex items-center justify-center gap-2"
+            className="bg-cyan-500 hover:bg-cyan-400 text-white px-4 py-2 rounded-md text-sm font-medium inline-flex items-center justify-center gap-2"
           >
             <RefreshCw className="w-4 h-4" />
             Check again

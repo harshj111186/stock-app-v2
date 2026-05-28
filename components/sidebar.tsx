@@ -45,7 +45,7 @@ export function Sidebar() {
       {/* Brand */}
       <div className="px-5 py-4 border-b border-zinc-200 dark:border-zinc-800 flex items-center gap-2.5">
         <div className="w-7 h-7 bg-cyan-500 rounded-md flex items-center justify-center">
-          <Package className="w-4 h-4 text-zinc-900" strokeWidth={2.5} />
+          <Package className="w-4 h-4 text-white" strokeWidth={2.5} />
         </div>
         <div>
           <div className="font-semibold text-sm">Stock Manager</div>

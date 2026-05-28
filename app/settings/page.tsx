@@ -141,7 +141,7 @@ function ChangePinCard() {
         <button
           type="submit"
           disabled={busy || !oldPin || !newPin || !confirmPin}
-          className="bg-cyan-500 hover:bg-cyan-400 disabled:opacity-40 disabled:cursor-not-allowed text-zinc-900 px-4 py-2 rounded-md text-sm font-medium inline-flex items-center gap-2"
+          className="bg-cyan-500 hover:bg-cyan-400 disabled:opacity-40 disabled:cursor-not-allowed text-white px-4 py-2 rounded-md text-sm font-medium inline-flex items-center gap-2"
         >
           {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <KeyRound className="w-4 h-4" />}
           {busy ? "Updating…" : "Update PIN"}
@@ -222,7 +222,7 @@ function InstallCard() {
             type="button"
             onClick={onClick}
             disabled={busy}
-            className="bg-cyan-500 hover:bg-cyan-400 disabled:opacity-40 text-zinc-900 px-4 py-2 rounded-md text-sm font-medium inline-flex items-center gap-2"
+            className="bg-cyan-500 hover:bg-cyan-400 disabled:opacity-40 text-white px-4 py-2 rounded-md text-sm font-medium inline-flex items-center gap-2"
           >
             {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />}
             {busy ? "Working…" : "Install app"}

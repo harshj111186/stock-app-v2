@@ -754,7 +754,7 @@ export default function TransactionsPage() {
               type="button"
               disabled={processing || !canWrite}
               onClick={addToQueue}
-              className="bg-cyan-500 hover:bg-cyan-400 disabled:opacity-40 disabled:cursor-not-allowed text-zinc-900 px-4 py-2 rounded-md text-sm font-medium flex items-center gap-2"
+              className="bg-cyan-500 hover:bg-cyan-400 disabled:opacity-40 disabled:cursor-not-allowed text-white px-4 py-2 rounded-md text-sm font-medium flex items-center gap-2"
             >
               <Plus className="w-4 h-4" />
               Add {f.action} to queue
@@ -787,7 +787,7 @@ export default function TransactionsPage() {
               type="button"
               onClick={processQueue}
               disabled={processing || !preflight.ok || !canWrite}
-              className="bg-emerald-500 hover:bg-emerald-400 disabled:opacity-40 disabled:cursor-not-allowed text-zinc-900 px-4 py-2 rounded-md text-sm font-medium flex items-center gap-2"
+              className="bg-emerald-500 hover:bg-emerald-400 disabled:opacity-40 disabled:cursor-not-allowed text-white px-4 py-2 rounded-md text-sm font-medium flex items-center gap-2"
               title={!preflight.ok ? "Fix pre-flight error first" : "Process all queued entries"}
             >
               {processing
@@ -1411,7 +1411,7 @@ function CaseSizeModal({
               type="button"
               onClick={() => onSave(n)}
               disabled={!valid || saving}
-              className="bg-cyan-500 hover:bg-cyan-400 disabled:opacity-40 disabled:cursor-not-allowed text-zinc-900 px-4 py-1.5 rounded-md text-xs font-medium flex items-center gap-2"
+              className="bg-cyan-500 hover:bg-cyan-400 disabled:opacity-40 disabled:cursor-not-allowed text-white px-4 py-1.5 rounded-md text-xs font-medium flex items-center gap-2"
             >
               {saving ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <CheckCircle2 className="w-3.5 h-3.5" />}
               Set case size &amp; add
