@@ -271,12 +271,14 @@ Shipped in four pushes to `main` (each auto-deploys). The audit found the app wa
 - **Mobile Filters sheet** on Items + Godown A/B (`components/filter-sheet.tsx`): phones show search + a "Filters" button (active-count badge) → slide-up bottom sheet; the desktop toolbar is unchanged (`hidden md:flex`).
 - **Category PATH grouping**: Items + Godown resolve each item's category to its full path via `pathById` (with a flat list it's identical; it nests visibly as the tree grows). Godown also now filters `archived = false`.
 
-#### Follow-ups (still open)
-- **Reconciliation mobile toolbar** — same Filters-sheet treatment (its toolbar is more bespoke: My-count/Reviewer mode toggle + commit button).
-- **Nested expand/collapse grouping** by each path segment (today grouping buckets by the full-path string as a single level — informative but not expandable per level).
-- **Lazy-load the ABC report chart** (~113 kB on `/reports/abc`; the dashboard chart is already lazy).
-- **Restore-archived UI** for items + categories (the RPCs already support un-archiving; no surface to reach archived rows yet).
-- Per-parent unique category names (only if duplicate child names under different parents are ever needed — a small constraint swap).
+#### Follow-ups — all four shipped 2026-05-29 (later still)
+- ✅ **Reconciliation mobile Filters sheet** (commit `58bfa7c`) — brand/category/show-only-changed move into the sheet on phones; mode toggle + commit stay put.
+- ✅ **ABC chart lazy-loaded** (commit `58bfa7c`) — extracted to `components/abc-chart.tsx` via `next/dynamic`; `/reports/abc` first-load 302 kB → 197 kB.
+- ✅ **Restore-archived UI** (commit `b5a15b8`) — Items get an "Archived" filter + Restore in the edit form; the category manager gets a "Show archived" toggle + per-node Restore.
+- ✅ **Nested expand/collapse grouping by category segment** (commit `e36548a`) — `buildTree` (Items + Godown) now groups by each path segment (Brand → Cat → Sub-cat → … → items), every level collapsible; a node can hold both sub-groups and items. Identical to before with a flat list; nests as the tree grows. Verified live.
+
+#### Still open (only if ever needed)
+- Per-parent unique category names (small constraint swap, for duplicate child names under different parents).
 
 #### Verification caveats for future sessions (this machine)
 - The project folder is **Google-Drive-synced**, so the LOCAL `next dev` recompiles in a loop (Drive touches watched files) — this stalls the preview screenshot tool and resets page state. Verify on the **deployed** site instead; it's unaffected.
