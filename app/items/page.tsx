@@ -95,6 +95,16 @@ export default function ItemsPage() {
       if (e) setExpanded(new Set(JSON.parse(e)));
     } catch { /* ignore */ }
   }, []);
+  // Deep-link filters from the dashboard (e.g. /items?status=out, ?status=low).
+  useEffect(() => {
+    try {
+      const p = new URLSearchParams(window.location.search);
+      const s = p.get("status");
+      if (s && ["stock", "out", "low"].includes(s)) setStatus(s);
+      const query = p.get("q");
+      if (query) setQ(query);
+    } catch { /* ignore */ }
+  }, []);
   useEffect(() => { try { localStorage.setItem("items.view", view); } catch {} }, [view]);
   useEffect(() => { try { localStorage.setItem("items.depth", String(depth)); } catch {} }, [depth]);
   useEffect(() => { try { localStorage.setItem("items.expanded", JSON.stringify([...expanded])); } catch {} }, [expanded]);

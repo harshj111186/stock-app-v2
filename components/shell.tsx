@@ -3,6 +3,7 @@ import type { ReactNode } from "react";
 import { Sidebar } from "./sidebar";
 import { Topbar } from "./topbar";
 import { BottomTabBar } from "./bottom-tab-bar";
+import { CommandPalette } from "./command-palette";
 import { useAuth } from "@/app/providers";
 
 // Mobile uses a bottom tab bar (5 primary routes; rest behind /more).
@@ -30,6 +31,7 @@ export function Shell({ title, children }: { title: string; children: ReactNode 
         </div>
       </main>
       <BottomTabBar />
+      <CommandPalette />
     </div>
   );
 }

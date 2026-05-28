@@ -1,5 +1,5 @@
 "use client";
-import { Search, Sun, Moon, Bell } from "lucide-react";
+import { Search, Sun, Moon } from "lucide-react";
 import { useEffect, useState } from "react";
 
 export function Topbar({ title }: { title: string }) {
@@ -28,8 +28,13 @@ export function Topbar({ title }: { title: string }) {
 
       <div className="flex-1" />
 
-      {/* Search field — desktop only (no global search wired yet) */}
-      <button className="hidden md:flex items-center gap-2 bg-zinc-100 dark:bg-zinc-800/60 hover:bg-zinc-200 dark:hover:bg-zinc-800 border border-zinc-200 dark:border-zinc-700/50 px-3 py-1.5 rounded-md text-xs text-zinc-500">
+      {/* Global command palette launcher — desktop. Opens the ⌘K palette. */}
+      <button
+        type="button"
+        onClick={() => window.dispatchEvent(new Event("open-command-palette"))}
+        className="hidden md:flex items-center gap-2 bg-zinc-100 dark:bg-zinc-800/60 hover:bg-zinc-200 dark:hover:bg-zinc-800 border border-zinc-200 dark:border-zinc-700/50 px-3 py-1.5 rounded-md text-xs text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-300 transition-colors"
+        aria-label="Open command palette"
+      >
         <Search className="w-3.5 h-3.5" />
         Search…
         <kbd className="ml-6 bg-zinc-200 dark:bg-zinc-700/50 px-1.5 py-0.5 rounded text-[10px] font-mono">⌘K</kbd>
@@ -41,13 +46,6 @@ export function Topbar({ title }: { title: string }) {
         aria-label="Toggle theme"
       >
         {isDark ? <Sun className="w-4 h-4 text-zinc-400" /> : <Moon className="w-4 h-4 text-zinc-600" />}
-      </button>
-
-      <button
-        className="hidden md:flex p-2 hover:bg-zinc-100 dark:hover:bg-zinc-800 rounded-md relative"
-        aria-label="Notifications"
-      >
-        <Bell className="w-4 h-4 text-zinc-400" />
       </button>
     </header>
   );
