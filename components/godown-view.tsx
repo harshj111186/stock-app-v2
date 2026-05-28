@@ -25,44 +25,55 @@ type ItemHere = Item & {
 };
 
 // ─── grouping helpers ────────────────────────────────────────────────────
-const groupVal = (i: ItemHere, level: number): string => {
-  if (level === 0) return i.brand || "(No brand)";
-  if (level === 1) return i.category || "(No category)";
-  if (level === 2) return i.subcategory || "(No subcategory)";
-  return "";
-};
 const SEP = "›";
+// Group path per item: Brand, then EACH category-tree segment (so a nested
+// category becomes multiple expandable levels), then Subcategory.
+const groupPath = (i: ItemHere, depth: number): string[] => {
+  const out: string[] = [];
+  if (depth >= 1) out.push(i.brand || "(No brand)");
+  if (depth >= 2) out.push(...(i.category ? i.category.split(" › ") : ["(No category)"]));
+  if (depth >= 3) out.push(i.subcategory || "(No subcategory)");
+  return out;
+};
 
 type Node = {
   key: string;
   label: string;
   count: number;
-  items?: ItemHere[];   // leaf
-  children?: Node[];    // branch
+  items?: ItemHere[];   // items that live directly at this node
+  children?: Node[];    // sub-groups
 };
 
+// A node can carry BOTH children and items; the renderers handle each. With a
+// flat category list this matches the old Brand → Category → Subcategory shape.
 function buildTree(items: ItemHere[], depth: number): Node[] {
   if (depth === 0) {
     return [{ key: "__all", label: "All items", count: items.length, items }];
   }
-  const recurse = (subset: ItemHere[], level: number, parentKey: string): Node[] => {
+  const recurse = (subset: ItemHere[], level: number, parentKey: string): { nodes: Node[]; direct: ItemHere[] } => {
+    const direct: ItemHere[] = [];
     const buckets = new Map<string, ItemHere[]>();
     for (const i of subset) {
-      const v = groupVal(i, level);
+      const path = groupPath(i, depth);
+      if (level >= path.length) { direct.push(i); continue; }
+      const v = path[level];
       if (!buckets.has(v)) buckets.set(v, []);
       buckets.get(v)!.push(i);
     }
-    return [...buckets.entries()]
+    const nodes: Node[] = [...buckets.entries()]
       .sort(([a], [b]) => a.localeCompare(b))
       .map(([label, group]) => {
         const key = parentKey ? `${parentKey}${SEP}${label}` : label;
-        if (level + 1 < depth) {
-          return { key, label, count: group.length, children: recurse(group, level + 1, key) };
-        }
-        return { key, label, count: group.length, items: group };
+        const sub = recurse(group, level + 1, key);
+        return {
+          key, label, count: group.length,
+          children: sub.nodes.length ? sub.nodes : undefined,
+          items: sub.direct.length ? sub.direct : undefined,
+        };
       });
+    return { nodes, direct };
   };
-  return recurse(items, 0, "");
+  return recurse(items, 0, "").nodes;
 }
 
 // ─── component ───────────────────────────────────────────────────────────

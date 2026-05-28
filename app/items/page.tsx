@@ -23,45 +23,59 @@ type View = "grid" | "table";
 type Depth = 0 | 1 | 2 | 3;
 
 // ─── group helpers ────────────────────────────────────────────────────────
-// Level 0 = Brand, level 1 = Category, level 2 = Subcategory.
-const groupVal = (i: Combined, level: number): string => {
-  if (level === 0) return i.brand || "(No brand)";
-  if (level === 1) return i.category || "(No category)";
-  if (level === 2) return i.subcategory || "(No subcategory)";
-  return "";
-};
+// Group path per item: Brand, then EACH category-tree segment (so a nested
+// category like "Fans › Ceiling › Premium" becomes three expandable levels),
+// then Subcategory. `depth` controls how far down we group.
 const SEP = "›";
+const groupPath = (i: Combined, depth: number): string[] => {
+  const out: string[] = [];
+  if (depth >= 1) out.push(i.brand || "(No brand)");
+  if (depth >= 2) out.push(...(i.category ? i.category.split(" › ") : ["(No category)"]));
+  if (depth >= 3) out.push(i.subcategory || "(No subcategory)");
+  return out;
+};
 
 type Node = {
   key: string;
   label: string;
   count: number;
-  items?: Combined[];   // leaf
-  children?: Node[];    // branch
+  items?: Combined[];   // items that live directly at this node
+  children?: Node[];    // sub-groups
 };
 
+// Builds a tree from each item's variable-length group path. A node can carry
+// BOTH children (deeper groups) AND items (things that stop at this level) —
+// the grid/table/mobile renderers already handle each independently. With a
+// FLAT category list this reproduces exactly the old Brand → Category →
+// Subcategory shape; it only nests further once the category tree grows.
 function buildTree(items: Combined[], depth: number): Node[] {
   if (depth === 0) {
     return [{ key: "__all", label: "All items", count: items.length, items }];
   }
-  const recurse = (subset: Combined[], level: number, parentKey: string): Node[] => {
+  const recurse = (subset: Combined[], level: number, parentKey: string): { nodes: Node[]; direct: Combined[] } => {
+    const direct: Combined[] = [];
     const buckets = new Map<string, Combined[]>();
     for (const i of subset) {
-      const v = groupVal(i, level);
+      const path = groupPath(i, depth);
+      if (level >= path.length) { direct.push(i); continue; }
+      const v = path[level];
       if (!buckets.has(v)) buckets.set(v, []);
       buckets.get(v)!.push(i);
     }
-    return [...buckets.entries()]
+    const nodes: Node[] = [...buckets.entries()]
       .sort(([a], [b]) => a.localeCompare(b))
       .map(([label, group]) => {
         const key = parentKey ? `${parentKey}${SEP}${label}` : label;
-        if (level + 1 < depth) {
-          return { key, label, count: group.length, children: recurse(group, level + 1, key) };
-        }
-        return { key, label, count: group.length, items: group };
+        const sub = recurse(group, level + 1, key);
+        return {
+          key, label, count: group.length,
+          children: sub.nodes.length ? sub.nodes : undefined,
+          items: sub.direct.length ? sub.direct : undefined,
+        };
       });
+    return { nodes, direct };
   };
-  return recurse(items, 0, "");
+  return recurse(items, 0, "").nodes;
 }
 
 // ─── component ────────────────────────────────────────────────────────────
