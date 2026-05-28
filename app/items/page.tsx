@@ -9,6 +9,7 @@ import { Shell } from "@/components/shell";
 import { useAuth } from "@/app/providers";
 import { sb, type Item, type Stock } from "@/lib/supabase";
 import { colourCss, fmtN } from "@/lib/utils";
+import { ItemFormModal } from "@/components/item-form-modal";
 
 // Combined now also carries raw cases/loose so the override modal can edit them directly.
 type Combined = Item & {
@@ -83,6 +84,10 @@ export default function ItemsPage() {
 
   // manual override modal
   const [editingItem, setEditingItem] = useState<Combined | null>(null);
+  // create / edit-details / archive (admin)
+  const [categories, setCategories] = useState<{ id: string; name: string }[]>([]);
+  const [creating, setCreating] = useState(false);
+  const [editingDetails, setEditingDetails] = useState<Combined | null>(null);
 
   // ─── load persisted UI state once ───────────────────────────────────────
   useEffect(() => {
@@ -95,7 +100,8 @@ export default function ItemsPage() {
       if (e) setExpanded(new Set(JSON.parse(e)));
     } catch { /* ignore */ }
   }, []);
-  // Deep-link filters from the dashboard (e.g. /items?status=out, ?status=low).
+  // Deep-link filters + actions from the dashboard / command palette
+  // (e.g. /items?status=out, ?status=low, ?new=1).
   useEffect(() => {
     try {
       const p = new URLSearchParams(window.location.search);
@@ -103,8 +109,9 @@ export default function ItemsPage() {
       if (s && ["stock", "out", "low"].includes(s)) setStatus(s);
       const query = p.get("q");
       if (query) setQ(query);
+      if (p.get("new") === "1" && isAdmin) setCreating(true);
     } catch { /* ignore */ }
-  }, []);
+  }, [isAdmin]);
   useEffect(() => { try { localStorage.setItem("items.view", view); } catch {} }, [view]);
   useEffect(() => { try { localStorage.setItem("items.depth", String(depth)); } catch {} }, [depth]);
   useEffect(() => { try { localStorage.setItem("items.expanded", JSON.stringify([...expanded])); } catch {} }, [expanded]);
@@ -114,13 +121,14 @@ export default function ItemsPage() {
   const loadData = useCallback(async () => {
     const c = sb();
     const [{ data: rows }, { data: stock }, { data: cats }] = await Promise.all([
-      c.from("items").select("*").order("item_code"),
+      c.from("items").select("*").eq("archived", false).order("item_code"),
       c.from("godown_stock").select("*"),
       c.from("categories").select("id, name"),
     ]);
     const catMap = new Map<string, string>(
       (cats || []).map((x: any) => [x.id as string, x.name as string])
     );
+    setCategories(((cats || []) as any[]).map(x => ({ id: x.id, name: x.name })).sort((a, b) => a.name.localeCompare(b.name)));
     const sMap: Record<string, { A: Stock; B: Stock }> = {};
     (stock || []).forEach((s: any) => {
       sMap[s.item_id] = sMap[s.item_id] || {
@@ -230,9 +238,11 @@ export default function ItemsPage() {
             {loaded ? `${items.length} products in catalogue` : "Loading…"}
           </p>
         </div>
-        <button className="bg-cyan-500 hover:bg-cyan-400 text-white px-3 py-1.5 rounded-md text-sm font-medium flex items-center gap-1.5 flex-shrink-0">
-          <Plus className="w-4 h-4" /> <span className="hidden sm:inline">New item</span><span className="sm:hidden">New</span>
-        </button>
+        {isAdmin && (
+          <button onClick={() => setCreating(true)} className="bg-cyan-500 hover:bg-cyan-400 text-white px-3 py-1.5 rounded-md text-sm font-medium flex items-center gap-1.5 flex-shrink-0">
+            <Plus className="w-4 h-4" /> <span className="hidden sm:inline">New item</span><span className="sm:hidden">New</span>
+          </button>
+        )}
       </div>
 
       {/* ─── Toolbar ─────────────────────────────────────────── */}
@@ -323,6 +333,28 @@ export default function ItemsPage() {
           isAdmin={isAdmin}
           onClose={() => setEditingItem(null)}
           onSaved={async () => { await loadData(); setEditingItem(null); }}
+          onEditDetails={isAdmin ? () => { const it = editingItem; setEditingItem(null); setEditingDetails(it); } : undefined}
+        />
+      )}
+
+      {/* ─── Create / edit item details (admin) ──────────────── */}
+      {creating && (
+        <ItemFormModal
+          mode="create"
+          categories={categories}
+          brands={brands}
+          onClose={() => setCreating(false)}
+          onSaved={async () => { await loadData(); setCreating(false); }}
+        />
+      )}
+      {editingDetails && (
+        <ItemFormModal
+          mode="edit"
+          item={editingDetails}
+          categories={categories}
+          brands={brands}
+          onClose={() => setEditingDetails(null)}
+          onSaved={async () => { await loadData(); setEditingDetails(null); }}
         />
       )}
     </Shell>
@@ -717,12 +749,13 @@ function Empty() {
 // (which lives on the items table, not godown_stock) is updated separately
 // via a plain UPDATE — admin only, because of items-table RLS.
 function EditStockModal({
-  item, isAdmin, onClose, onSaved,
+  item, isAdmin, onClose, onSaved, onEditDetails,
 }: {
   item: Combined;
   isAdmin: boolean;
   onClose: () => void;
   onSaved: () => void | Promise<void>;
+  onEditDetails?: () => void;
 }) {
   const oldCs = item.case_size || 0;
   const [cs, setCs] = useState(String(oldCs));
@@ -880,14 +913,25 @@ function EditStockModal({
               <span className="text-zinc-400"> · {item.item_code}</span>
             </p>
           </div>
-          <button
-            type="button"
-            onClick={onClose}
-            aria-label="Close"
-            className="text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200 -mr-1.5 p-1"
-          >
-            <X className="w-5 h-5" />
-          </button>
+          <div className="flex items-center gap-1 flex-shrink-0">
+            {onEditDetails && (
+              <button
+                type="button"
+                onClick={onEditDetails}
+                className="text-xs text-cyan-600 dark:text-cyan-400 hover:bg-cyan-500/10 rounded-md px-2 py-1 inline-flex items-center gap-1 whitespace-nowrap"
+              >
+                <Pencil className="w-3.5 h-3.5" /> Edit details
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={onClose}
+              aria-label="Close"
+              className="text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200 p-1"
+            >
+              <X className="w-5 h-5" />
+            </button>
+          </div>
         </div>
 
         {/* Body — scrolls within the modal so header+footer stay anchored */}

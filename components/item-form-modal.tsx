@@ -1,0 +1,216 @@
+"use client";
+import { useState } from "react";
+import { X, Save, Loader2, AlertCircle, Plus, Archive } from "lucide-react";
+import { sb, type Item } from "@/lib/supabase";
+
+// Create / edit an item's catalogue attributes. Stock quantity is NOT handled
+// here — that stays in the dedicated stock-override flow and process_transaction.
+// Writes go through the create_item / update_item RPCs (admin-gated). A new
+// item is global, so it appears in both Godown A and B immediately.
+
+type Cat = { id: string; name: string };
+
+export function ItemFormModal({
+  mode, item, categories, brands, onClose, onSaved,
+}: {
+  mode: "create" | "edit";
+  item?: Item | null;
+  categories: Cat[];
+  brands: string[];
+  onClose: () => void;
+  onSaved: () => void | Promise<void>;
+}) {
+  const [model, setModel] = useState(item?.model ?? "");
+  const [brand, setBrand] = useState(item?.brand ?? "");
+  const [categoryId, setCategoryId] = useState(item?.category_id ?? "");
+  const [subcategory, setSubcategory] = useState(item?.subcategory ?? "");
+  const [size, setSize] = useState(item?.size ?? "");
+  const [colour, setColour] = useState(item?.colour ?? "");
+  const [caseSize, setCaseSize] = useState(String(item?.case_size ?? ""));
+  const [reorderA, setReorderA] = useState(String(item?.reorder_point_a ?? ""));
+  const [reorderB, setReorderB] = useState(String(item?.reorder_point_b ?? ""));
+  const [hsn, setHsn] = useState(item?.hsn_code ?? "");
+  // items.gst_rate is stored as a fraction (0.18); the field shows a percent.
+  const [gstPct, setGstPct] = useState(
+    item?.gst_rate != null ? String(Math.round(item.gst_rate * 100)) : ""
+  );
+  const [itemCode, setItemCode] = useState(item?.item_code ?? "");
+
+  const [saving, setSaving] = useState(false);
+  const [archiving, setArchiving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const onlyDigits = (s: string) => s.replace(/[^\d]/g, "");
+
+  async function archive() {
+    if (!item) return;
+    if (!confirm(`Archive "${item.model}"? It leaves the catalogue but its history is kept. You can restore it later.`)) return;
+    setError(null);
+    setArchiving(true);
+    try {
+      const { error: e } = await sb().rpc("set_item_archived", { p_item_id: item.id, p_archived: true });
+      if (e) throw e;
+      await onSaved();
+    } catch (e: any) {
+      setError(e?.message || "Failed to archive item.");
+    } finally {
+      setArchiving(false);
+    }
+  }
+
+  async function save() {
+    if (!model.trim()) { setError("Model is required."); return; }
+    setError(null);
+    setSaving(true);
+    try {
+      const c = sb();
+      const gstFraction = gstPct.trim() === "" ? null : Math.max(0, Number(gstPct)) / 100;
+      const common = {
+        p_model: model.trim(),
+        p_brand: brand.trim() || null,
+        p_category_id: categoryId || null,
+        p_subcategory: subcategory.trim() || null,
+        p_size: size.trim() || null,
+        p_colour: colour.trim() || null,
+        p_case_size: Number(caseSize || 0) | 0,
+        p_hsn_code: hsn.trim() || null,
+        p_gst_rate: gstFraction,
+        p_reorder_point_a: Number(reorderA || 0) | 0,
+        p_reorder_point_b: Number(reorderB || 0) | 0,
+      };
+      if (mode === "create") {
+        const { error: e } = await c.rpc("create_item", { ...common, p_item_code: itemCode.trim() || null });
+        if (e) throw e;
+      } else {
+        const { error: e } = await c.rpc("update_item", { p_item_id: item!.id, ...common });
+        if (e) throw e;
+      }
+      await onSaved();
+    } catch (e: any) {
+      setError(e?.message || "Failed to save item.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div
+      className="fixed inset-0 z-50 bg-black/50 dark:bg-black/70 flex items-end sm:items-center justify-center p-0 sm:p-4"
+      role="dialog" aria-modal="true" aria-label={mode === "create" ? "Add item" : "Edit item"}
+      onClick={onClose}
+    >
+      <div
+        className="bg-white dark:bg-zinc-900 rounded-t-2xl sm:rounded-2xl w-full max-w-2xl shadow-lg border border-zinc-200 dark:border-zinc-800 flex flex-col max-h-[95vh] sm:max-h-[90vh] animate-slide-up"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="px-5 py-4 border-b border-zinc-200 dark:border-zinc-800 flex items-start justify-between gap-4 flex-shrink-0">
+          <div className="min-w-0">
+            <h2 className="text-base font-semibold">{mode === "create" ? "Add a new item" : "Edit item details"}</h2>
+            <p className="text-xs text-zinc-500 mt-0.5">
+              {mode === "create"
+                ? "Creates the item for both godowns. Add stock afterwards via Transactions."
+                : "Catalogue details only — stock quantity is changed elsewhere."}
+            </p>
+          </div>
+          <button type="button" onClick={onClose} aria-label="Close" className="text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200 -mr-1.5 p-1">
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+
+        <div className="p-5 space-y-4 overflow-y-auto flex-1">
+          <Field label="Model / name" required>
+            <input value={model} onChange={(e) => setModel(e.target.value)} autoFocus
+              placeholder="e.g. Renesa 1200mm" className={inputCls} />
+          </Field>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <Field label="Brand">
+              <input list="brand-list" value={brand} onChange={(e) => setBrand(e.target.value)}
+                placeholder="e.g. Goldmedal" className={inputCls} />
+              <datalist id="brand-list">{brands.map(b => <option key={b} value={b} />)}</datalist>
+            </Field>
+            <Field label="Item code" hint="auto if blank">
+              <input value={itemCode} onChange={(e) => setItemCode(e.target.value)}
+                placeholder="auto" className={inputCls} />
+            </Field>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <Field label="Category">
+              <select value={categoryId} onChange={(e) => setCategoryId(e.target.value)} className={inputCls}>
+                <option value="">— none —</option>
+                {categories.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+              </select>
+            </Field>
+            <Field label="Subcategory">
+              <input value={subcategory} onChange={(e) => setSubcategory(e.target.value)}
+                placeholder="optional" className={inputCls} />
+            </Field>
+          </div>
+
+          <div className="grid grid-cols-2 gap-4">
+            <Field label="Size"><input value={size} onChange={(e) => setSize(e.target.value)} placeholder="e.g. 1200mm" className={inputCls} /></Field>
+            <Field label="Colour"><input value={colour} onChange={(e) => setColour(e.target.value)} placeholder="e.g. Brown" className={inputCls} /></Field>
+          </div>
+
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+            <Field label="Case size" hint="units / carton">
+              <input inputMode="numeric" value={caseSize} onChange={(e) => setCaseSize(onlyDigits(e.target.value))} placeholder="0" className={`${inputCls} tnum`} />
+            </Field>
+            <Field label="GST %">
+              <input inputMode="numeric" value={gstPct} onChange={(e) => setGstPct(onlyDigits(e.target.value))} placeholder="18" className={`${inputCls} tnum`} />
+            </Field>
+            <Field label="Reorder A"><input inputMode="numeric" value={reorderA} onChange={(e) => setReorderA(onlyDigits(e.target.value))} placeholder="0" className={`${inputCls} tnum`} /></Field>
+            <Field label="Reorder B"><input inputMode="numeric" value={reorderB} onChange={(e) => setReorderB(onlyDigits(e.target.value))} placeholder="0" className={`${inputCls} tnum`} /></Field>
+          </div>
+
+          <Field label="HSN code" hint="optional">
+            <input value={hsn} onChange={(e) => setHsn(e.target.value)} placeholder="e.g. 8414" className={`${inputCls} tnum`} />
+          </Field>
+
+          {error && (
+            <div className="text-sm text-rose-600 dark:text-rose-300 bg-rose-500/10 border border-rose-500/30 rounded-md p-2.5 flex items-start gap-2">
+              <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
+              <span className="min-w-0 break-words">{error}</span>
+            </div>
+          )}
+        </div>
+
+        <div
+          className="px-5 py-3 border-t border-zinc-200 dark:border-zinc-800 flex items-center justify-end gap-2 bg-zinc-50 dark:bg-zinc-900/50 flex-shrink-0"
+          style={{ paddingBottom: "calc(0.75rem + env(safe-area-inset-bottom))" }}
+        >
+          {mode === "edit" && (
+            <button type="button" onClick={archive} disabled={archiving || saving}
+              className="mr-auto px-3 py-2 text-sm text-rose-600 dark:text-rose-400 hover:bg-rose-500/10 rounded-md inline-flex items-center gap-1.5 disabled:opacity-40">
+              {archiving ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Archive className="w-3.5 h-3.5" />}
+              Archive
+            </button>
+          )}
+          <button type="button" onClick={onClose} className="px-3 py-2 text-sm text-zinc-600 dark:text-zinc-300 hover:bg-zinc-200 dark:hover:bg-zinc-800 rounded-md">Cancel</button>
+          <button type="button" onClick={save} disabled={saving || !model.trim()}
+            className="bg-cyan-500 hover:bg-cyan-400 disabled:opacity-40 disabled:cursor-not-allowed text-white px-3.5 py-2 rounded-md text-sm font-medium flex items-center gap-1.5">
+            {saving ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : mode === "create" ? <Plus className="w-3.5 h-3.5" /> : <Save className="w-3.5 h-3.5" />}
+            {saving ? "Saving…" : mode === "create" ? "Create item" : "Save changes"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+const inputCls =
+  "w-full bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-cyan-500";
+
+function Field({ label, required, hint, children }: { label: string; required?: boolean; hint?: string; children: React.ReactNode }) {
+  return (
+    <div>
+      <div className="flex items-center gap-1.5 mb-1.5">
+        <span className="text-[11px] uppercase tracking-wider text-zinc-500 font-medium">{label}</span>
+        {required && <span className="text-rose-500 text-[11px]">*</span>}
+        {hint && <span className="text-[10px] text-zinc-400 normal-case tracking-normal">· {hint}</span>}
+      </div>
+      {children}
+    </div>
+  );
+}
