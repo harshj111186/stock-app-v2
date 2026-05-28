@@ -230,6 +230,51 @@ If you must touch one of these files: **read first, edit surgically, never repla
 
 ## 11. Changelog (latest first — add new entries at the top)
 
+### 2026-05-29 — Bold premium reskin + dashboard + item CRUD + category tree
+
+**User ask:** Deep-dive the whole app; remove unwanted/dead buttons; make it a premium, lightweight, mobile-AND-web app; add an item page where you can add/remove/edit items (applying across both godowns); make categories nestable to unlimited depth (Company › Category › Sub › …) so items save category-wise; better dashboard. Chosen options: full nested category tree, push-to-live as I go, bolder reskin.
+
+Shipped in four pushes to `main` (each auto-deploys). The audit found the app was already far more complete than the brief implied (reconciliation, transactions, reports, users/PIN auth, mobile cards, PWA all solid) — so this focused on the genuine gaps.
+
+**1. Bold premium reskin (`fb9b11a`).** Delivered by REMAPPING Tailwind scales in `tailwind.config.ts` so the whole app moved without rewriting classNames:
+- `zinc` → refined cool-slate neutrals, deep OLED-leaning dark base.
+- `cyan` → bold violet accent (the new brand colour). Primary buttons are now violet with WHITE labels — every accent button across the app was switched from `text-zinc-900` to `text-white` (a sweep; the old dark-on-cyan no longer had contrast on violet).
+- Semantic emerald/amber/rose LEFT as Tailwind defaults (stock status) so they never collide with the accent.
+- `globals.css`: new CSS-var tokens (mirrors the remap), Space Grotesk display font for headings + KPI numbers (Inter stays for UI), one accessible `:focus-visible` ring, `prefers-reduced-motion` handling. `layout.tsx`: Space Grotesk added to the Google Fonts link; theme-color synced.
+- Premium radius/shadow/glow scale + fade-in/slide-up keyframes in the config.
+
+**2. Premium dashboard + ⌘K palette + dead-UI removal (`7750b08`).**
+- Topbar: removed the dead Bell. The Search button + **⌘K** now open a real **command palette** (`components/command-palette.tsx`, mounted in Shell) — jump to any page + quick actions, keyboard-first, role-gated.
+- Dashboard (`app/page.tsx`) rebuilt: violet "stock value" hero KPI, every KPI is a Link, lazy-loaded 14-day sales-trend area chart (`components/dashboard-chart.tsx`, `next/dynamic` ssr:false — recharts stays OFF the dashboard's initial bundle), low-stock watchlist, navigating "attention" rows.
+- **Fixed two long-standing wrong counts:** out-of-stock now only counts items WE CARRY (have a `godown_stock` row) that hit zero — not the never-stocked SKUs it used to double-count (was showing 105/166). Dead stock is now real (units on hand + no active, reversal-aware sale in 90 days), no longer a clone of out-of-stock. Top movers is a real last-30-days ranking.
+- Items page reads `?status=out|low&q=` so dashboard cards deep-link into a pre-filtered catalogue.
+
+**3. Add / Edit / Archive items (`c5b6212`).** The "New item" button was DEAD (no handler) and there was no way to edit item attributes or remove an item.
+- `db/2026-05-29-item-crud-rpcs.sql`: SECURITY DEFINER `create_item` / `update_item` / `set_item_archived` + `_require_active_admin()` helper. Admin-gated (catalogue mgmt is an owner task; staff keep the stock-override flow). Auto-generates item_code when blank; keeps legacy `category` text in sync with category_id; soft-delete only (history preserved). **New items are global — they exist for both godowns immediately; we deliberately DON'T seed godown_stock rows** (keeps "never stocked" ≠ "ran out"; first Purchase creates the row).
+- `components/item-form-modal.tsx`: create/edit form (admin). Entry points: violet "New item" button + ⌘K "Add a new item" (`?new=1`); edit/archive via the item's stock modal → "Edit details". Items list now filters `archived = false`.
+- USER RAN THE SQL — confirmed `item CRUD RPCs ready · 166 active items`.
+
+**4. Unlimited-depth category tree (`da47cfb`).**
+- `db/2026-05-29-category-tree.sql`: adds `parent_id` (self-FK) + `sort_order` to `categories`; admin-gated `category_create / rename / move / archive` RPCs. `category_move` is cycle-safe (recursive ancestor check); archive blocked while a node has live subcategories. **Kept the existing global-unique name** rather than doing risky drop/recreate-constraint surgery on the live table — fine for one shop; per-parent uniqueness is a small follow-up if ever needed. Existing categories untouched → all become top-level nodes.
+- `lib/categories.ts`: pure tree helpers (build/flatten/path), defensive against missing-parent orphans + cycles.
+- `app/categories/page.tsx` (admin): the manager — inline add/rename, move via a parent picker, archive, per-node item counts, expand/collapse.
+- `components/category-tree-picker.tsx`: indented native-select picker, used in the item form to assign an item to ANY node (shows full path). Degrades to a flat list before the migration runs.
+- Reachable from sidebar (System), mobile More, Settings, and ⌘K.
+- **Migration handed to the user to run; awaiting confirmation at time of writing.**
+
+#### Deploy / env notes
+- Push capability: `gh` is authenticated locally as `harshj111186` (repo+workflow scopes); `git push origin main` works and triggers the Pages Action. Commits exclude the untracked `.tmp.driveupload/` (Drive temp) via explicit `git add` paths.
+- `.env.local` exists locally with the Supabase keys; `.claude/launch.json` runs the dev server (it picked port 3010). Reskin verified live via screenshots (dashboard/items/login) + DOM/style inspection; the rest verified via clean `npm run build` because the preview screenshot tool kept timing out under machine load (multiple dev servers) and the PIN gate blocks headless access to authed pages.
+
+#### Follow-ups (not done — queued)
+- **Mobile toolbar consolidation** (Items / Godown / Reconciliation): collapse the search + brand/category/status/depth selects + view toggle into search + a single "Filters" sheet on phones. Held back because it's a mobile-layout change that really wants visual verification (couldn't screenshot this session).
+- **Group items by the category PATH** (nested grouping in Items/Godown/Reconciliation) — currently still groups by the immediate category name; the tree is used for management + assignment. Enhance buildTree to nest by path once verifiable.
+- **Lazy-load the ABC report chart** (only `/reports/abc` still bundles recharts eagerly, ~113kB first-load; dashboard already lazy-loads it).
+- **Restore-archived UI** for items + categories (the RPCs already support un-archiving).
+- Per-parent unique category names (only if the shop ever needs duplicate child names under different parents).
+
+---
+
 ### 2026-05-22 — Desktop PWA install (service worker + install buttons)
 
 **User ask:** "now i want installable app for this for both computer and mobile. for mobile we used add to homescreen but for pc and laptop the download option doesnt show in web browser"
