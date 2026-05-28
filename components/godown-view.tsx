@@ -7,6 +7,8 @@ import {
 import { Shell } from "@/components/shell";
 import { sb, type Item, type Stock } from "@/lib/supabase";
 import { colourCss, fmtN } from "@/lib/utils";
+import { pathById, type CatRow } from "@/lib/categories";
+import { FilterSheet, SheetField, FilterButton } from "@/components/filter-sheet";
 
 // ─── types ───────────────────────────────────────────────────────────────
 type Godown = "A" | "B";
@@ -73,6 +75,7 @@ export function GodownView({ godown }: { godown: Godown }) {
   const [brand, setBrand] = useState("");
   const [cat, setCat] = useState("");
   const [status, setStatus] = useState(""); // "" | "stock" | "out" | "low" | "never"
+  const [filtersOpen, setFiltersOpen] = useState(false);
 
   // view + grouping (persisted per-godown so the two pages don't fight each other)
   const [view, setView] = useState<View>("grid");
@@ -101,13 +104,15 @@ export function GodownView({ godown }: { godown: Godown }) {
     (async () => {
       const c = sb();
       const [{ data: rows }, { data: stock }, { data: cats }] = await Promise.all([
-        c.from("items").select("*").order("item_code"),
+        c.from("items").select("*").eq("archived", false).order("item_code"),
         c.from("godown_stock").select("*").eq("godown", godown),
-        c.from("categories").select("id, name"),
+        c.from("categories").select("*"),
       ]);
-      const catMap = new Map<string, string>(
-        (cats || []).map((x: any) => [x.id as string, x.name as string])
-      );
+      const catRows: CatRow[] = ((cats || []) as any[]).map(x => ({
+        id: x.id, name: x.name, parent_id: x.parent_id ?? null,
+        sort_order: x.sort_order ?? 0, archived: x.archived ?? false,
+      }));
+      const catPath = pathById(catRows);
       const sMap = new Map<string, Stock>();
       (stock || []).forEach((s: any) => sMap.set(s.item_id, s as Stock));
 
@@ -119,8 +124,8 @@ export function GodownView({ godown }: { godown: Godown }) {
         const total = cs > 0 ? cases * cs + loose : loose;
         return {
           ...i,
-          // join category name via FK (preferred over the legacy text column)
-          category: catMap.get(i.category_id) ?? i.category ?? null,
+          // join the full category PATH via FK (preferred over legacy text)
+          category: catPath.get(i.category_id) ?? i.category ?? null,
           cases,
           loose,
           total,
@@ -240,37 +245,40 @@ export function GodownView({ godown }: { godown: Godown }) {
           />
         </div>
 
-        <select value={brand} onChange={(e) => setBrand(e.target.value)}
-          className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-md px-3 py-1.5 text-sm">
-          <option value="">All brands</option>
-          {brands.map(b => <option key={b} value={b}>{b}</option>)}
-        </select>
+        {/* Mobile: filters in a bottom sheet */}
+        <FilterButton activeCount={(brand ? 1 : 0) + (cat ? 1 : 0) + (status ? 1 : 0)} onClick={() => setFiltersOpen(true)} />
 
-        <select value={cat} onChange={(e) => setCat(e.target.value)}
-          className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-md px-3 py-1.5 text-sm">
-          <option value="">All categories</option>
-          {cats.map(c => <option key={c} value={c}>{c}</option>)}
-        </select>
-
-        <select value={status} onChange={(e) => setStatus(e.target.value)}
-          className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-md px-3 py-1.5 text-sm">
-          <option value="">All statuses</option>
-          <option value="stock">In stock</option>
-          <option value="low">Low (≤ reorder)</option>
-          <option value="out">Out of stock</option>
-          <option value="never">Never stocked here</option>
-        </select>
-
-        <select value={depth} onChange={(e) => setDepth(Number(e.target.value) as Depth)}
-          className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-md px-3 py-1.5 text-sm">
-          <option value={0}>No grouping</option>
-          <option value={1}>Group: Brand</option>
-          <option value={2}>Group: Brand · Category</option>
-          <option value={3}>Group: Brand · Category · Subcat.</option>
-        </select>
+        {/* Desktop: inline filters */}
+        <div className="hidden md:flex md:flex-wrap md:gap-2 md:items-center">
+          <select value={brand} onChange={(e) => setBrand(e.target.value)}
+            className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-md px-3 py-1.5 text-sm">
+            <option value="">All brands</option>
+            {brands.map(b => <option key={b} value={b}>{b}</option>)}
+          </select>
+          <select value={cat} onChange={(e) => setCat(e.target.value)}
+            className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-md px-3 py-1.5 text-sm">
+            <option value="">All categories</option>
+            {cats.map(c => <option key={c} value={c}>{c}</option>)}
+          </select>
+          <select value={status} onChange={(e) => setStatus(e.target.value)}
+            className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-md px-3 py-1.5 text-sm">
+            <option value="">All statuses</option>
+            <option value="stock">In stock</option>
+            <option value="low">Low (≤ reorder)</option>
+            <option value="out">Out of stock</option>
+            <option value="never">Never stocked here</option>
+          </select>
+          <select value={depth} onChange={(e) => setDepth(Number(e.target.value) as Depth)}
+            className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-md px-3 py-1.5 text-sm">
+            <option value={0}>No grouping</option>
+            <option value={1}>Group: Brand</option>
+            <option value={2}>Group: Brand · Category</option>
+            <option value={3}>Group: Brand · Category · Subcat.</option>
+          </select>
+        </div>
 
         {/* View toggle */}
-        <div className="flex bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-md overflow-hidden">
+        <div className="flex bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-md overflow-hidden flex-shrink-0">
           <button
             onClick={() => setView("grid")}
             className={`px-2.5 py-1.5 ${view === "grid" ? "bg-cyan-500/15 text-cyan-600 dark:text-cyan-300" : "text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-200"}`}
@@ -290,7 +298,7 @@ export function GodownView({ godown }: { godown: Godown }) {
         </div>
 
         {depth > 0 && (
-          <div className="flex items-center gap-1 text-xs">
+          <div className="hidden md:flex items-center gap-1 text-xs">
             <button onClick={expandAll} className="text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-200 px-2 py-1">Expand all</button>
             <span className="text-zinc-300 dark:text-zinc-700">·</span>
             <button onClick={collapseAll} className="text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-200 px-2 py-1">Collapse all</button>
@@ -299,6 +307,49 @@ export function GodownView({ godown }: { godown: Godown }) {
 
         <div className="text-xs text-zinc-500 self-center ml-auto tabular-nums">{filtered.length} shown</div>
       </div>
+
+      {/* Mobile filters sheet */}
+      <FilterSheet
+        open={filtersOpen}
+        onClose={() => setFiltersOpen(false)}
+        onClear={() => { setBrand(""); setCat(""); setStatus(""); }}
+      >
+        <SheetField label="Brand">
+          <select value={brand} onChange={(e) => setBrand(e.target.value)} className="w-full bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-cyan-500">
+            <option value="">All brands</option>
+            {brands.map(b => <option key={b} value={b}>{b}</option>)}
+          </select>
+        </SheetField>
+        <SheetField label="Category">
+          <select value={cat} onChange={(e) => setCat(e.target.value)} className="w-full bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-cyan-500">
+            <option value="">All categories</option>
+            {cats.map(c => <option key={c} value={c}>{c}</option>)}
+          </select>
+        </SheetField>
+        <SheetField label="Status">
+          <select value={status} onChange={(e) => setStatus(e.target.value)} className="w-full bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-cyan-500">
+            <option value="">All statuses</option>
+            <option value="stock">In stock</option>
+            <option value="low">Low (≤ reorder)</option>
+            <option value="out">Out of stock</option>
+            <option value="never">Never stocked here</option>
+          </select>
+        </SheetField>
+        <SheetField label="Grouping">
+          <select value={depth} onChange={(e) => setDepth(Number(e.target.value) as Depth)} className="w-full bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-cyan-500">
+            <option value={0}>No grouping</option>
+            <option value={1}>Group: Brand</option>
+            <option value={2}>Group: Brand · Category</option>
+            <option value={3}>Group: Brand · Category · Subcat.</option>
+          </select>
+        </SheetField>
+        {depth > 0 && (
+          <div className="flex gap-2">
+            <button onClick={expandAll} className="flex-1 border border-zinc-200 dark:border-zinc-700 rounded-md py-2 text-sm text-zinc-600 dark:text-zinc-300">Expand all</button>
+            <button onClick={collapseAll} className="flex-1 border border-zinc-200 dark:border-zinc-700 rounded-md py-2 text-sm text-zinc-600 dark:text-zinc-300">Collapse all</button>
+          </div>
+        )}
+      </FilterSheet>
 
       {/* Body */}
       {!loaded ? (

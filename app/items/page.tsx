@@ -10,7 +10,7 @@ import { useAuth } from "@/app/providers";
 import { sb, type Item, type Stock } from "@/lib/supabase";
 import { colourCss, fmtN } from "@/lib/utils";
 import { ItemFormModal } from "@/components/item-form-modal";
-import { type CatRow } from "@/lib/categories";
+import { pathById, type CatRow } from "@/lib/categories";
 import { FilterSheet, SheetField, FilterButton } from "@/components/filter-sheet";
 
 // Combined now also carries raw cases/loose so the override modal can edit them directly.
@@ -128,13 +128,14 @@ export default function ItemsPage() {
       c.from("godown_stock").select("*"),
       c.from("categories").select("*"),
     ]);
-    const catMap = new Map<string, string>(
-      (cats || []).map((x: any) => [x.id as string, x.name as string])
-    );
-    setCategories(((cats || []) as any[]).map(x => ({
+    const catRows: CatRow[] = ((cats || []) as any[]).map(x => ({
       id: x.id, name: x.name, parent_id: x.parent_id ?? null,
       sort_order: x.sort_order ?? 0, archived: x.archived ?? false,
-    })));
+    }));
+    setCategories(catRows);
+    // Resolve each item's category to its FULL tree path (e.g. "Fans › Ceiling
+    // › Premium") so grouping + filters reflect the hierarchy, not just the leaf.
+    const catPath = pathById(catRows);
     const sMap: Record<string, { A: Stock; B: Stock }> = {};
     (stock || []).forEach((s: any) => {
       sMap[s.item_id] = sMap[s.item_id] || {
@@ -152,7 +153,7 @@ export default function ItemsPage() {
         // Prefer category name via FK; fall back to the legacy category text column
         // for any row whose category_id wasn't backfilled. Matches GodownView's
         // resolution so both pages bucket identical items into identical groups.
-        category: catMap.get(i.category_id) ?? i.category ?? null,
+        category: catPath.get(i.category_id) ?? i.category ?? null,
         totalA: cs > 0 ? a.cases * cs + a.loose : a.loose,
         totalB: cs > 0 ? b.cases * cs + b.loose : b.loose,
         casesA: a.cases || 0, looseA: a.loose || 0,
