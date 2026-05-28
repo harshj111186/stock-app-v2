@@ -4,7 +4,7 @@ import { useRouter } from "next/navigation";
 import {
   LayoutDashboard, Boxes, Warehouse, ArrowLeftRight, ClipboardCheck, Receipt,
   BarChart3, TrendingUp, AlertOctagon, ShieldCheck, Users, Settings,
-  Search, Plus, CornerDownLeft, Command,
+  Search, Plus, CornerDownLeft, Command, FolderTree,
 } from "lucide-react";
 import { useAuth } from "@/app/providers";
 import { cn } from "@/lib/utils";
@@ -42,7 +42,8 @@ const COMMANDS: Cmd[] = [
   { id: "dead-stock", label: "Dead stock", icon: AlertOctagon, href: "/reports/dead-stock", group: "Go to", keywords: "report idle no movement" },
   { id: "audit", label: "Audit log", icon: ShieldCheck, href: "/audit", group: "Go to", keywords: "history changes", adminOnly: true },
   { id: "users", label: "Users", icon: Users, href: "/users", group: "Go to", keywords: "accounts roles approve", adminOnly: true },
-  { id: "settings", label: "Settings", icon: Settings, href: "/settings", group: "Go to", keywords: "account pin install categories" },
+  { id: "categories", label: "Categories", icon: FolderTree, href: "/categories", group: "Go to", keywords: "tree nesting catalogue structure subcategory", adminOnly: true },
+  { id: "settings", label: "Settings", icon: Settings, href: "/settings", group: "Go to", keywords: "account pin install" },
   // Quick actions
   { id: "new-item", label: "Add a new item", hint: "Items", icon: Plus, href: "/items?new=1", group: "Actions", keywords: "create product sku" },
   { id: "new-txn", label: "Log a transaction", hint: "Transactions", icon: Plus, href: "/transactions", group: "Actions", keywords: "purchase sale entry" },

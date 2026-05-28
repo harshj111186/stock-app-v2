@@ -10,6 +10,7 @@ import { useAuth } from "@/app/providers";
 import { sb, type Item, type Stock } from "@/lib/supabase";
 import { colourCss, fmtN } from "@/lib/utils";
 import { ItemFormModal } from "@/components/item-form-modal";
+import { type CatRow } from "@/lib/categories";
 
 // Combined now also carries raw cases/loose so the override modal can edit them directly.
 type Combined = Item & {
@@ -85,7 +86,7 @@ export default function ItemsPage() {
   // manual override modal
   const [editingItem, setEditingItem] = useState<Combined | null>(null);
   // create / edit-details / archive (admin)
-  const [categories, setCategories] = useState<{ id: string; name: string }[]>([]);
+  const [categories, setCategories] = useState<CatRow[]>([]);
   const [creating, setCreating] = useState(false);
   const [editingDetails, setEditingDetails] = useState<Combined | null>(null);
 
@@ -123,12 +124,15 @@ export default function ItemsPage() {
     const [{ data: rows }, { data: stock }, { data: cats }] = await Promise.all([
       c.from("items").select("*").eq("archived", false).order("item_code"),
       c.from("godown_stock").select("*"),
-      c.from("categories").select("id, name"),
+      c.from("categories").select("*"),
     ]);
     const catMap = new Map<string, string>(
       (cats || []).map((x: any) => [x.id as string, x.name as string])
     );
-    setCategories(((cats || []) as any[]).map(x => ({ id: x.id, name: x.name })).sort((a, b) => a.name.localeCompare(b.name)));
+    setCategories(((cats || []) as any[]).map(x => ({
+      id: x.id, name: x.name, parent_id: x.parent_id ?? null,
+      sort_order: x.sort_order ?? 0, archived: x.archived ?? false,
+    })));
     const sMap: Record<string, { A: Stock; B: Stock }> = {};
     (stock || []).forEach((s: any) => {
       sMap[s.item_id] = sMap[s.item_id] || {

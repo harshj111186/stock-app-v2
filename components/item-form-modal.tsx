@@ -2,20 +2,20 @@
 import { useState } from "react";
 import { X, Save, Loader2, AlertCircle, Plus, Archive } from "lucide-react";
 import { sb, type Item } from "@/lib/supabase";
+import { CategoryTreePicker } from "@/components/category-tree-picker";
+import { pathById, type CatRow } from "@/lib/categories";
 
 // Create / edit an item's catalogue attributes. Stock quantity is NOT handled
 // here — that stays in the dedicated stock-override flow and process_transaction.
 // Writes go through the create_item / update_item RPCs (admin-gated). A new
 // item is global, so it appears in both Godown A and B immediately.
 
-type Cat = { id: string; name: string };
-
 export function ItemFormModal({
   mode, item, categories, brands, onClose, onSaved,
 }: {
   mode: "create" | "edit";
   item?: Item | null;
-  categories: Cat[];
+  categories: CatRow[];
   brands: string[];
   onClose: () => void;
   onSaved: () => void | Promise<void>;
@@ -136,11 +136,11 @@ export function ItemFormModal({
           </div>
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-            <Field label="Category">
-              <select value={categoryId} onChange={(e) => setCategoryId(e.target.value)} className={inputCls}>
-                <option value="">— none —</option>
-                {categories.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
-              </select>
+            <Field label="Category" hint="any level of the tree">
+              <CategoryTreePicker rows={categories} value={categoryId} onChange={setCategoryId} className={inputCls} />
+              {categoryId && (
+                <div className="text-[11px] text-zinc-500 mt-1 truncate">{pathById(categories).get(categoryId) || ""}</div>
+              )}
             </Field>
             <Field label="Subcategory">
               <input value={subcategory} onChange={(e) => setSubcategory(e.target.value)}

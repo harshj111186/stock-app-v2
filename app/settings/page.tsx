@@ -4,9 +4,10 @@ import { useAuth } from "@/app/providers";
 import { useInstall } from "@/components/install-provider";
 import { useState } from "react";
 import { sb } from "@/lib/supabase";
+import Link from "next/link";
 import {
   KeyRound, Loader2, CheckCircle2, AlertCircle, ShieldCheck,
-  Download, Smartphone, Monitor,
+  Download, Smartphone, Monitor, FolderTree, ChevronRight,
 } from "lucide-react";
 
 export default function SettingsPage() {
@@ -28,6 +29,17 @@ export default function SettingsPage() {
             icon={profile?.is_super_admin ? <ShieldCheck className="w-3.5 h-3.5 text-cyan-500" /> : undefined}
           />
         </div>
+
+        {profile?.role === "admin" && (
+          <Link href="/categories" className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg p-5 flex items-center gap-3 hover:border-cyan-500/50 transition-colors group">
+            <span className="w-9 h-9 bg-cyan-500/10 text-cyan-600 dark:text-cyan-400 rounded-lg flex items-center justify-center flex-shrink-0"><FolderTree className="w-4 h-4" /></span>
+            <span className="flex-1 min-w-0">
+              <span className="block text-sm font-medium">Categories</span>
+              <span className="block text-xs text-zinc-500">Build the nested catalogue structure</span>
+            </span>
+            <ChevronRight className="w-4 h-4 text-zinc-400 group-hover:text-cyan-500 group-hover:translate-x-0.5 transition-all" />
+          </Link>
+        )}
 
         <ChangePinCard />
 

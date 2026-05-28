@@ -4,7 +4,7 @@ import { usePathname } from "next/navigation";
 import {
   LayoutDashboard, Boxes, Warehouse, ArrowLeftRight, Receipt,
   BarChart3, TrendingUp, AlertOctagon, ShieldCheck, Users, Settings, LogOut,
-  Package, Download, ClipboardCheck,
+  Package, Download, ClipboardCheck, FolderTree,
 } from "lucide-react";
 import { useAuth } from "@/app/providers";
 import { useInstall } from "@/components/install-provider";
@@ -26,6 +26,7 @@ const NAV = [
     { href: "/reports/dead-stock", label: "Dead stock", icon: AlertOctagon },
   ]},
   { group: "System", items: [
+    { href: "/categories", label: "Categories", icon: FolderTree },
     { href: "/audit", label: "Audit log", icon: ShieldCheck },
     { href: "/users", label: "Users", icon: Users },
     { href: "/settings", label: "Settings", icon: Settings },
