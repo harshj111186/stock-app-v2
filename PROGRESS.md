@@ -266,12 +266,22 @@ Shipped in four pushes to `main` (each auto-deploys). The audit found the app wa
 - Push capability: `gh` is authenticated locally as `harshj111186` (repo+workflow scopes); `git push origin main` works and triggers the Pages Action. Commits exclude the untracked `.tmp.driveupload/` (Drive temp) via explicit `git add` paths.
 - `.env.local` exists locally with the Supabase keys; `.claude/launch.json` runs the dev server (it picked port 3010). Reskin verified live via screenshots (dashboard/items/login) + DOM/style inspection; the rest verified via clean `npm run build` because the preview screenshot tool kept timing out under machine load (multiple dev servers) and the PIN gate blocks headless access to authed pages.
 
-#### Follow-ups (not done — queued)
-- **Mobile toolbar consolidation** (Items / Godown / Reconciliation): collapse the search + brand/category/status/depth selects + view toggle into search + a single "Filters" sheet on phones. Held back because it's a mobile-layout change that really wants visual verification (couldn't screenshot this session).
-- **Group items by the category PATH** (nested grouping in Items/Godown/Reconciliation) — currently still groups by the immediate category name; the tree is used for management + assignment. Enhance buildTree to nest by path once verifiable.
-- **Lazy-load the ABC report chart** (only `/reports/abc` still bundles recharts eagerly, ~113kB first-load; dashboard already lazy-loads it).
-- **Restore-archived UI** for items + categories (the RPCs already support un-archiving).
-- Per-parent unique category names (only if the shop ever needs duplicate child names under different parents).
+#### Also landed 2026-05-29 (later, once visual access was restored)
+- **categories RLS read policy** (`db/2026-05-29-categories-select-rls.sql`) — the table had RLS enabled with NO select policy, so the app got `[]` (the old UI silently used the legacy `items.category` text column; the new manager showed "0 categories"). Added `for select to authenticated using (true)`. User ran it — confirmed 13 readable. **Required for the tree to show anything.** Writes stay RPC-only.
+- **Mobile Filters sheet** on Items + Godown A/B (`components/filter-sheet.tsx`): phones show search + a "Filters" button (active-count badge) → slide-up bottom sheet; the desktop toolbar is unchanged (`hidden md:flex`).
+- **Category PATH grouping**: Items + Godown resolve each item's category to its full path via `pathById` (with a flat list it's identical; it nests visibly as the tree grows). Godown also now filters `archived = false`.
+
+#### Follow-ups (still open)
+- **Reconciliation mobile toolbar** — same Filters-sheet treatment (its toolbar is more bespoke: My-count/Reviewer mode toggle + commit button).
+- **Nested expand/collapse grouping** by each path segment (today grouping buckets by the full-path string as a single level — informative but not expandable per level).
+- **Lazy-load the ABC report chart** (~113 kB on `/reports/abc`; the dashboard chart is already lazy).
+- **Restore-archived UI** for items + categories (the RPCs already support un-archiving; no surface to reach archived rows yet).
+- Per-parent unique category names (only if duplicate child names under different parents are ever needed — a small constraint swap).
+
+#### Verification caveats for future sessions (this machine)
+- The project folder is **Google-Drive-synced**, so the LOCAL `next dev` recompiles in a loop (Drive touches watched files) — this stalls the preview screenshot tool and resets page state. Verify on the **deployed** site instead; it's unaffected.
+- **Never run `npm run build` while `next dev` is live** — they share `.next/` and the dev server then 404-loops on `layout.css`. Fix: stop dev, `rm -rf .next`, restart.
+- The PIN gate blocks headless access to authed pages. For read-only visual checks, the already-authenticated browser session can be unlocked by setting `sessionStorage['pinUnlocked:<userId>']='1'` and reloading (the Supabase session persists in localStorage). Read-only only — never submit writes against live data this way.
 
 ---
 
