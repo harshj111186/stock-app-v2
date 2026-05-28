@@ -9,6 +9,7 @@ import { Shell } from "@/components/shell";
 import { sb, type Item } from "@/lib/supabase";
 import { useAuth } from "@/app/providers";
 import { fmtN, cn } from "@/lib/utils";
+import { FilterSheet, SheetField, FilterButton } from "@/components/filter-sheet";
 
 // ─── Reconciliation page ─────────────────────────────────────────────────
 //
@@ -945,10 +946,11 @@ function Toolbar({
   canCommit: boolean; processing: boolean;
   progress: { done: number; total: number };
 }) {
+  const [filtersOpen, setFiltersOpen] = useState(false);
   return (
     <div className="space-y-2 mb-4">
       <div className="flex flex-wrap gap-2 items-center">
-        <div className="flex-1 min-w-[200px] relative">
+        <div className="flex-1 min-w-[180px] relative">
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-zinc-500" />
           <input
             value={q} onChange={(e) => setQ(e.target.value)}
@@ -956,31 +958,38 @@ function Toolbar({
             className="w-full bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-md pl-9 pr-3 py-1.5 text-sm focus:outline-none focus:border-cyan-500"
           />
         </div>
-        <select value={brand} onChange={(e) => setBrand(e.target.value)}
-          className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-md px-3 py-1.5 text-sm">
-          <option value="">All brands</option>
-          {brands.map(b => <option key={b} value={b}>{b}</option>)}
-        </select>
-        <select value={cat} onChange={(e) => setCat(e.target.value)}
-          className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-md px-3 py-1.5 text-sm">
-          <option value="">All categories</option>
-          {cats.map(c => <option key={c} value={c}>{c}</option>)}
-        </select>
-        <button
-          type="button"
-          onClick={() => setShowOnlyChanged(!showOnlyChanged)}
-          className={cn(
-            "inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm border transition-colors",
-            showOnlyChanged
-              ? "bg-amber-500/15 border-amber-500/50 text-amber-700 dark:text-amber-300"
-              : "bg-white dark:bg-zinc-900 border-zinc-200 dark:border-zinc-800 text-zinc-600 dark:text-zinc-300 hover:border-zinc-300 dark:hover:border-zinc-700"
-          )}
-          aria-pressed={showOnlyChanged}
-        >
-          {showOnlyChanged ? <Eye className="w-3.5 h-3.5" /> : <EyeOff className="w-3.5 h-3.5" />}
-          {showOnlyChanged ? (mode === "my" ? "Only mine" : "Only staged") : "All items"}
-        </button>
-        <span className="text-xs text-zinc-500 self-center tabular-nums">{fmtN(shownCount)} shown</span>
+
+        {/* Mobile: filters live in a sheet */}
+        <FilterButton activeCount={(brand ? 1 : 0) + (cat ? 1 : 0) + (showOnlyChanged ? 1 : 0)} onClick={() => setFiltersOpen(true)} />
+
+        {/* Desktop: inline filters */}
+        <div className="hidden md:flex md:items-center md:gap-2">
+          <select value={brand} onChange={(e) => setBrand(e.target.value)}
+            className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-md px-3 py-1.5 text-sm">
+            <option value="">All brands</option>
+            {brands.map(b => <option key={b} value={b}>{b}</option>)}
+          </select>
+          <select value={cat} onChange={(e) => setCat(e.target.value)}
+            className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-md px-3 py-1.5 text-sm">
+            <option value="">All categories</option>
+            {cats.map(c => <option key={c} value={c}>{c}</option>)}
+          </select>
+          <button
+            type="button"
+            onClick={() => setShowOnlyChanged(!showOnlyChanged)}
+            className={cn(
+              "inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm border transition-colors",
+              showOnlyChanged
+                ? "bg-amber-500/15 border-amber-500/50 text-amber-700 dark:text-amber-300"
+                : "bg-white dark:bg-zinc-900 border-zinc-200 dark:border-zinc-800 text-zinc-600 dark:text-zinc-300 hover:border-zinc-300 dark:hover:border-zinc-700"
+            )}
+            aria-pressed={showOnlyChanged}
+          >
+            {showOnlyChanged ? <Eye className="w-3.5 h-3.5" /> : <EyeOff className="w-3.5 h-3.5" />}
+            {showOnlyChanged ? (mode === "my" ? "Only mine" : "Only staged") : "All items"}
+          </button>
+        </div>
+        <span className="text-xs text-zinc-500 self-center tabular-nums ml-auto md:ml-0">{fmtN(shownCount)} shown</span>
       </div>
 
       <div className="flex flex-wrap items-center gap-2">
@@ -1050,6 +1059,40 @@ function Toolbar({
           </button>
         )}
       </div>
+
+      {/* Mobile filters sheet */}
+      <FilterSheet
+        open={filtersOpen}
+        onClose={() => setFiltersOpen(false)}
+        onClear={() => { setBrand(""); setCat(""); setShowOnlyChanged(false); }}
+      >
+        <SheetField label="Brand">
+          <select value={brand} onChange={(e) => setBrand(e.target.value)} className="w-full bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-cyan-500">
+            <option value="">All brands</option>
+            {brands.map(b => <option key={b} value={b}>{b}</option>)}
+          </select>
+        </SheetField>
+        <SheetField label="Category">
+          <select value={cat} onChange={(e) => setCat(e.target.value)} className="w-full bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-cyan-500">
+            <option value="">All categories</option>
+            {cats.map(c => <option key={c} value={c}>{c}</option>)}
+          </select>
+        </SheetField>
+        <button
+          type="button"
+          onClick={() => setShowOnlyChanged(!showOnlyChanged)}
+          className={cn(
+            "w-full inline-flex items-center justify-center gap-1.5 rounded-md px-3 py-2.5 text-sm border transition-colors",
+            showOnlyChanged
+              ? "bg-amber-500/15 border-amber-500/50 text-amber-700 dark:text-amber-300"
+              : "bg-white dark:bg-zinc-800 border-zinc-200 dark:border-zinc-700 text-zinc-600 dark:text-zinc-300"
+          )}
+          aria-pressed={showOnlyChanged}
+        >
+          {showOnlyChanged ? <Eye className="w-3.5 h-3.5" /> : <EyeOff className="w-3.5 h-3.5" />}
+          {showOnlyChanged ? (mode === "my" ? "Showing only mine" : "Showing only staged") : "Show all items"}
+        </button>
+      </FilterSheet>
     </div>
   );
 }
