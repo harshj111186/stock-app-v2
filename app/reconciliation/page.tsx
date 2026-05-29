@@ -1,15 +1,16 @@
 "use client";
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  Search, Printer, ClipboardCheck, CheckCircle2, AlertCircle,
+  Printer, ClipboardCheck, CheckCircle2, AlertCircle,
   RotateCcw, Loader2, Eraser, Filter, Eye, EyeOff, Users, ShieldCheck,
   UserCircle2, Clock,
 } from "lucide-react";
 import { Shell } from "@/components/shell";
 import { sb, type Item } from "@/lib/supabase";
 import { useAuth } from "@/app/providers";
-import { fmtN, cn } from "@/lib/utils";
+import { fmtN, cn, matchesQuery } from "@/lib/utils";
 import { FilterSheet, SheetField, FilterButton } from "@/components/filter-sheet";
+import { SearchBox } from "@/components/search-box";
 
 // ─── Reconciliation page ─────────────────────────────────────────────────
 //
@@ -87,6 +88,25 @@ function parseExpr(raw: string): number | null {
 const TODAY = () => new Date().toISOString().slice(0, 10);
 const pieces = (cs: number, cases: number, loose: number) =>
   cs > 0 ? cases * cs + loose : loose;
+
+// "4×4 + 2 = 18" style breakup. When case size is 0, items are loose-only
+// so we just show the loose count.
+function breakupStr(cs: number, cases: number, loose: number): string {
+  if (cs > 0) return `${fmtN(cases)}×${cs} + ${fmtN(loose)} = ${fmtN(cases * cs + loose)} pcs`;
+  return `${fmtN(loose)} pcs (loose)`;
+}
+
+// Pull one user's entered values for a single godown out of their draft.
+// Uses their own case-size entry if present, else the item's current one.
+function draftSide(d: DBDraft, g: Godown, itemCs: number) {
+  const cs = parseExpr(d.case_size_raw) ?? itemCs;
+  const cRaw = g === "A" ? d.a_cases_raw : d.b_cases_raw;
+  const lRaw = g === "A" ? d.a_loose_raw : d.b_loose_raw;
+  const touched = cRaw.trim() !== "" || lRaw.trim() !== "";
+  const cases = parseExpr(cRaw) ?? 0;
+  const loose = parseExpr(lRaw) ?? 0;
+  return { touched, cases, loose, cs, pcs: pieces(cs, cases, loose) };
+}
 
 function timeAgo(iso: string): string {
   const now = Date.now();
@@ -546,7 +566,6 @@ export default function ReconciliationPage() {
   );
 
   const filtered = useMemo(() => {
-    const ql = q.trim().toLowerCase();
     return itemsEnriched.filter(i => {
       if (brand && i.brand !== brand) return false;
       if (cat && i.categoryName !== cat) return false;
@@ -560,10 +579,8 @@ export default function ReconciliationPage() {
           if (drs.length === 0) return false;
         }
       }
-      if (ql) {
-        const hay = `${i.brand || ""} ${i.model} ${i.size} ${i.colour} ${i.categoryName || ""} ${i.subcategory || ""} ${i.item_code}`.toLowerCase();
-        if (!hay.includes(ql)) return false;
-      }
+      const hay = `${i.brand || ""} ${i.model} ${i.size} ${i.colour} ${i.categoryName || ""} ${i.subcategory || ""} ${i.item_code}`;
+      if (!matchesQuery(hay, q)) return false;
       return true;
     });
   }, [itemsEnriched, q, brand, cat, showOnlyChanged, draftsByItem, mode, profile?.id]);
@@ -933,16 +950,17 @@ function Toolbar({
 }) {
   const [filtersOpen, setFiltersOpen] = useState(false);
   return (
-    <div className="space-y-2 mb-4">
+    // Sticky so the search + filters stay reachable while scrolling the
+    // long item list. Negative margins let the background span the full
+    // content width; px puts the padding back.
+    <div className="space-y-2 mb-4 sticky top-0 z-20 -mx-4 sm:-mx-6 md:-mx-8 px-4 sm:px-6 md:px-8 pt-1 pb-2.5 bg-zinc-50 dark:bg-zinc-950 border-b border-zinc-200/70 dark:border-zinc-800/70">
       <div className="flex flex-wrap gap-2 items-center">
-        <div className="flex-1 min-w-[180px] relative">
-          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-zinc-500" />
-          <input
-            value={q} onChange={(e) => setQ(e.target.value)}
-            placeholder="Search by brand, model, code…"
-            className="w-full bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-md pl-9 pr-3 py-1.5 text-sm focus:outline-none focus:border-cyan-500"
-          />
-        </div>
+        <SearchBox
+          value={q}
+          onChange={setQ}
+          placeholder="Search — brand, model, colour, size…"
+          className="flex-1 min-w-[180px]"
+        />
 
         {/* Mobile: filters live in a sheet */}
         <FilterButton activeCount={(brand ? 1 : 0) + (cat ? 1 : 0) + (showOnlyChanged ? 1 : 0)} onClick={() => setFiltersOpen(true)} />
@@ -1177,14 +1195,15 @@ function DesktopTable({
   return (
     <div className="hidden md:block bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg overflow-hidden">
       <table className="w-full text-sm">
-        <thead className="bg-zinc-50 dark:bg-zinc-900/50 border-b border-zinc-200 dark:border-zinc-800 sticky top-0 z-10">
+        <thead className="bg-zinc-50 dark:bg-zinc-900/50 border-b border-zinc-200 dark:border-zinc-800">
           <tr className="text-zinc-500 text-[11px] uppercase tracking-wider">
-            <th className="text-left px-3 py-2.5 font-medium w-[320px]">Item</th>
-            <th className="text-center px-2 py-2.5 font-medium w-[90px]">Case size</th>
-            <th className="text-center px-2 py-2.5 font-medium w-[90px]">A cases</th>
-            <th className="text-center px-2 py-2.5 font-medium w-[90px]">A loose</th>
-            <th className="text-center px-2 py-2.5 font-medium w-[90px]">B cases</th>
-            <th className="text-center px-2 py-2.5 font-medium w-[90px]">B loose</th>
+            <th className="text-left px-3 py-2.5 font-medium w-[300px]">Item</th>
+            <th className="text-center px-2 py-2.5 font-medium w-[78px]">Case size</th>
+            <th className="text-center px-2 py-2.5 font-medium w-[78px]">A cases</th>
+            <th className="text-center px-2 py-2.5 font-medium w-[78px]">A loose</th>
+            <th className="text-center px-2 py-2.5 font-medium w-[78px]">B cases</th>
+            <th className="text-center px-2 py-2.5 font-medium w-[78px]">B loose</th>
+            <th className="text-left px-3 py-2.5 font-medium w-[210px]">Count breakup</th>
             <th className="w-8" />
           </tr>
         </thead>
@@ -1313,6 +1332,9 @@ function MyDesktopRow({
             tone={rd.B.userTouched ? (rd.B.valid ? "amber" : "rose") : "neutral"}
             ariaLabel={`Godown B loose for ${i.model}`} />
         </td>
+        <td className="px-3 py-2 align-top">
+          <BreakupCell rd={rd} app={app} item={i} others={others} />
+        </td>
         <td className="px-2 py-2">
           {myTouched && (
             <button type="button" onClick={onReset} className="text-zinc-400 hover:text-rose-500 p-1" title="Reset row" aria-label="Reset row">
@@ -1323,7 +1345,7 @@ function MyDesktopRow({
       </tr>
       {hasErr && (
         <tr className="bg-rose-500/5 border-t border-rose-500/20">
-          <td colSpan={7} className="px-3 py-2 text-[11px] text-rose-700 dark:text-rose-300">
+          <td colSpan={8} className="px-3 py-2 text-[11px] text-rose-700 dark:text-rose-300">
             <div className="flex items-start gap-1.5">
               <AlertCircle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
               <div>{errors!.join(" · ")}</div>
@@ -1358,6 +1380,60 @@ function RowMeta({ last, others, conflict }: { last?: LastReconciled; others: DB
   }
   if (lines.length === 0) return null;
   return <div className="mt-1 flex flex-wrap gap-x-3 gap-y-0.5">{lines}</div>;
+}
+
+// Per-godown breakup shown in the My-count desktop table. For each godown:
+//   - the user's entered count as "Xc×cs + YL = Z pcs" (only when they
+//     touched that side or changed the case size)
+//   - the app's current value as a grey "app: …" reference
+//   - any other counters' entered totals for that godown
+function BreakupCell({
+  rd, app, item, others,
+}: {
+  rd: RowDiffType;
+  app: { A: AppStock; B: AppStock };
+  item: Item;
+  others: DBDraft[];
+}) {
+  const itemCs = item.case_size || 0;
+  const row = (g: Godown) => {
+    const side = g === "A" ? rd.A : rd.B;
+    const appSide = g === "A" ? app.A : app.B;
+    const youShown = side.userTouched || rd.caseSizeChanged;
+    const othersForG = others
+      .map(o => ({ name: displayUser(o), s: draftSide(o, g, itemCs) }))
+      .filter(o => o.s.touched);
+    return (
+      <div className="leading-tight">
+        <div className="flex items-baseline gap-1.5">
+          <span className="text-[10px] font-semibold text-zinc-500 w-3">{g}</span>
+          {youShown ? (
+            <span className="text-[11px] tabular-nums text-zinc-700 dark:text-zinc-200">
+              {breakupStr(rd.csNew, side.physCases, side.physLoose)}
+            </span>
+          ) : (
+            <span className="text-[11px] text-zinc-400">not counted</span>
+          )}
+        </div>
+        <div className="flex flex-wrap items-baseline gap-x-2 pl-[18px]">
+          <span className="text-[10px] tabular-nums text-zinc-400">
+            app {breakupStr(itemCs, appSide.cases, appSide.loose)}
+          </span>
+          {othersForG.map((o, idx) => (
+            <span key={idx} className="text-[10px] tabular-nums text-cyan-600/80 dark:text-cyan-400/80">
+              {o.name.split(" ")[0]} {fmtN(o.s.pcs)}
+            </span>
+          ))}
+        </div>
+      </div>
+    );
+  };
+  return (
+    <div className="space-y-1.5">
+      {row("A")}
+      {row("B")}
+    </div>
+  );
 }
 
 // ─── ExprInput ───────────────────────────────────────────────────────────
@@ -1476,6 +1552,9 @@ function MobileCards({
                 d_cases={my.a_cases_raw} d_loose={my.a_loose_raw}
                 side={rd.A}
                 touched={rd.A.userTouched || rd.caseSizeChanged}
+                csNew={rd.csNew} csOld={rd.csOld}
+                others={others.map(o => ({ name: displayUser(o).split(" ")[0], side: draftSide(o, "A", i.case_size || 0) }))
+                  .filter(o => o.side.touched).map(o => ({ name: o.name, pcs: o.side.pcs }))}
                 onCases={(v) => setField(currentUserId, i.id, "a_cases", v)}
                 onLoose={(v) => setField(currentUserId, i.id, "a_loose", v)}
                 onBlur={flushSaves}
@@ -1487,6 +1566,9 @@ function MobileCards({
                 d_cases={my.b_cases_raw} d_loose={my.b_loose_raw}
                 side={rd.B}
                 touched={rd.B.userTouched || rd.caseSizeChanged}
+                csNew={rd.csNew} csOld={rd.csOld}
+                others={others.map(o => ({ name: displayUser(o).split(" ")[0], side: draftSide(o, "B", i.case_size || 0) }))
+                  .filter(o => o.side.touched).map(o => ({ name: o.name, pcs: o.side.pcs }))}
                 onCases={(v) => setField(currentUserId, i.id, "b_cases", v)}
                 onLoose={(v) => setField(currentUserId, i.id, "b_loose", v)}
                 onBlur={flushSaves}
@@ -1509,6 +1591,7 @@ function MobileCards({
 
 function GodownBlock({
   label, appCases, appLoose, d_cases, d_loose, side, touched,
+  csNew, csOld, others,
   onCases, onLoose, onBlur, modelHint,
 }: {
   label: string;
@@ -1516,11 +1599,12 @@ function GodownBlock({
   d_cases: string; d_loose: string;
   side: RowDiffType["A"];
   touched: boolean;
+  csNew: number; csOld: number;
+  others: { name: string; pcs: number }[];
   onCases: (v: string) => void; onLoose: (v: string) => void;
   onBlur: () => void;
   modelHint: string;
 }) {
-  void appCases; void appLoose;
   return (
     <div className="bg-zinc-50 dark:bg-zinc-800/40 rounded-lg p-2">
       <div className="mb-2">
@@ -1537,6 +1621,25 @@ function GodownBlock({
           <ExprInput value={d_loose} placeholder="—" onChange={onLoose} onBlur={onBlur}
             tone={touched ? (side.valid ? "amber" : "rose") : "neutral"} ariaLabel={`${modelHint} loose`} />
         </div>
+      </div>
+
+      {/* Breakup: your count (when entered) + app reference + others */}
+      <div className="mt-2 pt-2 border-t border-zinc-200/70 dark:border-zinc-700/50 space-y-0.5">
+        {touched && side.valid ? (
+          <div className="text-[11px] tabular-nums text-zinc-700 dark:text-zinc-200 font-medium">
+            You: {breakupStr(csNew, side.physCases, side.physLoose)}
+          </div>
+        ) : (
+          <div className="text-[11px] text-zinc-400">You: not counted</div>
+        )}
+        <div className="text-[10px] tabular-nums text-zinc-400">
+          App: {breakupStr(csOld, appCases, appLoose)}
+        </div>
+        {others.map((o, idx) => (
+          <div key={idx} className="text-[10px] tabular-nums text-cyan-600/80 dark:text-cyan-400/80">
+            {o.name}: {fmtN(o.pcs)} pcs
+          </div>
+        ))}
       </div>
     </div>
   );

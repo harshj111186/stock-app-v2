@@ -1,17 +1,18 @@
 "use client";
 import { Fragment, useEffect, useState, useMemo, useCallback } from "react";
 import {
-  Plus, Search, ChevronRight, ChevronDown,
+  Plus, ChevronRight, ChevronDown,
   LayoutGrid, Table as TableIcon, Package,
   Pencil, X, Save, Loader2, AlertCircle,
 } from "lucide-react";
 import { Shell } from "@/components/shell";
 import { useAuth } from "@/app/providers";
 import { sb, type Item, type Stock } from "@/lib/supabase";
-import { colourCss, fmtN } from "@/lib/utils";
+import { colourCss, fmtN, matchesQuery } from "@/lib/utils";
 import { ItemFormModal } from "@/components/item-form-modal";
 import { pathById, type CatRow } from "@/lib/categories";
 import { FilterSheet, SheetField, FilterButton } from "@/components/filter-sheet";
+import { SearchBox } from "@/components/search-box";
 
 // Combined now also carries raw cases/loose so the override modal can edit them directly.
 type Combined = Item & {
@@ -203,10 +204,8 @@ export default function ItemsPage() {
     if (status === "stock" && total === 0) return false;
     if (status === "out" && total > 0) return false;
     if (status === "low" && !(total > 0 && total <= 2)) return false;
-    if (q) {
-      const hay = `${i.brand || ""} ${i.model} ${i.size} ${i.colour} ${i.category || ""} ${i.subcategory || ""} ${i.item_code}`.toLowerCase();
-      if (!hay.includes(q.toLowerCase())) return false;
-    }
+    const hay = `${i.brand || ""} ${i.model} ${i.size} ${i.colour} ${i.category || ""} ${i.subcategory || ""} ${i.item_code}`;
+    if (!matchesQuery(hay, q)) return false;
     return true;
   }), [items, q, brand, cat, status]);
 
@@ -271,14 +270,12 @@ export default function ItemsPage() {
 
       {/* ─── Toolbar ─────────────────────────────────────────── */}
       <div className="flex flex-wrap gap-2 mb-4 items-center">
-        <div className="flex-1 min-w-[200px] relative">
-          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-zinc-500" />
-          <input
-            value={q} onChange={(e) => setQ(e.target.value)}
-            placeholder="Search items…"
-            className="w-full bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-md pl-9 pr-3 py-1.5 text-sm focus:outline-none focus:border-cyan-500"
-          />
-        </div>
+        <SearchBox
+          value={q}
+          onChange={setQ}
+          placeholder="Search — model, colour, size…"
+          className="flex-1 min-w-[200px]"
+        />
 
         {/* Mobile: filters live in a bottom sheet to keep the toolbar to one row */}
         <FilterButton activeCount={(brand ? 1 : 0) + (cat ? 1 : 0) + (status ? 1 : 0)} onClick={() => setFiltersOpen(true)} />

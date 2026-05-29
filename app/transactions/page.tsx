@@ -8,7 +8,8 @@ import {
 import { Shell } from "@/components/shell";
 import { useAuth } from "@/app/providers";
 import { sb, type Item, type Stock, type Txn } from "@/lib/supabase";
-import { fmtN, fmtMoney } from "@/lib/utils";
+import { fmtN, fmtMoney, matchesQuery } from "@/lib/utils";
+import { SearchBox } from "@/components/search-box";
 
 // ─── types ────────────────────────────────────────────────────────────────
 type ActionKind = "Purchase" | "Sale" | "Transfer" | "Adjustment" | "Return";
@@ -472,11 +473,10 @@ export default function TransactionsPage() {
     let list = txns;
     if (logFilter) list = list.filter((t) => t.action === logFilter);
     if (logQuery) {
-      const q = logQuery.toLowerCase();
       list = list.filter((t) => {
         const it = itemById.get(t.item_id);
-        const hay = `${it?.model || ""} ${it?.size || ""} ${it?.colour || ""} ${it?.brand || ""} ${t.invoice_no || ""} ${t.reason || ""}`.toLowerCase();
-        return hay.includes(q);
+        const hay = `${it?.model || ""} ${it?.size || ""} ${it?.colour || ""} ${it?.brand || ""} ${t.invoice_no || ""} ${t.reason || ""}`;
+        return matchesQuery(hay, logQuery);
       });
     }
     return list;
@@ -1005,15 +1005,12 @@ export default function TransactionsPage() {
             <option value="Adjustment">Adjustments</option>
             <option value="Return">Returns</option>
           </select>
-          <div className="relative flex-1 sm:flex-none">
-            <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-zinc-500" />
-            <input
-              value={logQuery}
-              onChange={(e) => setLogQuery(e.target.value)}
-              placeholder="Search…"
-              className="w-full bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-md pl-8 pr-3 py-1 text-xs"
-            />
-          </div>
+          <SearchBox
+            value={logQuery}
+            onChange={setLogQuery}
+            placeholder="Search log…"
+            className="flex-1 sm:flex-none sm:w-56"
+          />
         </div>
 
         {/* Desktop / tablet table */}
@@ -1248,9 +1245,8 @@ function ItemPicker({
 
   const matches = useMemo(() => {
     if (!q.trim()) return items.slice(0, 30);
-    const ql = q.toLowerCase();
     return items.filter((i) =>
-      `${i.brand || ""} ${i.model} ${i.size} ${i.colour} ${i.item_code}`.toLowerCase().includes(ql)
+      matchesQuery(`${i.brand || ""} ${i.model} ${i.size} ${i.colour} ${i.item_code}`, q)
     ).slice(0, 30);
   }, [items, q]);
 

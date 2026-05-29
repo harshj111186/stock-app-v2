@@ -1,12 +1,13 @@
 "use client";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  Search, Loader2, Check, AlertCircle, Receipt, Plus, X,
+  Loader2, Check, AlertCircle, Receipt, Plus, X,
 } from "lucide-react";
 import { Shell } from "@/components/shell";
 import { useAuth } from "@/app/providers";
 import { sb, type Item, type Pricing } from "@/lib/supabase";
-import { fmtMoney } from "@/lib/utils";
+import { fmtMoney, matchesQuery } from "@/lib/utils";
+import { SearchBox } from "@/components/search-box";
 
 // Pricing values are stored as FRACTIONS in Supabase (0.18 = 18%, 0.15 = 15%)
 // but edited as plain percentages in the UI ("18", "15"). We convert at the
@@ -143,10 +144,8 @@ export default function PricingPage() {
     if (brandFilter && r.brand !== brandFilter) return false;
     if (catFilter && r.category !== catFilter) return false;
     if (onlyMissing && r.hasRow) return false;
-    if (q) {
-      const hay = `${r.brand || ""} ${r.model} ${r.size} ${r.colour} ${r.category || ""} ${r.subcategory || ""} ${r.item_code}`.toLowerCase();
-      if (!hay.includes(q.toLowerCase())) return false;
-    }
+    const hay = `${r.brand || ""} ${r.model} ${r.size} ${r.colour} ${r.category || ""} ${r.subcategory || ""} ${r.item_code}`;
+    if (!matchesQuery(hay, q)) return false;
     return true;
   }), [rows, q, brandFilter, catFilter, onlyMissing]);
 
@@ -262,14 +261,12 @@ export default function PricingPage() {
 
       {/* ─── Toolbar ────────────────────────────────────────────── */}
       <div className="flex flex-wrap gap-2 mb-4 items-center">
-        <div className="flex-1 min-w-[200px] relative">
-          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-zinc-500" />
-          <input
-            value={q} onChange={(e) => setQ(e.target.value)}
-            placeholder="Search items…"
-            className="w-full bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-md pl-9 pr-3 py-1.5 text-sm focus:outline-none focus:border-cyan-500"
-          />
-        </div>
+        <SearchBox
+          value={q}
+          onChange={setQ}
+          placeholder="Search — model, colour, size…"
+          className="flex-1 min-w-[200px]"
+        />
 
         <select value={brandFilter} onChange={(e) => setBrandFilter(e.target.value)}
           className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-md px-3 py-1.5 text-sm">

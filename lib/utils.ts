@@ -11,6 +11,28 @@ export const fmtN = (n: number | null | undefined) =>
 export const fmtMoney = (n: number | null | undefined) =>
   "₹" + Math.round(n ?? 0).toLocaleString("en-IN");
 
+// ─── search helpers ────────────────────────────────────────────────────
+// Normalise text for forgiving search: lowercase, turn every run of
+// non-alphanumeric chars (brackets, dots, dashes, slashes…) into a single
+// space, then trim. So "Phantom (BLDC) (WOOD)" → "phantom bldc wood".
+export function normalizeText(s: string | null | undefined): string {
+  return (s || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+// Multi-term AND search: every whitespace-separated term in `query` must
+// appear somewhere in `haystack`, after both are normalised. Order doesn't
+// matter and brackets are ignored, so one search box handles
+// "phantom wood antique" or "blue 1200 daisy" → the right item.
+export function matchesQuery(haystack: string, query: string): boolean {
+  const q = normalizeText(query);
+  if (!q) return true;
+  const hay = normalizeText(haystack);
+  return q.split(" ").every((term) => hay.includes(term));
+}
+
 // Colour name → CSS background + auto-contrast text
 const COLOUR_WORDS: Record<string, string | null> = {
   white: "#f6f6f4", ivory: "#fff8e7", cream: "#fdf6e3", pearl: "#eae0d5",
