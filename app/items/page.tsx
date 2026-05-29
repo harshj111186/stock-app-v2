@@ -876,86 +876,44 @@ function EditStockModal({
     setSaving(true);
     try {
       const c = sb();
-      const today = new Date().toISOString().slice(0, 10);
 
       // 1) Update case_size on items if it changed. Done first so the
-      //    Adjustment calls split the new total using the new case size.
-      let effectiveCs = oldCs;
+      //    apply_reconciliation calls below read the new case size when
+      //    they compute piece counts.
       if (csChanged) {
         const { error: e1 } = await c.from("items").update({ case_size: csN }).eq("id", item.id);
         if (e1) throw e1;
-        effectiveCs = csN;
       }
 
-      // 2) Refresh godown_stock RIGHT NOW so deltas come from the real
-      //    current state, not whatever the items page loaded earlier.
-      //    Without this, reconciliation runs (or any other write since
-      //    the page loaded) leave the modal showing stale numbers and
-      //    process_transaction errors with "Insufficient stock at
-      //    godown X (have N, need M)" because its server-side check
-      //    sees the fresher value.
-      const { data: freshStock, error: fsErr } = await c
-        .from("godown_stock")
-        .select("godown, cases, loose")
-        .eq("item_id", item.id);
-      if (fsErr) throw fsErr;
-      const freshA = freshStock?.find((s: any) => s.godown === "A") ?? { cases: 0, loose: 0 };
-      const freshB = freshStock?.find((s: any) => s.godown === "B") ?? { cases: 0, loose: 0 };
+      // 2) Set absolute physical values per godown via apply_reconciliation.
+      //    The RPC row-locks the godown_stock row, computes the delta from
+      //    the CURRENT db value (not whatever the items page loaded), logs
+      //    an Adjustment audit row when the piece total moved, and forces
+      //    cases/loose to exactly what the user typed. This replaces the
+      //    older process_transaction + reconcile_stock_split dance — single
+      //    atomic call, no stale-state races on retry.
+      const aTouched = aCN !== item.casesA || aLN !== item.looseA || csChanged;
+      const bTouched = bCN !== item.casesB || bLN !== item.looseB || csChanged;
 
-      const freshOldA = effectiveCs > 0 ? freshA.cases * effectiveCs + freshA.loose : freshA.loose;
-      const freshOldB = effectiveCs > 0 ? freshB.cases * effectiveCs + freshB.loose : freshB.loose;
-      const newA = effectiveCs > 0 ? aCN * effectiveCs + aLN : aLN;
-      const newB = effectiveCs > 0 ? bCN * effectiveCs + bLN : bLN;
-      const dA = newA - freshOldA;
-      const dB = newB - freshOldB;
-
-      // 3) Adjustment txns for the piece-level delta — gives the audit
-      //    log a row. process_transaction also moves godown_stock, but
-      //    step 4 below will override its cases/loose split with the
-      //    exact values the user typed.
-      if (dA !== 0) {
-        const { error: eA } = await c.rpc("process_transaction", {
-          p_item_id: item.id,
-          p_action: "Adjustment",
-          p_godown: "A",
-          p_qty: Math.abs(dA),
-          p_date: today,
-          p_note: reasonText,
-          p_direction: dA > 0 ? 1 : -1,
+      if (aTouched) {
+        const { error: eA } = await c.rpc("apply_reconciliation", {
+          p_item_id:      item.id,
+          p_godown:       "A",
+          p_target_cases: aCN,
+          p_target_loose: aLN,
+          p_reason:       reasonText,
         });
         if (eA) throw eA;
       }
-      if (dB !== 0) {
-        const { error: eB } = await c.rpc("process_transaction", {
-          p_item_id: item.id,
-          p_action: "Adjustment",
-          p_godown: "B",
-          p_qty: Math.abs(dB),
-          p_date: today,
-          p_note: reasonText,
-          p_direction: dB > 0 ? 1 : -1,
+      if (bTouched) {
+        const { error: eB } = await c.rpc("apply_reconciliation", {
+          p_item_id:      item.id,
+          p_godown:       "B",
+          p_target_cases: bCN,
+          p_target_loose: bLN,
+          p_reason:       reasonText,
         });
         if (eB) throw eB;
-      }
-
-      // 4) Force the cases/loose split to exactly what was typed.
-      //    Fires for any godown the user touched (or whose totals
-      //    shifted due to a case-size change). godown_stock RLS blocks
-      //    direct client writes, so we go through the SECURITY DEFINER
-      //    RPC.
-      const aTouched = aCN !== item.casesA || aLN !== item.looseA || csChanged;
-      const bTouched = bCN !== item.casesB || bLN !== item.looseB || csChanged;
-      if (aTouched) {
-        const { error: eSA } = await c.rpc("reconcile_stock_split", {
-          p_item_id: item.id, p_godown: "A", p_cases: aCN, p_loose: aLN,
-        });
-        if (eSA) throw eSA;
-      }
-      if (bTouched) {
-        const { error: eSB } = await c.rpc("reconcile_stock_split", {
-          p_item_id: item.id, p_godown: "B", p_cases: bCN, p_loose: bLN,
-        });
-        if (eSB) throw eSB;
       }
 
       await onSaved();

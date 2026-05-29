@@ -707,37 +707,22 @@ export default function ReconciliationPage() {
         }
       }
       for (const s of j.sides) {
-        if (s.diff !== 0) {
-          const direction: 1 | -1 = s.diff > 0 ? 1 : -1;
-          const { error } = await sb().rpc("process_transaction", {
-            p_item_id: j.itemId,
-            p_action: "Adjustment",
-            p_godown: s.godown,
-            p_qty: Math.abs(s.diff),
-            p_date: date,
-            p_note: `Reconciliation ${date}`,
-            p_direction: direction,
-          });
-          if (error) {
-            newErrors.push({ itemId: j.itemId, godown: s.godown, message: error.message });
-            failedItems.add(j.itemId);
-            done++; setProgress({ done, total: totalSteps });
-            continue;
-          }
-        }
-        // godown_stock has RLS that only the process_transaction
-        // SECURITY DEFINER path can satisfy — so we can't direct-upsert
-        // from the client. reconcile_stock_split is the sanctioned RPC
-        // (admin-gated inside the function body) that forces the
-        // cases/loose split to match the physical count.
-        const { error: upErr } = await sb().rpc("reconcile_stock_split", {
-          p_item_id: j.itemId,
-          p_godown:  s.godown,
-          p_cases:   s.physCases,
-          p_loose:   s.physLoose,
+        // apply_reconciliation: single atomic call that row-locks the
+        // godown_stock row, computes the delta from the CURRENT db
+        // value (so retries don't double-count if the page is stale),
+        // logs an Adjustment when the piece total moved, and forces
+        // the cases/loose split to the absolute values the user typed.
+        // s.diff / s.physCases / s.physLoose come from the page state
+        // for display only; the server is the source of truth.
+        const { error } = await sb().rpc("apply_reconciliation", {
+          p_item_id:      j.itemId,
+          p_godown:       s.godown,
+          p_target_cases: s.physCases,
+          p_target_loose: s.physLoose,
+          p_reason:       `Reconciliation ${date}`,
         });
-        if (upErr) {
-          newErrors.push({ itemId: j.itemId, godown: s.godown, message: `Split sync failed: ${upErr.message}` });
+        if (error) {
+          newErrors.push({ itemId: j.itemId, godown: s.godown, message: error.message });
           failedItems.add(j.itemId);
         }
         done++; setProgress({ done, total: totalSteps });
