@@ -230,6 +230,22 @@ If you must touch one of these files: **read first, edit surgically, never repla
 
 ## 11. Changelog (latest first — add new entries at the top)
 
+### 2026-05-29 — Master key (unlock any account except the super-admin)
+
+**User ask:** "a master key option which can unlock any account except main master account."
+
+A super-admin-set shared secret that satisfies the PIN gate for ANY account except harsh's super-admin (main master) account — for forgotten PINs / shared devices / oversight.
+
+- **`db/2026-05-29-master-key.sql`** — new `app_config` one-row table (RLS on, zero client grants → only the SECURITY DEFINER fns touch it). RPCs: `set_master_key` / `clear_master_key` (super-admin only), `master_key_is_set` (boolean for the UI), `verify_master_key` (returns false for a super-admin session; clears the caller's PIN lockout on success). Bcrypt via `extensions.crypt`; depends on `_is_super_admin` from the PIN-auth migration. **The "except main master account" rule is enforced in SQL, not just UI.** Must be run in Supabase before the feature works.
+- **`components/pin-gate.tsx`** — enter mode shows an "Unlock with master key" link (only on non-super accounts, only when a key is set) → password input → `verify_master_key`. New `isSuperAdmin` prop (passed from `providers.tsx`) hides the option on harsh's own gate.
+- **`app/settings/page.tsx`** — super-admin-only `MasterKeyCard` to set / change / remove the key (≥4 chars), with a Set/Not-set indicator.
+
+Pre-SQL it's inert for everyone (the gate option needs a key set; the Settings card is harsh-only). After running the SQL, harsh sets the key in Settings → it unlocks any staff/admin PIN gate.
+
+Follow-up idea: per-attempt rate-limit on `verify_master_key` (currently relies on the key being longer than a 4-digit PIN); fine for a 6-user shop.
+
+---
+
 ### 2026-05-29 — Bold premium reskin + dashboard + item CRUD + category tree
 
 **User ask:** Deep-dive the whole app; remove unwanted/dead buttons; make it a premium, lightweight, mobile-AND-web app; add an item page where you can add/remove/edit items (applying across both godowns); make categories nestable to unlimited depth (Company › Category › Sub › …) so items save category-wise; better dashboard. Chosen options: full nested category tree, push-to-live as I go, bolder reskin.
