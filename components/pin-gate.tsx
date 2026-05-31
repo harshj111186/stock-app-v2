@@ -25,17 +25,25 @@ export function PinGate({
   email,
   onUnlocked,
   onSignOut,
+  isSuperAdmin = false,
 }: {
   mode: Mode;
   email: string;
   onUnlocked: () => void;
   onSignOut: () => void;
+  // The super-admin's own gate never offers the master key (it can't unlock
+  // the main master account anyway — enforced server-side too).
+  isSuperAdmin?: boolean;
 }) {
   const [pin, setPin] = useState("");
   const [confirmPin, setConfirmPin] = useState("");
   const [step, setStep] = useState<"first" | "confirm">("first");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  // Master-key unlock (enter mode, non-super accounts only).
+  const [masterMode, setMasterMode] = useState(false);
+  const [masterKey, setMasterKey] = useState("");
+  const [masterKeySet, setMasterKeySet] = useState(false);
 
   // Reset state when mode flips (e.g. user finished setting, now we re-render
   // to a different gate state and unmount this — but be safe).
@@ -44,7 +52,21 @@ export function PinGate({
     setConfirmPin("");
     setStep("first");
     setErr(null);
+    setMasterMode(false);
+    setMasterKey("");
   }, [mode]);
+
+  // Offer the master-key option only when one exists AND this isn't the
+  // super-admin's own gate.
+  useEffect(() => {
+    if (mode !== "enter" || isSuperAdmin) { setMasterKeySet(false); return; }
+    let cancelled = false;
+    sb().rpc("master_key_is_set").then(
+      ({ data }) => { if (!cancelled) setMasterKeySet(data === true); },
+      () => {},
+    );
+    return () => { cancelled = true; };
+  }, [mode, isSuperAdmin]);
 
   const submit = async (finalPin: string) => {
     setErr(null);
@@ -88,6 +110,25 @@ export function PinGate({
     }
   };
 
+  // Master-key unlock — verifies the shared key (server refuses it for the
+  // super-admin's own account) and clears any lockout on success.
+  const submitMaster = async () => {
+    const key = masterKey.trim();
+    if (!key) { setErr("Enter the master key."); return; }
+    setErr(null);
+    setBusy(true);
+    try {
+      const { data, error } = await sb().rpc("verify_master_key", { p_key: key });
+      if (error) { setErr(error.message || "Master key check failed"); return; }
+      if (data === true) { onUnlocked(); }
+      else { setErr("Master key incorrect."); setMasterKey(""); }
+    } catch (e: unknown) {
+      setErr(e instanceof Error ? e.message : "Something went wrong");
+    } finally {
+      setBusy(false);
+    }
+  };
+
   // Called by PinInput when 4 digits are filled.
   const handleComplete = async (value: string) => {
     if (mode === "enter") {
@@ -113,17 +154,17 @@ export function PinGate({
     await submit(value);
   };
 
-  const title = mode === "enter"
-    ? "Enter your PIN"
-    : step === "first"
-      ? "Set a 4-digit PIN"
-      : "Confirm your PIN";
+  const title = mode === "set"
+    ? (step === "first" ? "Set a 4-digit PIN" : "Confirm your PIN")
+    : masterMode ? "Enter master key" : "Enter your PIN";
 
-  const sub = mode === "enter"
-    ? "Type the 4-digit PIN you set when you signed up."
-    : step === "first"
-      ? "You'll use this PIN every time you open the app. Pick something you'll remember — admin can reset it but won't see it."
-      : "Type it again to confirm.";
+  const sub = mode === "set"
+    ? (step === "first"
+        ? "You'll use this PIN every time you open the app. Pick something you'll remember — admin can reset it but won't see it."
+        : "Type it again to confirm.")
+    : masterMode
+      ? "Unlock this account with the shared master key."
+      : "Type the 4-digit PIN you set when you signed up.";
 
   return (
     <div className="min-h-screen flex items-center justify-center px-4 bg-zinc-50 dark:bg-zinc-950">
@@ -142,11 +183,35 @@ export function PinGate({
 
         <p className="text-xs text-zinc-500 mb-5 leading-relaxed">{sub}</p>
 
-        <PinInput
-          key={`${mode}-${step}`}            // remount → fresh blank inputs on step change
-          onComplete={handleComplete}
-          disabled={busy}
-        />
+        {mode === "enter" && masterMode ? (
+          <form onSubmit={(e) => { e.preventDefault(); void submitMaster(); }}>
+            <input
+              type="password"
+              autoFocus
+              value={masterKey}
+              onChange={(e) => setMasterKey(e.target.value)}
+              placeholder="Master key"
+              disabled={busy}
+              autoComplete="off"
+              className="w-full bg-zinc-50 dark:bg-zinc-800 border-2 border-zinc-200 dark:border-zinc-700 rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:border-cyan-500 disabled:opacity-50"
+              aria-label="Master key"
+            />
+            <button
+              type="submit"
+              disabled={busy || !masterKey.trim()}
+              className="mt-3 w-full bg-cyan-500 hover:bg-cyan-400 disabled:opacity-40 disabled:cursor-not-allowed text-white rounded-md py-2 text-sm font-medium inline-flex items-center justify-center gap-1.5"
+            >
+              {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <KeyRound className="w-4 h-4" />}
+              Unlock
+            </button>
+          </form>
+        ) : (
+          <PinInput
+            key={`${mode}-${step}`}            // remount → fresh blank inputs on step change
+            onComplete={handleComplete}
+            disabled={busy}
+          />
+        )}
 
         {err && (
           <div className="mt-3 text-xs text-rose-500 bg-rose-500/10 border border-rose-500/20 rounded px-3 py-2 flex items-start gap-2">
@@ -154,17 +219,28 @@ export function PinGate({
             <span className="min-w-0 break-words">{err}</span>
           </div>
         )}
-        {busy && (
+        {busy && !masterMode && (
           <div className="mt-3 text-xs text-zinc-500 flex items-center gap-2">
             <Loader2 className="w-3.5 h-3.5 animate-spin" />
             {mode === "enter" ? "Checking…" : "Saving PIN…"}
           </div>
         )}
 
-        {mode === "enter" && (
+        {mode === "enter" && !masterMode && (
           <div className="mt-5 text-[11px] text-zinc-500 text-center leading-relaxed">
             Forgot your PIN? Ask an admin to reset it — they can clear it for you on the Users page.
           </div>
+        )}
+
+        {mode === "enter" && masterKeySet && (
+          <button
+            type="button"
+            onClick={() => { setErr(null); setMasterKey(""); setMasterMode(m => !m); }}
+            className="mt-3 w-full text-[11px] text-cyan-600 dark:text-cyan-400 hover:underline inline-flex items-center justify-center gap-1.5"
+          >
+            <KeyRound className="w-3 h-3" />
+            {masterMode ? "Use my PIN instead" : "Unlock with master key"}
+          </button>
         )}
 
         <button

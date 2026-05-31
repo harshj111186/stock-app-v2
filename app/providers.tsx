@@ -260,6 +260,7 @@ export function Providers({ children }: { children: ReactNode }) {
         <PinGate
           mode="enter"
           email={profile.email}
+          isSuperAdmin={profile.is_super_admin}
           onUnlocked={() => {
             markPinUnlocked(profile.id);
             setPinTick(t => t + 1);

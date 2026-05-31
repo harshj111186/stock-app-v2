@@ -2,7 +2,7 @@
 import { Shell } from "@/components/shell";
 import { useAuth } from "@/app/providers";
 import { useInstall } from "@/components/install-provider";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { sb } from "@/lib/supabase";
 import Link from "next/link";
 import {
@@ -42,6 +42,8 @@ export default function SettingsPage() {
         )}
 
         <ChangePinCard />
+
+        {profile?.is_super_admin && <MasterKeyCard />}
 
         <InstallCard />
 
@@ -186,6 +188,122 @@ function PinField({
         autoComplete="off"
         className="w-full bg-zinc-50 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-cyan-500 tnum tracking-[0.4em] text-center"
       />
+    </div>
+  );
+}
+
+// ─── Master key (super-admin only) ──────────────────────────────────────────
+// A shared secret that satisfies the PIN gate for ANY account except this main
+// master account. Set / changed / removed here; verified at the gate via the
+// verify_master_key RPC (which refuses the super-admin's own session).
+function MasterKeyCard() {
+  const [isSet, setIsSet] = useState<boolean | null>(null);
+  const [keyVal, setKeyVal] = useState("");
+  const [confirmVal, setConfirmVal] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState<{ kind: "ok" | "bad"; text: string } | null>(null);
+
+  const refresh = async () => {
+    try {
+      const { data } = await sb().rpc("master_key_is_set");
+      setIsSet(data === true);
+    } catch {
+      setIsSet(null);
+    }
+  };
+  useEffect(() => { void refresh(); }, []);
+
+  const save = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setMsg(null);
+    if (keyVal.trim().length < 4) { setMsg({ kind: "bad", text: "Master key must be at least 4 characters." }); return; }
+    if (keyVal !== confirmVal) { setMsg({ kind: "bad", text: "The two entries don't match." }); return; }
+    setBusy(true);
+    try {
+      const { error } = await sb().rpc("set_master_key", { p_key: keyVal.trim() });
+      if (error) { setMsg({ kind: "bad", text: error.message || "Couldn't save master key" }); return; }
+      setMsg({ kind: "ok", text: "Master key saved — it now unlocks any account except yours." });
+      setKeyVal(""); setConfirmVal(""); void refresh();
+    } catch (e: any) {
+      setMsg({ kind: "bad", text: e?.message || "Something went wrong" });
+    } finally { setBusy(false); }
+  };
+
+  const remove = async () => {
+    if (!window.confirm("Remove the master key? Nobody will be able to use it to unlock accounts until you set a new one.")) return;
+    setBusy(true); setMsg(null);
+    try {
+      const { error } = await sb().rpc("clear_master_key");
+      if (error) { setMsg({ kind: "bad", text: error.message || "Couldn't remove the master key" }); return; }
+      setMsg({ kind: "ok", text: "Master key removed." });
+      void refresh();
+    } catch (e: any) {
+      setMsg({ kind: "bad", text: e?.message || "Something went wrong" });
+    } finally { setBusy(false); }
+  };
+
+  return (
+    <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg p-5">
+      <div className="flex items-center gap-2 mb-3">
+        <KeyRound className="w-3.5 h-3.5 text-cyan-500" />
+        <div className="text-xs text-zinc-500 uppercase tracking-wider">Master key</div>
+        {isSet !== null && (
+          <span className={`ml-auto text-[10px] px-1.5 py-0.5 rounded ${isSet ? "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400" : "bg-zinc-200/70 dark:bg-zinc-800 text-zinc-500"}`}>
+            {isSet ? "Set" : "Not set"}
+          </span>
+        )}
+      </div>
+      <p className="text-xs text-zinc-500 mb-4 leading-relaxed">
+        A shared key that can unlock <b>any account's</b> PIN screen — handy for forgotten PINs or shared devices.
+        It can <b>never</b> unlock your own super-admin account. Stored encrypted; only you can set it. Use at least
+        4 characters (longer is safer).
+      </p>
+
+      <form onSubmit={save} className="space-y-3">
+        <div>
+          <div className="text-[11px] uppercase tracking-wider text-zinc-500 font-medium mb-1.5">{isSet ? "New master key" : "Master key"}</div>
+          <input
+            type="password" value={keyVal} onChange={(e) => setKeyVal(e.target.value)} autoComplete="off"
+            className="w-full bg-zinc-50 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-cyan-500"
+          />
+        </div>
+        <div>
+          <div className="text-[11px] uppercase tracking-wider text-zinc-500 font-medium mb-1.5">Confirm</div>
+          <input
+            type="password" value={confirmVal} onChange={(e) => setConfirmVal(e.target.value)} autoComplete="off"
+            className="w-full bg-zinc-50 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-cyan-500"
+          />
+        </div>
+
+        {msg && (
+          <div className={[
+            "text-xs rounded px-3 py-2 flex items-start gap-2",
+            msg.kind === "ok"
+              ? "bg-emerald-500/10 border border-emerald-500/20 text-emerald-600 dark:text-emerald-300"
+              : "bg-rose-500/10 border border-rose-500/20 text-rose-500",
+          ].join(" ")}>
+            {msg.kind === "ok" ? <CheckCircle2 className="w-3.5 h-3.5 mt-0.5 shrink-0" /> : <AlertCircle className="w-3.5 h-3.5 mt-0.5 shrink-0" />}
+            <span className="min-w-0 break-words">{msg.text}</span>
+          </div>
+        )}
+
+        <div className="flex items-center gap-2">
+          <button
+            type="submit"
+            disabled={busy || !keyVal || !confirmVal}
+            className="bg-cyan-500 hover:bg-cyan-400 disabled:opacity-40 disabled:cursor-not-allowed text-white px-4 py-2 rounded-md text-sm font-medium inline-flex items-center gap-2"
+          >
+            {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <KeyRound className="w-4 h-4" />}
+            {isSet ? "Update master key" : "Set master key"}
+          </button>
+          {isSet && (
+            <button type="button" onClick={remove} disabled={busy}
+              className="text-sm text-rose-600 dark:text-rose-400 hover:bg-rose-500/10 px-3 py-2 rounded-md disabled:opacity-40">
+              Remove
+            </button>
+          )}
+        </div>
+      </form>
     </div>
   );
 }
