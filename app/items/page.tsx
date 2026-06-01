@@ -813,12 +813,12 @@ function Empty() {
   );
 }
 
-// ─── manual stock-override modal ──────────────────────────────────────────
-// Lets the user fix discrepancies between system stock and physical count.
-// Writes one or two Adjustment transactions (one per godown that changed)
-// via process_transaction() so the audit trail is intact. Case size
-// (which lives on the items table, not godown_stock) is updated separately
-// via a plain UPDATE — admin only, because of items-table RLS.
+// ─── count-correction modal ───────────────────────────────────────────────
+// Sets each godown's ABSOLUTE physical count (cases/loose) — the entered
+// values become the new stock, not a delta on top. One apply_reconciliation
+// call per godown sets the value and logs an Adjustment when the total moved.
+// Case size (on items, not godown_stock) is updated separately via a plain
+// UPDATE — admin only, because of items-table RLS.
 function EditStockModal({
   item, isAdmin, onClose, onSaved, onEditDetails,
 }: {
@@ -834,8 +834,6 @@ function EditStockModal({
   const [aLoose, setALoose] = useState(String(item.looseA));
   const [bCases, setBCases] = useState(String(item.casesB));
   const [bLoose, setBLoose] = useState(String(item.looseB));
-  const [reason, setReason] = useState("count correction");
-  const [reasonOther, setReasonOther] = useState("");
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -856,14 +854,10 @@ function EditStockModal({
   const csChanged = csN !== oldCs;
   const nothingChanged = !csChanged && deltaA === 0 && deltaB === 0;
 
-  // chosen reason text to write to the ledger
-  const reasonText = reason === "other" ? reasonOther.trim() : reason;
-
   const onlyDigits = (s: string) => s.replace(/[^\d]/g, "");
 
   async function save() {
     if (nothingChanged) { setError("Nothing to save — change at least one value."); return; }
-    if (!reasonText) { setError("Please provide a reason."); return; }
     if (csChanged && !isAdmin) {
       setError("Only admins can change case size. Ask an admin, or untouch the case size field.");
       return;
@@ -898,7 +892,7 @@ function EditStockModal({
           p_godown:       "A",
           p_target_cases: aCN,
           p_target_loose: aLN,
-          p_reason:       reasonText,
+          p_reason:       "Count correction",
         });
         if (eA) throw eA;
       }
@@ -908,7 +902,7 @@ function EditStockModal({
           p_godown:       "B",
           p_target_cases: bCN,
           p_target_loose: bLN,
-          p_reason:       reasonText,
+          p_reason:       "Count correction",
         });
         if (eB) throw eB;
       }
@@ -936,7 +930,7 @@ function EditStockModal({
         {/* Header */}
         <div className="px-5 py-4 border-b border-zinc-200 dark:border-zinc-800 flex items-start justify-between gap-4 flex-shrink-0">
           <div className="min-w-0">
-            <h2 className="text-base font-semibold">Manual stock override</h2>
+            <h2 className="text-base font-semibold">Count correction</h2>
             <p className="text-xs text-zinc-500 mt-0.5 truncate">
               {item.brand && <span>{item.brand} · </span>}{item.model} · {item.size} · {item.colour}
               <span className="text-zinc-400"> · {item.item_code}</span>
@@ -966,9 +960,8 @@ function EditStockModal({
         {/* Body — scrolls within the modal so header+footer stay anchored */}
         <div className="p-5 space-y-5 overflow-y-auto flex-1">
           <div className="bg-amber-50 dark:bg-amber-500/10 border border-amber-200 dark:border-amber-500/30 rounded-md p-3 text-[12px] text-amber-800 dark:text-amber-200 leading-relaxed">
-            Use this only to <b>fix discrepancies</b> between the system and the actual physical count.
-            For everyday Purchase / Sale / Transfer, use the Transactions page instead.
-            Saving here writes an <b>Adjustment</b> entry per godown so the audit log is preserved.
+            Type the <b>actual physical count</b> for each godown — these are the <b>final</b> values the stock is set to, not added on top.
+            For everyday Purchase / Sale / Transfer, use the Transactions page. Each change is logged as a correction.
           </div>
 
           {/* Case size */}
@@ -1003,33 +996,6 @@ function EditStockModal({
             />
           </div>
 
-          {/* Reason */}
-          <div>
-            <Label>Reason (saved to the audit log)</Label>
-            <select
-              value={reason}
-              onChange={(e) => setReason(e.target.value)}
-              className="w-full bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-cyan-500"
-            >
-              <option value="count correction">Count correction</option>
-              <option value="damage">Damage</option>
-              <option value="lost">Lost</option>
-              <option value="found">Found</option>
-              <option value="theft">Theft</option>
-              <option value="data-entry fix">Data-entry fix</option>
-              <option value="other">Other…</option>
-            </select>
-            {reason === "other" && (
-              <input
-                type="text"
-                placeholder="Describe the reason…"
-                value={reasonOther}
-                onChange={(e) => setReasonOther(e.target.value)}
-                className="mt-2 w-full bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-cyan-500"
-              />
-            )}
-          </div>
-
           {error && (
             <div className="text-sm text-rose-600 dark:text-rose-300 bg-rose-500/10 border border-rose-500/30 rounded-md p-2.5 flex items-start gap-2">
               <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
@@ -1046,7 +1012,7 @@ function EditStockModal({
           <div className="text-[11px] text-zinc-500 w-full sm:w-auto sm:flex-1 min-w-0">
             {nothingChanged
               ? "No changes yet."
-              : `Will write ${[csChanged && "case-size update", deltaA !== 0 && "A adjustment", deltaB !== 0 && "B adjustment"].filter(Boolean).join(" + ")}.`}
+              : `Will set ${[csChanged && "case size", deltaA !== 0 && "Stock A", deltaB !== 0 && "Stock B"].filter(Boolean).join(" + ")}.`}
           </div>
           <div className="flex gap-2 ml-auto">
             <button
