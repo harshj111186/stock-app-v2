@@ -4,11 +4,11 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { sb, type Profile, PROFILE_COLUMNS } from "@/lib/supabase";
 import { useAuth } from "@/app/providers";
 import {
-  Shield, CheckCircle2, KeyRound, UserMinus, UserCheck, Pencil,
+  Shield, CheckCircle2, KeyRound, UserMinus, UserCheck, UserX, Pencil,
   Loader2, AlertCircle, ShieldCheck, Clock, Users,
 } from "lucide-react";
 
-type Action = "approve" | "reset" | "deactivate" | "reactivate" | "role" | "name";
+type Action = "approve" | "reset" | "deactivate" | "reactivate" | "role" | "name" | "reject" | "unreject";
 type Busy = { id: string; action: Action } | null;
 
 export default function UsersPage() {
@@ -77,6 +77,14 @@ export default function UsersPage() {
   const reactivate = (u: Profile) =>
     runRpc("admin_set_active", { p_user_id: u.id, p_active: true }, `Reactivated ${u.email}`, u.id, "reactivate");
 
+  const reject = (u: Profile) => {
+    if (!confirm(`Reject ${u.email}'s signup? They won't be able to sign in. You can undo this from the Rejected list.`)) return;
+    runRpc("admin_reject_user", { p_user_id: u.id, p_rejected: true }, `Rejected ${u.email}`, u.id, "reject");
+  };
+
+  const unreject = (u: Profile) =>
+    runRpc("admin_reject_user", { p_user_id: u.id, p_rejected: false }, `Moved ${u.email} back to pending`, u.id, "unreject");
+
   const setRole = (u: Profile, role: Profile["role"]) =>
     runRpc("admin_set_role", { p_user_id: u.id, p_new_role: role }, `Set ${u.email} to ${role}`, u.id, "role");
 
@@ -89,9 +97,10 @@ export default function UsersPage() {
   };
 
   // ─── Derived buckets ────────────────────────────────────────────────────
-  const pending = useMemo(() => users.filter(u => !u.approved_at), [users]);
+  const pending = useMemo(() => users.filter(u => !u.approved_at && !u.rejected_at), [users]);
   const active = useMemo(() => users.filter(u => u.approved_at && u.active), [users]);
   const deactivated = useMemo(() => users.filter(u => u.approved_at && !u.active), [users]);
+  const rejected = useMemo(() => users.filter(u => !!u.rejected_at), [users]);
 
   // ─── Access check ───────────────────────────────────────────────────────
   if (me?.role !== "admin") {
@@ -128,7 +137,7 @@ export default function UsersPage() {
         <h1 className="text-xl sm:text-2xl font-semibold tracking-tight">Users</h1>
         <p className="text-sm text-zinc-500 mt-1 tabular-nums">
           {loaded
-            ? <>{users.length} total · {pending.length} pending · {active.length} active · {deactivated.length} deactivated</>
+            ? <>{users.length} total · {pending.length} pending · {active.length} active · {deactivated.length} deactivated{rejected.length > 0 ? <> · {rejected.length} rejected</> : null}</>
             : "Loading…"}
         </p>
       </div>
@@ -159,17 +168,30 @@ export default function UsersPage() {
                       {u.created_at ? new Date(u.created_at).toLocaleDateString("en-IN") : "—"}
                     </td>
                     <td className="px-5 py-2.5 text-right">
-                      <button
-                        type="button"
-                        onClick={() => approve(u)}
-                        disabled={busy?.id === u.id}
-                        className="bg-emerald-500 hover:bg-emerald-400 disabled:opacity-40 text-white px-3 py-1.5 rounded-md text-xs font-medium inline-flex items-center gap-1.5"
-                      >
-                        {busy?.id === u.id && busy.action === "approve"
-                          ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                          : <CheckCircle2 className="w-3.5 h-3.5" />}
-                        Approve
-                      </button>
+                      <div className="inline-flex items-center gap-3">
+                        <button
+                          type="button"
+                          onClick={() => approve(u)}
+                          disabled={busy?.id === u.id}
+                          className="bg-emerald-500 hover:bg-emerald-400 disabled:opacity-40 text-white px-3 py-1.5 rounded-md text-xs font-medium inline-flex items-center gap-1.5"
+                        >
+                          {busy?.id === u.id && busy.action === "approve"
+                            ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                            : <CheckCircle2 className="w-3.5 h-3.5" />}
+                          Approve
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => reject(u)}
+                          disabled={busy?.id === u.id}
+                          className="text-xs text-zinc-500 hover:text-rose-500 disabled:opacity-40 inline-flex items-center gap-1"
+                        >
+                          {busy?.id === u.id && busy.action === "reject"
+                            ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                            : <UserX className="w-3.5 h-3.5" />}
+                          Reject
+                        </button>
+                      </div>
                     </td>
                   </tr>
                 ))}
@@ -194,6 +216,17 @@ export default function UsersPage() {
                     ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
                     : <CheckCircle2 className="w-3.5 h-3.5" />}
                   Approve {u.email}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => reject(u)}
+                  disabled={busy?.id === u.id}
+                  className="mt-2 w-full text-xs text-rose-600 dark:text-rose-400 bg-rose-500/10 hover:bg-rose-500/20 disabled:opacity-40 px-3 py-2 rounded-md inline-flex items-center justify-center gap-1.5"
+                >
+                  {busy?.id === u.id && busy.action === "reject"
+                    ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    : <UserX className="w-3.5 h-3.5" />}
+                  Reject
                 </button>
               </li>
             ))}
@@ -310,6 +343,98 @@ export default function UsersPage() {
                 </li>
               );
             })}
+          </ul>
+        </section>
+      )}
+
+      {/* ── Rejected bucket ─────────────────────────────────────────────── */}
+      {rejected.length > 0 && (
+        <section className="mt-6">
+          <div className="flex items-center gap-2 mb-2">
+            <UserX className="w-4 h-4 text-rose-500" />
+            <h2 className="text-sm font-medium text-zinc-500">Rejected ({rejected.length})</h2>
+          </div>
+
+          {/* Desktop */}
+          <div className="hidden md:block bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg overflow-hidden">
+            <table className="w-full text-sm">
+              <thead className="bg-zinc-50 dark:bg-zinc-900/50 border-b border-zinc-200 dark:border-zinc-800">
+                <tr className="text-zinc-500 text-[11px] uppercase tracking-wider">
+                  <th className="text-left px-5 py-2.5 font-medium">Email</th>
+                  <th className="text-left px-3 py-2.5 font-medium">Rejected</th>
+                  <th className="text-right px-5 py-2.5 font-medium">Action</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rejected.map(u => (
+                  <tr key={u.id} className="border-t border-zinc-200/50 dark:border-zinc-800/50">
+                    <td className="px-5 py-2.5 text-zinc-500 line-through">{u.email}</td>
+                    <td className="px-3 py-2.5 text-zinc-500 tnum text-xs">
+                      {u.rejected_at ? new Date(u.rejected_at).toLocaleDateString("en-IN") : "—"}
+                    </td>
+                    <td className="px-5 py-2.5 text-right">
+                      <div className="inline-flex items-center gap-3">
+                        <button
+                          type="button"
+                          onClick={() => approve(u)}
+                          disabled={busy?.id === u.id}
+                          className="bg-emerald-500 hover:bg-emerald-400 disabled:opacity-40 text-white px-3 py-1.5 rounded-md text-xs font-medium inline-flex items-center gap-1.5"
+                        >
+                          {busy?.id === u.id && busy.action === "approve"
+                            ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                            : <CheckCircle2 className="w-3.5 h-3.5" />}
+                          Approve
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => unreject(u)}
+                          disabled={busy?.id === u.id}
+                          className="text-xs text-zinc-500 hover:text-cyan-500 disabled:opacity-40 inline-flex items-center gap-1"
+                        >
+                          {busy?.id === u.id && busy.action === "unreject"
+                            ? <Loader2 className="w-3 h-3 animate-spin" />
+                            : <Clock className="w-3 h-3" />}
+                          Move to pending
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          {/* Mobile */}
+          <ul className="md:hidden bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-2xl overflow-hidden shadow-sm divide-y divide-zinc-200/60 dark:divide-zinc-800/60">
+            {rejected.map(u => (
+              <li key={u.id} className="px-4 py-3">
+                <div className="text-sm text-zinc-500 line-through truncate mb-2">{u.email}</div>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => approve(u)}
+                    disabled={busy?.id === u.id}
+                    className="flex-1 bg-emerald-500 hover:bg-emerald-400 disabled:opacity-40 text-white px-3 py-2 rounded-md text-xs font-medium inline-flex items-center justify-center gap-1.5"
+                  >
+                    {busy?.id === u.id && busy.action === "approve"
+                      ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      : <CheckCircle2 className="w-3.5 h-3.5" />}
+                    Approve
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => unreject(u)}
+                    disabled={busy?.id === u.id}
+                    className="flex-1 text-xs text-zinc-700 dark:text-zinc-200 bg-zinc-100 dark:bg-zinc-800 hover:bg-zinc-200 dark:hover:bg-zinc-700 disabled:opacity-40 px-3 py-2 rounded-md inline-flex items-center justify-center gap-1.5"
+                  >
+                    {busy?.id === u.id && busy.action === "unreject"
+                      ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      : <Clock className="w-3.5 h-3.5" />}
+                    To pending
+                  </button>
+                </div>
+              </li>
+            ))}
           </ul>
         </section>
       )}

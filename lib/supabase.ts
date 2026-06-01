@@ -113,6 +113,10 @@ export type Profile = {
   pin_attempts: number;
   pin_locked_until: string | null;
   created_at: string;
+  // A rejected pending signup: rejected_at set, approved_at still null →
+  // hidden from Pending, blocked from signing in (reversible by an admin).
+  rejected_at: string | null;
+  rejected_by: string | null;
 };
 
 // Use this with .select(...) instead of .select("*") on user_profiles.
@@ -124,4 +128,4 @@ export type Profile = {
 // the client to see. Explicit column list = pin_hash isn't requested =
 // query succeeds with everything we actually need.
 export const PROFILE_COLUMNS =
-  "id, email, name, role, active, is_super_admin, approved_at, approved_by, pin_set_at, pin_attempts, pin_locked_until, created_at";
+  "id, email, name, role, active, is_super_admin, approved_at, approved_by, pin_set_at, pin_attempts, pin_locked_until, created_at, rejected_at, rejected_by";
