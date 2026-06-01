@@ -230,6 +230,21 @@ If you must touch one of these files: **read first, edit surgically, never repla
 
 ## 11. Changelog (latest first — add new entries at the top)
 
+### 2026-05-29 — Master PASSWORD at login (Edge Function)
+
+**User ask:** after the PIN-gate master key, "a master password which when entered for any role except super admin, it should open the account and bypass the pin." They'd typed an employee email + the master password at the *login* screen and got "invalid credentials" — because the PIN-gate master key only runs *after* a successful Supabase login.
+
+To log into an account WITHOUT its real password you must mint a session with the service-role key, which can't ship in a static site — so this is the first server-side piece in the project: a Supabase **Edge Function**.
+
+- **`db/2026-05-29-master-login.sql`** — `master_login_resolve(email, key)`: verifies the key against `app_config`, refuses the super-admin / inactive / unapproved accounts, returns the target `user_id`. **Granted only to `service_role`** (revoked from authenticated/anon) so the browser can't use it as a key oracle.
+- **`supabase/functions/master-login/index.ts`** — Edge Function: calls the resolver with the service key, then mints a session via `auth.admin.generateLink({type:'magiclink'})` → `verifyOtp({token_hash})`, returns `{access_token, refresh_token, user_id}`. Uses the auto-injected `SUPABASE_*` env. **Must be deployed** (dashboard paste or `supabase functions deploy master-login`).
+- **`app/login/page.tsx`** — on a failed sign-in (sign-in mode only) it calls `master-login`; on success `setSession()` + `markPinUnlocked(user_id)` + hard-nav home (so the PIN is skipped). Normal login is untouched; if the function/SQL/key aren't in place the attempt silently no-ops and the normal error shows.
+- **`tsconfig.json`** — excludes `supabase/functions` (Deno + URL imports) from the Next type-check.
+
+Activation: run the SQL → deploy the Edge Function → set the master key in Settings. **Security:** this is a remote skeleton key to every non-owner account — keep it long + secret. Possible hardening later: rate-limit `master-login`, or scope which accounts it can open.
+
+---
+
 ### 2026-05-29 — Master key (unlock any account except the super-admin)
 
 **User ask:** "a master key option which can unlock any account except main master account."
