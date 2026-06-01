@@ -230,6 +230,19 @@ If you must touch one of these files: **read first, edit surgically, never repla
 
 ## 11. Changelog (latest first — add new entries at the top)
 
+### 2026-05-29 — Reject a pending signup
+
+**User ask:** "add the option to reject the approval for user sign ups." Admins could only Approve; pending signups otherwise sat forever (a gap flagged in the PIN-auth follow-ups).
+
+Soft + reversible reject (no auth-account deletion → no service-role/Edge Function needed):
+- **`db/2026-05-29-reject-signup.sql`** — `rejected_at` / `rejected_by` columns (added to the authenticated SELECT whitelist), `admin_reject_user(p_user_id, p_rejected)` to set/clear it (super-admin protected; reject also sets active=false), and `admin_approve_user` now clears the rejected flag too. Run in Supabase to enable.
+- **`lib/supabase.ts`** — `Profile` + `PROFILE_COLUMNS` gain the two columns.
+- **`app/users/page.tsx`** — "Reject" button in the Pending bucket (desktop + mobile); new "Rejected" bucket with Approve / "Move to pending". Bucketing: pending = `!approved_at && !rejected_at`, rejected = `rejected_at` set. The existing gate (needs `approved_at`) already blocks rejected users — `rejected_at` just moves them out of Pending + makes it explicit/reversible.
+
+Follow-up idea: a hard "delete account" (frees the email for re-signup) would be a small Edge Function using `auth.admin.deleteUser` — the master-login function shows the pattern. Not built; soft reject covers the ask.
+
+---
+
 ### 2026-05-29 — Master PASSWORD at login (Edge Function)
 
 **User ask:** after the PIN-gate master key, "a master password which when entered for any role except super admin, it should open the account and bypass the pin." They'd typed an employee email + the master password at the *login* screen and got "invalid credentials" — because the PIN-gate master key only runs *after* a successful Supabase login.
