@@ -230,6 +230,19 @@ If you must touch one of these files: **read first, edit surgically, never repla
 
 ## 11. Changelog (latest first — add new entries at the top)
 
+### 2026-06-01 — Persistent transaction queue + actor name in history
+
+**User ask:** (1) a queued-but-unprocessed batch should survive an employee leaving the app and be there when they return; (2) the transaction history + audit log should show the **name** of the user who made each transaction / adjustment / direct item edit.
+
+1. **Persistent queue** — the Transactions batch queue was React-state only (lost on leave/refresh).
+   - **`db/2026-06-01-transaction-queue.sql`** — per-user `transaction_queue` table mirroring the `QueuedTxn` shape (`user_id default auth.uid()`, RLS `for all using/with check (user_id = auth.uid())`). Staging only — doesn't touch stock.
+   - `app/transactions/page.tsx`: `reload()` hydrates the queue from the table; `doAddToQueue` inserts (DB id becomes the row uid); remove/clear delete; `processQueue` deletes each row on success (failures stay for retry). **Graceful pre-SQL:** `reload`'s Supabase select returns an error object (not a throw) → empty queue; `doAddToQueue` falls back to an in-memory uid if the insert fails — so deploying before the SQL doesn't break queueing, it just won't persist yet. Run the SQL to switch on persistence.
+2. **Actor name** — `created_by` (transactions) / `user_id` (audit_log) resolved to a name via `user_profiles` (id → name/email).
+   - Transaction log: new **"By"** column (desktop) + "by <name>" line (mobile) — covers transactions + adjustments.
+   - Audit log: the truncated uuid is replaced with the name — covers direct item edits. **No SQL.**
+
+---
+
 ### 2026-06-01 — Admin: reset password + remove account (Edge Function)
 
 **User ask:** options to reset a user's PIN **and password**, and to **remove an account completely** so the same email can sign up again from scratch.

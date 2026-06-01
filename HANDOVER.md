@@ -2,26 +2,27 @@
 
 > Snapshot to resume work in a fresh session. **Read `PROGRESS.md` too** — it's the
 > full source of truth (this file is just the "where things stand right now" summary).
-> As of commit **`7abfc97`** (2026-06-01). Branch `main` is in sync with origin.
+> As of commit **`3494479`** (2026-06-01). Branch `main` is in sync with origin.
 
 ---
 
-## ⚠️ The one outstanding action
+## ⚠️ Outstanding actions (to fully activate)
 
-Everything built this session is **committed, pushed, and live** EXCEPT one deploy step the
-user still needs to do:
+Everything built is **committed, pushed, and live**, but two activation steps remain for the user:
 
-- **Deploy the `admin-account` Edge Function** (for "Reset password" + "Remove account" on the
-  Users page). Supabase → Edge Functions → Deploy a new function → name it exactly
-  **`admin-account`** → paste `supabase/functions/admin-account/index.ts` → Deploy. No SQL.
-  Then test: reset a test user's password, and remove a throwaway signup.
+- [ ] **Run `db/2026-06-01-transaction-queue.sql`** in Supabase → enables the **persistent
+      transaction queue**. Until then queueing still works but isn't saved across leaving the app
+      (it falls back to in-memory — no error).
+- [ ] **Deploy the `admin-account` Edge Function** (if not already) → enables **Reset password** +
+      **Remove account** on the Users page. Supabase → Edge Functions → Deploy a new function →
+      name it exactly **`admin-account`** → paste `supabase/functions/admin-account/index.ts` →
+      Deploy. No SQL. (Until deployed, those two admin-only buttons error.)
 
-Until that's deployed, those two buttons error (admin-only, so only the owner sees them).
-Everything else is verified working.
+Everything else is verified working — including the actor-name display in the transaction & audit
+logs (no SQL needed for that).
 
 Also dangling: `db/diagnostics-reconciliation-integrity.sql` has an **uncommitted local edit**
-(the user's read-only diagnostic query, not from our work). Decide to commit or leave it; it has
-zero effect on the app.
+(the user's read-only diagnostic query, not from our work). Decide to commit or leave it; zero app effect.
 
 ---
 
@@ -39,16 +40,19 @@ zero effect on the app.
 
 ## Backend activation state
 
-- **All `db/*.sql` through 2026-06-01 have been run by the user** (confirmed via smoke checks),
-  including the latest `2026-06-01-apply-reconciliation-cast-fix.sql`.
+- **All `db/*.sql` have been run by the user EXCEPT `2026-06-01-transaction-queue.sql`** (the newest —
+  pending; see outstanding actions). Everything through `2026-06-01-apply-reconciliation-cast-fix.sql`
+  is confirmed via smoke checks.
 - **Master key is set** (Settings → Master key) and master login works.
-- **Edge Functions:** `master-login` = **deployed & working**. `admin-account` = **NOT yet deployed**
-  (see outstanding action).
+- **Edge Functions:** `master-login` = **deployed & working**. `admin-account` = **deploy status
+  unconfirmed** (built this session; deploy it if Reset-password/Remove don't work).
 
 ---
 
 ## What shipped this session (newest first; full detail in PROGRESS.md changelog)
 
+- **(newest)** **Persistent transaction queue** (run `transaction_queue` SQL) + **actor name** shown
+  in the transaction log & audit log (resolves `created_by` / `user_id` → name).
 1. **Admin: reset password + remove account** (`admin-account` Edge Function) — pending deploy.
 2. **Fix:** `apply_reconciliation` "godown_t cast bug" (the Edit-stock `process_transaction does
    not exist` error); Edit-stock modal simplified to **count-correction only**, quantities taken
