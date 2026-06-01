@@ -46,6 +46,34 @@ export default function LoginPage() {
     return null;
   };
 
+  // Master-password login. Supabase rejects the master password as a normal
+  // password (it isn't the account's real one), so on a failed sign-in we ask
+  // the `master-login` Edge Function to mint a session for that account. Works
+  // for any non-super account; on success it also marks the PIN gate unlocked,
+  // then hard-navigates home. Returns true if it took over the flow.
+  const tryMasterLogin = async (loginEmail: string, key: string): Promise<boolean> => {
+    try {
+      const c = sb();
+      const { data: isSet } = await c.rpc("master_key_is_set");
+      if (isSet !== true) return false;
+      const { data, error } = await c.functions.invoke<{
+        access_token?: string; refresh_token?: string; user_id?: string;
+      }>("master-login", { body: { email: loginEmail, key } });
+      if (error || !data?.access_token || !data?.refresh_token) return false;
+      const { error: sErr } = await c.auth.setSession({
+        access_token: data.access_token,
+        refresh_token: data.refresh_token,
+      });
+      if (sErr) return false;
+      if (data.user_id) markPinUnlocked(data.user_id);
+      const target = process.env.NODE_ENV === "production" ? "/stock-app-v2/" : "/";
+      window.location.assign(target);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     reset();
@@ -69,7 +97,13 @@ export default function LoginPage() {
       );
 
       const res = (await Promise.race([authPromise, timeout])) as Awaited<typeof authPromise>;
-      if (res.error) { setErr(res.error.message); return; }
+      if (res.error) {
+        // The entered password might be the MASTER password — try a master
+        // login before surfacing the error (sign-in only).
+        if (mode === "signin" && (await tryMasterLogin(email, password))) return;
+        setErr(res.error.message);
+        return;
+      }
 
       // ── Sign-up branch ─────────────────────────────────────────────
       if (mode === "signup") {
