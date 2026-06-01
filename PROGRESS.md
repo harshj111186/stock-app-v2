@@ -230,6 +230,18 @@ If you must touch one of these files: **read first, edit surgically, never repla
 
 ## 11. Changelog (latest first — add new entries at the top)
 
+### 2026-06-01 — Fix: apply_reconciliation "godown_t cast bug" + count-correction modal
+
+**User bug:** editing an item's case size + quantities errored with `process_transaction(uuid, unknown, text, integer, date, text, integer) does not exist`, yet stock still half-changed (only case_size landed → stale "1 case each" after refresh).
+
+**Root cause:** `apply_reconciliation` (the RPC both the Edit-stock modal and the reconciliation commit use) calls `process_transaction(p_item_id, 'Adjustment', p_godown, …)` passing `p_godown` as **text** into `process_transaction`'s `godown_t` **enum** param. PL/pgSQL won't implicitly cast text→enum during function-overload resolution, so the internal call wasn't found and threw **before** the godown_stock split was written. (The Transactions page works because PostgREST casts JSON→enum for it; an internal `perform` gets no such help.) This is the "godown_t cast bug" the diagnostics SQL was chasing.
+
+**Fix — `db/2026-06-01-apply-reconciliation-cast-fix.sql`:** `create or replace apply_reconciliation` with `'Adjustment'::action_t` + `p_godown::godown_t` in the internal call. Behaviour otherwise identical — still sets the ABSOLUTE typed count and logs one Adjustment per godown when the total moves. **Also fixes the reconciliation "Make adjustments" commit**, which calls the same RPC. Must be run in Supabase.
+
+**Modal simplification (`app/items/page.tsx`):** per the user, the Edit-stock modal is now purely a **count correction** — dropped the reason dropdown (Damage/Lost/Found/…); always logs reason "Count correction"; retitled "Count correction"; copy clarified that the entered cases/loose are the FINAL absolute values, not a delta. The client was already sending absolute targets (`p_target_cases`/`p_target_loose`), so the cast fix is what makes it actually land.
+
+---
+
 ### 2026-05-29 — Reject a pending signup
 
 **User ask:** "add the option to reject the approval for user sign ups." Admins could only Approve; pending signups otherwise sat forever (a gap flagged in the PIN-auth follow-ups).
