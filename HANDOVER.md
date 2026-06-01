@@ -2,27 +2,17 @@
 
 > Snapshot to resume work in a fresh session. **Read `PROGRESS.md` too** — it's the
 > full source of truth (this file is just the "where things stand right now" summary).
-> As of commit **`3494479`** (2026-06-01). Branch `main` is in sync with origin.
+> As of commit **`62c6f55`** (2026-06-01) — fully activated. Branch `main` is in sync with origin.
 
 ---
 
-## ⚠️ Outstanding actions (to fully activate)
+## ✅ Status: fully activated — no outstanding steps
 
-Everything built is **committed, pushed, and live**, but two activation steps remain for the user:
+Everything built is **committed, pushed, live, and switched on**. All `db/*.sql` have been run by
+the user and **both** Edge Functions (`master-login`, `admin-account`) are deployed. Nothing pending.
 
-- [ ] **Run `db/2026-06-01-transaction-queue.sql`** in Supabase → enables the **persistent
-      transaction queue**. Until then queueing still works but isn't saved across leaving the app
-      (it falls back to in-memory — no error).
-- [ ] **Deploy the `admin-account` Edge Function** (if not already) → enables **Reset password** +
-      **Remove account** on the Users page. Supabase → Edge Functions → Deploy a new function →
-      name it exactly **`admin-account`** → paste `supabase/functions/admin-account/index.ts` →
-      Deploy. No SQL. (Until deployed, those two admin-only buttons error.)
-
-Everything else is verified working — including the actor-name display in the transaction & audit
-logs (no SQL needed for that).
-
-Also dangling: `db/diagnostics-reconciliation-integrity.sql` has an **uncommitted local edit**
-(the user's read-only diagnostic query, not from our work). Decide to commit or leave it; zero app effect.
+Only loose end (cosmetic): `db/diagnostics-reconciliation-integrity.sql` has an **uncommitted local
+edit** (the user's read-only diagnostic query, not from our work). Commit or leave it — zero app effect.
 
 ---
 
@@ -40,12 +30,9 @@ Also dangling: `db/diagnostics-reconciliation-integrity.sql` has an **uncommitte
 
 ## Backend activation state
 
-- **All `db/*.sql` have been run by the user EXCEPT `2026-06-01-transaction-queue.sql`** (the newest —
-  pending; see outstanding actions). Everything through `2026-06-01-apply-reconciliation-cast-fix.sql`
-  is confirmed via smoke checks.
+- **All `db/*.sql` have been run by the user**, through `2026-06-01-transaction-queue.sql`.
 - **Master key is set** (Settings → Master key) and master login works.
-- **Edge Functions:** `master-login` = **deployed & working**. `admin-account` = **deploy status
-  unconfirmed** (built this session; deploy it if Reset-password/Remove don't work).
+- **Edge Functions:** `master-login` and `admin-account` are **both deployed**.
 
 ---
 
