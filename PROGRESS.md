@@ -230,6 +230,19 @@ If you must touch one of these files: **read first, edit surgically, never repla
 
 ## 11. Changelog (latest first — add new entries at the top)
 
+### 2026-06-01 — Admin: reset password + remove account (Edge Function)
+
+**User ask:** options to reset a user's PIN **and password**, and to **remove an account completely** so the same email can sign up again from scratch.
+
+PIN reset already existed (`admin_reset_pin`). Resetting another user's password and deleting an auth account both need the service-role key → a second Edge Function (after master-login).
+
+- **`supabase/functions/admin-account/index.ts`** — actions `reset_password` (admin sets a new temp password via `auth.admin.updateUserById`; chosen over an email link because the project has no SMTP) and `delete` (`auth.admin.deleteUser` → frees the email; best-effort profile-row cleanup after). It verifies the **caller's** JWT and re-enforces the admin rules server-side: active-admin only, never the super-admin, admin targets need a super-admin caller, no self-delete. Returns `{ ok, error }` (HTTP 200) for clean UI messages. **Must be deployed** (dashboard paste or `supabase functions deploy admin-account`). No SQL.
+- **`app/users/page.tsx`** — `runEdge` helper + `resetPassword` (prompt → temp password) and `deleteAccount` (double-confirm) handlers. "Reset password" sits on the Active row beside Reset PIN; "Remove" is on the Active row AND the Pending / Rejected / Deactivated buckets (those accounts aren't in the Active table). New perms: `canResetPassword` (= canResetPin), `canDelete` (never super-admin/self; admin target needs super). Busy/spinner wired for the two new actions.
+
+Caveat surfaced to the user + in the function message: an account with **transaction history** can be FK-blocked from hard deletion — deactivate those instead. Fine for the common case (wrong/spam/never-active signups), which is the point of "free the email."
+
+---
+
 ### 2026-06-01 — Fix: apply_reconciliation "godown_t cast bug" + count-correction modal
 
 **User bug:** editing an item's case size + quantities errored with `process_transaction(uuid, unknown, text, integer, date, text, integer) does not exist`, yet stock still half-changed (only case_size landed → stale "1 case each" after refresh).
