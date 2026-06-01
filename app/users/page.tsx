@@ -5,10 +5,10 @@ import { sb, type Profile, PROFILE_COLUMNS } from "@/lib/supabase";
 import { useAuth } from "@/app/providers";
 import {
   Shield, CheckCircle2, KeyRound, UserMinus, UserCheck, UserX, Pencil,
-  Loader2, AlertCircle, ShieldCheck, Clock, Users,
+  Loader2, AlertCircle, ShieldCheck, Clock, Users, Lock, Trash2,
 } from "lucide-react";
 
-type Action = "approve" | "reset" | "deactivate" | "reactivate" | "role" | "name" | "reject" | "unreject";
+type Action = "approve" | "reset" | "deactivate" | "reactivate" | "role" | "name" | "reject" | "unreject" | "password" | "delete";
 type Busy = { id: string; action: Action } | null;
 
 export default function UsersPage() {
@@ -85,6 +85,36 @@ export default function UsersPage() {
   const unreject = (u: Profile) =>
     runRpc("admin_reject_user", { p_user_id: u.id, p_rejected: false }, `Moved ${u.email} back to pending`, u.id, "unreject");
 
+  // Privileged actions via the admin-account Edge Function (service role).
+  // The function returns { ok, error } (always HTTP 200 for handled cases).
+  const runEdge = async (action: string, extra: Record<string, unknown>, okMsg: string, rowId: string, act: Action) => {
+    setBusy({ id: rowId, action: act });
+    try {
+      const { data, error } = await sb().functions.invoke("admin-account", { body: { action, ...extra } });
+      if (error) throw error;
+      if (!data?.ok) throw new Error(data?.error || "Action failed.");
+      showToast("ok", okMsg);
+      await load();
+    } catch (e: any) {
+      showToast("bad", e?.message || "Action failed.");
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const resetPassword = (u: Profile) => {
+    const pw = prompt(`Set a NEW password for ${u.email} (at least 6 characters). Share it with them — they can change it later.`);
+    if (pw === null) return;
+    if (pw.trim().length < 6) { showToast("bad", "Password must be at least 6 characters."); return; }
+    runEdge("reset_password", { target_user_id: u.id, new_password: pw.trim() }, `Password reset for ${u.email}`, u.id, "password");
+  };
+
+  const deleteAccount = (u: Profile) => {
+    if (!confirm(`Permanently DELETE ${u.email}?\n\nThis removes the account completely so the same email can sign up again from scratch. It cannot be undone.`)) return;
+    if (!confirm(`Last check — really delete ${u.email}?`)) return;
+    runEdge("delete", { target_user_id: u.id }, `Deleted ${u.email}`, u.id, "delete");
+  };
+
   const setRole = (u: Profile, role: Profile["role"]) =>
     runRpc("admin_set_role", { p_user_id: u.id, p_new_role: role }, `Set ${u.email} to ${role}`, u.id, "role");
 
@@ -127,7 +157,9 @@ export default function UsersPage() {
     busy,
     onSetRole: setRole,
     onResetPin: resetPin,
+    onResetPassword: resetPassword,
     onDeactivate: deactivate,
+    onDelete: deleteAccount,
     onSetName: setName,
   });
 
@@ -191,6 +223,18 @@ export default function UsersPage() {
                             : <UserX className="w-3.5 h-3.5" />}
                           Reject
                         </button>
+                        <button
+                          type="button"
+                          onClick={() => deleteAccount(u)}
+                          disabled={busy?.id === u.id}
+                          className="text-xs text-zinc-500 hover:text-rose-500 disabled:opacity-40 inline-flex items-center gap-1"
+                          title="Delete completely (frees the email for a fresh signup)"
+                        >
+                          {busy?.id === u.id && busy.action === "delete"
+                            ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                            : <Trash2 className="w-3.5 h-3.5" />}
+                          Remove
+                        </button>
                       </div>
                     </td>
                   </tr>
@@ -227,6 +271,17 @@ export default function UsersPage() {
                     ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
                     : <UserX className="w-3.5 h-3.5" />}
                   Reject
+                </button>
+                <button
+                  type="button"
+                  onClick={() => deleteAccount(u)}
+                  disabled={busy?.id === u.id}
+                  className="mt-2 w-full text-xs text-rose-600 dark:text-rose-400 bg-rose-500/10 hover:bg-rose-500/20 disabled:opacity-40 px-3 py-2 rounded-md inline-flex items-center justify-center gap-1.5"
+                >
+                  {busy?.id === u.id && busy.action === "delete"
+                    ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    : <Trash2 className="w-3.5 h-3.5" />}
+                  Remove completely
                 </button>
               </li>
             ))}
@@ -300,17 +355,31 @@ export default function UsersPage() {
                       <td className="px-5 py-2.5 text-zinc-500">{u.email}</td>
                       <td className="px-3 py-2.5"><RoleBadge role={u.role} super={u.is_super_admin} /></td>
                       <td className="px-5 py-2.5 text-right">
-                        <button
-                          type="button"
-                          onClick={() => reactivate(u)}
-                          disabled={busy?.id === u.id || protectedRow}
-                          className="bg-cyan-500 hover:bg-cyan-400 disabled:opacity-40 disabled:cursor-not-allowed text-white px-3 py-1.5 rounded-md text-xs font-medium inline-flex items-center gap-1.5"
-                        >
-                          {busy?.id === u.id && busy.action === "reactivate"
-                            ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                            : <UserCheck className="w-3.5 h-3.5" />}
-                          Reactivate
-                        </button>
+                        <div className="inline-flex items-center gap-3">
+                          <button
+                            type="button"
+                            onClick={() => reactivate(u)}
+                            disabled={busy?.id === u.id || protectedRow}
+                            className="bg-cyan-500 hover:bg-cyan-400 disabled:opacity-40 disabled:cursor-not-allowed text-white px-3 py-1.5 rounded-md text-xs font-medium inline-flex items-center gap-1.5"
+                          >
+                            {busy?.id === u.id && busy.action === "reactivate"
+                              ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                              : <UserCheck className="w-3.5 h-3.5" />}
+                            Reactivate
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => deleteAccount(u)}
+                            disabled={busy?.id === u.id || u.is_super_admin}
+                            className="text-xs text-zinc-500 hover:text-rose-500 disabled:opacity-40 disabled:cursor-not-allowed inline-flex items-center gap-1"
+                            title="Delete completely (frees the email for a fresh signup)"
+                          >
+                            {busy?.id === u.id && busy.action === "delete"
+                              ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                              : <Trash2 className="w-3.5 h-3.5" />}
+                            Remove
+                          </button>
+                        </div>
                       </td>
                     </tr>
                   );
@@ -339,6 +408,17 @@ export default function UsersPage() {
                       ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
                       : <UserCheck className="w-3.5 h-3.5" />}
                     Reactivate
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => deleteAccount(u)}
+                    disabled={busy?.id === u.id || u.is_super_admin}
+                    className="mt-2 w-full text-xs text-rose-600 dark:text-rose-400 bg-rose-500/10 hover:bg-rose-500/20 disabled:opacity-40 disabled:cursor-not-allowed px-3 py-2 rounded-md inline-flex items-center justify-center gap-1.5"
+                  >
+                    {busy?.id === u.id && busy.action === "delete"
+                      ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      : <Trash2 className="w-3.5 h-3.5" />}
+                    Remove completely
                   </button>
                 </li>
               );
@@ -396,6 +476,18 @@ export default function UsersPage() {
                             : <Clock className="w-3 h-3" />}
                           Move to pending
                         </button>
+                        <button
+                          type="button"
+                          onClick={() => deleteAccount(u)}
+                          disabled={busy?.id === u.id}
+                          className="text-xs text-zinc-500 hover:text-rose-500 disabled:opacity-40 inline-flex items-center gap-1"
+                          title="Delete completely (frees the email for a fresh signup)"
+                        >
+                          {busy?.id === u.id && busy.action === "delete"
+                            ? <Loader2 className="w-3 h-3 animate-spin" />
+                            : <Trash2 className="w-3 h-3" />}
+                          Remove
+                        </button>
                       </div>
                     </td>
                   </tr>
@@ -433,6 +525,17 @@ export default function UsersPage() {
                     To pending
                   </button>
                 </div>
+                <button
+                  type="button"
+                  onClick={() => deleteAccount(u)}
+                  disabled={busy?.id === u.id}
+                  className="mt-2 w-full text-xs text-rose-600 dark:text-rose-400 bg-rose-500/10 hover:bg-rose-500/20 disabled:opacity-40 px-3 py-2 rounded-md inline-flex items-center justify-center gap-1.5"
+                >
+                  {busy?.id === u.id && busy.action === "delete"
+                    ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    : <Trash2 className="w-3.5 h-3.5" />}
+                  Remove completely
+                </button>
               </li>
             ))}
           </ul>
@@ -466,7 +569,9 @@ function useRowPerms(u: Profile, isMe: boolean, meIsSuper: boolean) {
     isSuperRow,
     canChangeRole:  !lockedToMe && !lockedAdmin && !isSuperRow,
     canResetPin:    !lockedToMe,
+    canResetPassword: !lockedToMe,
     canDeactivate:  !lockedToMe && !lockedAdmin && !isMe, // can't deactivate yourself
+    canDelete:      !isSuperRow && !isMe && !lockedAdmin,  // never the super-admin or yourself
     canEditName:    !lockedToMe,
     roleOpts:       (meIsSuper ? ["admin", "staff", "viewer"] : ["staff", "viewer"]) as Profile["role"][],
   };
@@ -479,12 +584,14 @@ type RowProps = {
   busy: Busy;
   onSetRole: (u: Profile, r: Profile["role"]) => void;
   onResetPin: (u: Profile) => void;
+  onResetPassword: (u: Profile) => void;
   onDeactivate: (u: Profile) => void;
+  onDelete: (u: Profile) => void;
   onSetName: (u: Profile) => void;
 };
 
 // ─── Desktop row ───────────────────────────────────────────────────────────
-function UserDesktopRow({ u, isMe, meIsSuper, busy, onSetRole, onResetPin, onDeactivate, onSetName }: RowProps) {
+function UserDesktopRow({ u, isMe, meIsSuper, busy, onSetRole, onResetPin, onResetPassword, onDeactivate, onDelete, onSetName }: RowProps) {
   const perms = useRowPerms(u, isMe, meIsSuper);
   const rowBusy = busy?.id === u.id;
   const busyFor = (a: Action) => rowBusy && busy?.action === a;
@@ -534,7 +641,7 @@ function UserDesktopRow({ u, isMe, meIsSuper, busy, onSetRole, onResetPin, onDea
         <PinStatus u={u} />
       </td>
       <td className="px-5 py-2.5 text-right">
-        <div className="flex items-center justify-end gap-2">
+        <div className="flex items-center justify-end gap-2 flex-wrap">
           <button
             type="button"
             onClick={() => onResetPin(u)}
@@ -548,6 +655,17 @@ function UserDesktopRow({ u, isMe, meIsSuper, busy, onSetRole, onResetPin, onDea
           <span className="text-zinc-300 dark:text-zinc-700">·</span>
           <button
             type="button"
+            onClick={() => onResetPassword(u)}
+            disabled={!perms.canResetPassword || rowBusy}
+            className="text-xs text-zinc-500 hover:text-cyan-500 disabled:opacity-40 disabled:cursor-not-allowed inline-flex items-center gap-1"
+            title="Set a new password for this user"
+          >
+            {busyFor("password") ? <Loader2 className="w-3 h-3 animate-spin" /> : <Lock className="w-3 h-3" />}
+            Reset password
+          </button>
+          <span className="text-zinc-300 dark:text-zinc-700">·</span>
+          <button
+            type="button"
             onClick={() => onDeactivate(u)}
             disabled={!perms.canDeactivate || rowBusy}
             className="text-xs text-zinc-500 hover:text-rose-500 disabled:opacity-40 disabled:cursor-not-allowed inline-flex items-center gap-1"
@@ -556,6 +674,17 @@ function UserDesktopRow({ u, isMe, meIsSuper, busy, onSetRole, onResetPin, onDea
             {busyFor("deactivate") ? <Loader2 className="w-3 h-3 animate-spin" /> : <UserMinus className="w-3 h-3" />}
             Deactivate
           </button>
+          <span className="text-zinc-300 dark:text-zinc-700">·</span>
+          <button
+            type="button"
+            onClick={() => onDelete(u)}
+            disabled={!perms.canDelete || rowBusy}
+            className="text-xs text-zinc-500 hover:text-rose-500 disabled:opacity-40 disabled:cursor-not-allowed inline-flex items-center gap-1"
+            title="Delete this account completely (frees the email for a new signup)"
+          >
+            {busyFor("delete") ? <Loader2 className="w-3 h-3 animate-spin" /> : <Trash2 className="w-3 h-3" />}
+            Remove
+          </button>
         </div>
       </td>
     </tr>
@@ -563,7 +692,7 @@ function UserDesktopRow({ u, isMe, meIsSuper, busy, onSetRole, onResetPin, onDea
 }
 
 // ─── Mobile card ───────────────────────────────────────────────────────────
-function UserMobileCard({ u, isMe, meIsSuper, busy, onSetRole, onResetPin, onDeactivate, onSetName }: RowProps) {
+function UserMobileCard({ u, isMe, meIsSuper, busy, onSetRole, onResetPin, onResetPassword, onDeactivate, onDelete, onSetName }: RowProps) {
   const perms = useRowPerms(u, isMe, meIsSuper);
   const rowBusy = busy?.id === u.id;
   const busyFor = (a: Action) => rowBusy && busy?.action === a;
@@ -630,6 +759,26 @@ function UserMobileCard({ u, isMe, meIsSuper, busy, onSetRole, onResetPin, onDea
         >
           {busyFor("deactivate") ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <UserMinus className="w-3.5 h-3.5" />}
           Deactivate
+        </button>
+      </div>
+      <div className="flex items-center gap-2 mt-2">
+        <button
+          type="button"
+          onClick={() => onResetPassword(u)}
+          disabled={!perms.canResetPassword || rowBusy}
+          className="flex-1 text-xs text-zinc-700 dark:text-zinc-200 bg-zinc-100 dark:bg-zinc-800 hover:bg-zinc-200 dark:hover:bg-zinc-700 disabled:opacity-40 disabled:cursor-not-allowed px-3 py-2 rounded-md inline-flex items-center justify-center gap-1.5"
+        >
+          {busyFor("password") ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Lock className="w-3.5 h-3.5" />}
+          Reset password
+        </button>
+        <button
+          type="button"
+          onClick={() => onDelete(u)}
+          disabled={!perms.canDelete || rowBusy}
+          className="flex-1 text-xs text-rose-600 dark:text-rose-400 bg-rose-500/10 hover:bg-rose-500/20 disabled:opacity-40 disabled:cursor-not-allowed px-3 py-2 rounded-md inline-flex items-center justify-center gap-1.5"
+        >
+          {busyFor("delete") ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Trash2 className="w-3.5 h-3.5" />}
+          Remove
         </button>
       </div>
     </li>
