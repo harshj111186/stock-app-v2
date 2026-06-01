@@ -148,6 +148,7 @@ export default function TransactionsPage() {
 
   // ── batch queue state ──────────────────────────────────────────────────
   const [queue, setQueue] = useState<QueuedTxn[]>([]);
+  const [nameById, setNameById] = useState<Map<string, string>>(new Map());
   const [processing, setProcessing] = useState(false);
   const [processIdx, setProcessIdx] = useState<number>(0);
   const [processErrors, setProcessErrors] = useState<ProcessError[]>([]);
@@ -170,10 +171,12 @@ export default function TransactionsPage() {
 
   const reload = async () => {
     const c = sb();
-    const [{ data: rows }, { data: st }, { data: t }] = await Promise.all([
+    const [{ data: rows }, { data: st }, { data: t }, { data: profs }, { data: qd }] = await Promise.all([
       c.from("items").select("*").eq("archived", false).order("model"),
       c.from("godown_stock").select("*"),
       c.from("transactions").select("*").order("created_at", { ascending: false }).limit(200),
+      c.from("user_profiles").select("id, name, email"),
+      c.from("transaction_queue").select("*").order("created_at"),  // RLS → only my rows
     ]);
     setItems((rows || []) as Item[]);
     const sMap: StockMap = {};
@@ -186,6 +189,18 @@ export default function TransactionsPage() {
     });
     setStock(sMap);
     setTxns((t || []) as Txn[]);
+    const nm = new Map<string, string>();
+    (profs || []).forEach((p: any) => nm.set(p.id, p.name?.trim() || p.email?.split("@")[0] || ""));
+    setNameById(nm);
+    // Hydrate the queue from the user's persisted rows so it survives leaving
+    // the app / refresh / switching device.
+    setQueue((qd || []).map((r: any): QueuedTxn => ({
+      uid: r.id, action: r.action, item_id: r.item_id, godown: r.godown,
+      to_godown: r.to_godown ?? r.godown, cartons: r.cartons ?? 0, loose: r.loose ?? 0,
+      total_qty: r.total_qty ?? 0, rate: r.rate ?? "", invoice_no: r.invoice_no ?? "",
+      party_name: r.party_name ?? "", reason: r.reason ?? "", return_dir: (r.return_dir ?? 1) as 1 | -1,
+      direction: r.direction ?? null, date: r.txn_date,
+    })));
     setLoaded(true);
   };
   useEffect(() => { reload(); }, []);
@@ -206,6 +221,9 @@ export default function TransactionsPage() {
     setToast({ kind, text });
     setTimeout(() => setToast(null), 4000);
   };
+
+  // created_by → display name (— for unknown / removed users).
+  const nameOf = (id: string | null | undefined) => (id ? nameById.get(id) || "—" : "—");
 
   // Direction the current form will produce (-1, +1, or null for actions where
   // the SQL resolves it).
@@ -319,13 +337,29 @@ export default function TransactionsPage() {
       return;
     }
 
-    doAddToQueue(row);
+    void doAddToQueue(row);
   };
 
   // The actual queue-push, separated so the case-size modal can call it
   // after either Save-and-continue or Skip-as-loose.
-  const doAddToQueue = (row: QueuedTxn) => {
-    setQueue((q) => [...q, row]);
+  const doAddToQueue = async (row: QueuedTxn) => {
+    // Persist the queued row so it survives leaving the app / refresh / device
+    // switch. The DB id becomes the row's uid. If the queue table isn't there
+    // yet (migration not run), fall back to an in-memory row so the feature
+    // still works — it just won't persist until the SQL is applied.
+    let uid = row.uid;
+    try {
+      const { data, error } = await sb().from("transaction_queue").insert({
+        user_id: profile?.id,
+        item_id: row.item_id, action: row.action, godown: row.godown, to_godown: row.to_godown,
+        cartons: row.cartons, loose: row.loose, total_qty: row.total_qty,
+        rate: row.rate || null, invoice_no: row.invoice_no || null, party_name: row.party_name || null,
+        reason: row.reason || null, return_dir: row.return_dir, direction: row.direction,
+        txn_date: row.date,
+      }).select("id").single();
+      if (!error && data) uid = data.id;
+    } catch { /* keep the in-memory uid */ }
+    setQueue((q) => [...q, { ...row, uid }]);
     try { localStorage.setItem("txn.lastAction", row.action); } catch {}
     // Keep item + godown + action + date for fast repeat entry; clear the rest.
     setF((x) => ({ ...x, cartons: "", loose: "", rate: "", invoice_no: "", party_name: "", reason: "" }));
@@ -360,7 +394,7 @@ export default function TransactionsPage() {
       const loose = total - cartons * newSize;
       const updatedRow: QueuedTxn = { ...pendingCaseSize.rowToAdd, cartons, loose };
 
-      doAddToQueue(updatedRow);
+      await doAddToQueue(updatedRow);
       setPendingCaseSize(null);
       showToast("ok", `Case size set to ${newSize}; queued ${updatedRow.action}.`);
     } catch (e: any) {
@@ -374,7 +408,7 @@ export default function TransactionsPage() {
   // process_transaction handles cs=0 items as loose-only on the DB side.
   const skipCaseSizeAndAdd = () => {
     if (!pendingCaseSize) return;
-    doAddToQueue(pendingCaseSize.rowToAdd);
+    void doAddToQueue(pendingCaseSize.rowToAdd);
     setPendingCaseSize(null);
   };
 
@@ -385,13 +419,16 @@ export default function TransactionsPage() {
   const removeFromQueue = (uid: string) => {
     setQueue((q) => q.filter((t) => t.uid !== uid));
     setProcessErrors((errs) => errs.filter((e) => e.rowUid !== uid));
+    void sb().from("transaction_queue").delete().eq("id", uid);
   };
 
   const clearQueue = () => {
     if (queue.length === 0) return;
     if (!confirm(`Clear all ${queue.length} queued ${queue.length === 1 ? "entry" : "entries"}?`)) return;
+    const ids = queue.map((t) => t.uid);
     setQueue([]);
     setProcessErrors([]);
+    if (ids.length) void sb().from("transaction_queue").delete().in("id", ids);
   };
 
   // ── Run the entire queue in safe order ────────────────────────────────
@@ -408,6 +445,7 @@ export default function TransactionsPage() {
     setProcessIdx(0);
 
     const failures: ProcessError[] = [];
+    const succeeded: string[] = [];
     let processed = 0;
 
     for (let i = 0; i < sortedQueue.length; i++) {
@@ -432,9 +470,15 @@ export default function TransactionsPage() {
         });
         if (error) throw error;
         processed++;
+        succeeded.push(t.uid);
       } catch (e: any) {
         failures.push({ rowUid: t.uid, message: e?.message || "Unknown error" });
       }
+    }
+
+    // Drop processed rows from the persisted queue; failures stay for retry.
+    if (succeeded.length) {
+      try { await sb().from("transaction_queue").delete().in("id", succeeded); } catch { /* reload reconciles */ }
     }
 
     setProcessIdx(sortedQueue.length);
@@ -1023,15 +1067,16 @@ export default function TransactionsPage() {
               <th className="text-left px-3 py-2 font-medium">Godown</th>
               <th className="text-right px-3 py-2 font-medium">Qty</th>
               <th className="text-left px-3 py-2 font-medium">Note</th>
+              <th className="text-left px-3 py-2 font-medium">By</th>
               <th className="text-right px-5 py-2 font-medium" />
             </tr>
           </thead>
           <tbody>
             {!loaded && (
-              <tr><td colSpan={7} className="py-10 text-center text-sm text-zinc-500">Loading…</td></tr>
+              <tr><td colSpan={8} className="py-10 text-center text-sm text-zinc-500">Loading…</td></tr>
             )}
             {loaded && visibleTxns.length === 0 && (
-              <tr><td colSpan={7} className="py-10 text-center text-sm text-zinc-500">No transactions match these filters.</td></tr>
+              <tr><td colSpan={8} className="py-10 text-center text-sm text-zinc-500">No transactions match these filters.</td></tr>
             )}
             {loaded && visibleTxns.map((t) => {
               const it = itemById.get(t.item_id);
@@ -1057,6 +1102,7 @@ export default function TransactionsPage() {
                     </span>
                   </td>
                   <td className="px-3 py-2.5 text-xs text-zinc-500 truncate max-w-[260px]">{t.reason || t.invoice_no || t.status || ""}</td>
+                  <td className="px-3 py-2.5 text-xs text-zinc-600 dark:text-zinc-300">{nameOf(t.created_by)}</td>
                   <td className="px-5 py-2.5 text-right">
                     {canWrite && !isReversal && !alreadyReversed ? (
                       <button
@@ -1115,6 +1161,7 @@ export default function TransactionsPage() {
                   {note && (
                     <div className="text-[11px] text-zinc-500 mt-1.5 truncate">{note}</div>
                   )}
+                  <div className="text-[11px] text-zinc-400 mt-1">by {nameOf(t.created_by)}</div>
                   {(canWrite && !isReversal && !alreadyReversed) || alreadyReversed || isReversal ? (
                     <div className="mt-1.5 text-[11px]">
                       {canWrite && !isReversal && !alreadyReversed ? (

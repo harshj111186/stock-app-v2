@@ -16,19 +16,30 @@ type AuditRow = {
 export default function AuditPage() {
   const { profile } = useAuth();
   const [rows, setRows] = useState<AuditRow[]>([]);
+  const [nameById, setNameById] = useState<Map<string, string>>(new Map());
   const [loaded, setLoaded] = useState(false);
 
   useEffect(() => {
     (async () => {
-      const { data } = await sb()
-        .from("audit_log")
-        .select("id,user_id,occurred_at,table_name,row_id,operation")
-        .order("occurred_at", { ascending: false })
-        .limit(300);
+      const c = sb();
+      const [{ data }, { data: profs }] = await Promise.all([
+        c.from("audit_log")
+          .select("id,user_id,occurred_at,table_name,row_id,operation")
+          .order("occurred_at", { ascending: false })
+          .limit(300),
+        c.from("user_profiles").select("id, name, email"),
+      ]);
       setRows((data || []) as AuditRow[]);
+      const m = new Map<string, string>();
+      (profs || []).forEach((p: any) => m.set(p.id, p.name?.trim() || p.email?.split("@")[0] || ""));
+      setNameById(m);
       setLoaded(true);
     })();
   }, []);
+
+  // user_id → display name (falls back to a short id for rows whose user has
+  // since been removed).
+  const nameOf = (id: string | null) => (id ? (nameById.get(id) || id.slice(0, 8) + "…") : "—");
 
   if (profile?.role !== "admin") {
     return (
@@ -81,7 +92,7 @@ export default function AuditPage() {
                   <span className={`px-2 py-0.5 rounded text-[11px] ${opColour(r.operation)}`}>{r.operation}</span>
                 </td>
                 <td className="px-3 py-2.5"><code className="text-[11px] text-zinc-500">{(r.row_id || "").slice(0, 8)}</code></td>
-                <td className="px-5 py-2.5 text-[11px] text-zinc-500">{r.user_id ? r.user_id.slice(0, 8) + "…" : "—"}</td>
+                <td className="px-5 py-2.5 text-xs text-zinc-600 dark:text-zinc-300">{nameOf(r.user_id)}</td>
               </tr>
             ))}
             {loaded && rows.length === 0 && (
@@ -110,7 +121,7 @@ export default function AuditPage() {
               <div className="text-sm">{r.table_name}</div>
               <div className="flex items-center justify-between text-[11px] text-zinc-500 mt-0.5">
                 <span>Row <code className="text-zinc-500">{(r.row_id || "").slice(0, 8)}</code></span>
-                <span>User {r.user_id ? r.user_id.slice(0, 8) + "…" : "—"}</span>
+                <span>By {nameOf(r.user_id)}</span>
               </div>
             </li>
           ))}
