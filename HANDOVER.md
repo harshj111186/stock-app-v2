@@ -2,14 +2,22 @@
 
 > Snapshot to resume work in a fresh session. **Read `PROGRESS.md` too** — it's the
 > full source of truth (this file is just the "where things stand right now" summary).
-> As of commit **`62c6f55`** (2026-06-01) — fully activated. Branch `main` is in sync with origin.
+> As of commit **`ce55fee`** (2026-06-02). Branch `main` is in sync with origin.
 
 ---
 
-## ✅ Status: fully activated — no outstanding steps
+## ⚠️ One outstanding action
 
-Everything built is **committed, pushed, live, and switched on**. All `db/*.sql` have been run by
-the user and **both** Edge Functions (`master-login`, `admin-account`) are deployed. Nothing pending.
+Everything is **committed, pushed, and live**, but one SQL migration needs running:
+
+- [ ] **Run `db/2026-06-02-category-redo.sql`** in Supabase → SQL Editor. It switches categorisation
+      to a single tree (per-parent-unique names, get-or-create, bulk-move RPC) and **folds the legacy
+      free-text `items.subcategory` values into the tree**. Smoke check should print
+      `items_with_legacy_subcat = 0`. The new Items UI (single category picker, inline
+      "+ New subcategory", multi-select Move-to-category) degrades gracefully until it's run.
+
+Everything else (`master-login` + `admin-account` Edge Functions, all earlier `db/*.sql`) is deployed
+and live.
 
 Only loose end (cosmetic): `db/diagnostics-reconciliation-integrity.sql` has an **uncommitted local
 edit** (the user's read-only diagnostic query, not from our work). Commit or leave it — zero app effect.
