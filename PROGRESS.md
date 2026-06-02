@@ -230,6 +230,32 @@ If you must touch one of these files: **read first, edit surgically, never repla
 
 ## 11. Changelog (latest first — add new entries at the top)
 
+### 2026-06-02 — Queue fixes: deletes now persist + network-resilient processing
+
+Two bugs found while testing the persistent queue on mobile:
+
+1. **Removed/cleared queue rows came back after reload / re-login (any device).** Root cause:
+   `removeFromQueue` and `clearQueue` fired the DB delete as `void sb()…delete()`. A
+   Supabase/postgrest-js query builder is **lazy** — the `fetch` only runs inside `.then()`/`await`
+   — so a `void`-discarded builder **never sent the request**. The row stayed in `transaction_queue`
+   and re-hydrated on the next reload. (The *processed-rows* delete in `processQueue` used `await`,
+   which is why processing-clear worked but manual remove/clear didn't.) **Fix:** both handlers are
+   now `async` and `await` the delete, with optimistic UI + rollback (row reappears + toast) if the
+   delete fails while offline. Confirmed against the installed postgrest-js 2.105.4 source (`fetch`
+   is inside `then()`).
+2. **"TypeError: Load failed" on an otherwise-valid entry.** That's Safari's message for a failed
+   `fetch` (transient mobile-data drop / tab suspended mid-request). `process_transaction` is a POST,
+   and postgrest-js only auto-retries GET/HEAD/OPTIONS — so the blip surfaced raw. **Fix:**
+   `processQueue` now retries each row up to **3×** with backoff (0.5s, 1.5s) **only for
+   network-class errors**; a real DB rejection (stock check, constraint) still fails immediately with
+   its own message. A still-failing network error now shows a clear *"Network error — couldn't reach
+   the server. Check your connection and tap Process queue again."*
+
+Added module helpers `sleep()` + `isNetworkError()` in `app/transactions/page.tsx`. **No SQL, no
+schema change.** `tsc --noEmit` and `next build` both clean.
+
+---
+
 ### 2026-06-01 — Persistent transaction queue + actor name in history
 
 **User ask:** (1) a queued-but-unprocessed batch should survive an employee leaving the app and be there when they return; (2) the transaction history + audit log should show the **name** of the user who made each transaction / adjustment / direct item edit.

@@ -129,6 +129,25 @@ function makeUid(): string {
   return Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
 }
 
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+// True for transport-layer failures (offline, connection reset, tab suspended
+// mid-request) — Safari throws a TypeError "Load failed", Chrome "Failed to
+// fetch". These are transient and worth retrying. A real DB rejection (a stock
+// check, a constraint) is a PostgrestError with a code/hint — deterministic, so
+// retrying it is pointless and it should fail straight away.
+function isNetworkError(e: any): boolean {
+  if (e instanceof TypeError) return true;
+  const msg = (e?.message || "").toLowerCase();
+  return (
+    msg.includes("load failed") ||
+    msg.includes("failed to fetch") ||
+    msg.includes("networkerror") ||
+    msg.includes("network request failed") ||
+    msg.includes("network error")
+  );
+}
+
 // ─── page ─────────────────────────────────────────────────────────────────
 export default function TransactionsPage() {
   const { profile } = useAuth();
@@ -416,19 +435,37 @@ export default function TransactionsPage() {
     setPendingCaseSize(null);
   };
 
-  const removeFromQueue = (uid: string) => {
+  const removeFromQueue = async (uid: string) => {
+    const removed = queue.find((t) => t.uid === uid);
+    // Optimistic: drop it from the UI right away…
     setQueue((q) => q.filter((t) => t.uid !== uid));
     setProcessErrors((errs) => errs.filter((e) => e.rowUid !== uid));
-    void sb().from("transaction_queue").delete().eq("id", uid);
+    // …then actually delete the persisted row. The `await` is essential — a
+    // Supabase query builder is lazy and only fires its request inside .then()/
+    // await, so a fire-and-forget `void` call never reached the server and the
+    // row came back on the next reload. If the delete fails (e.g. offline), put
+    // the row back so the UI doesn't lie about what's saved.
+    const { error } = await sb().from("transaction_queue").delete().eq("id", uid);
+    if (error && removed) {
+      setQueue((q) => (q.some((t) => t.uid === uid) ? q : [...q, removed]));
+      showToast("bad", "Couldn't remove that entry — check your connection and try again.");
+    }
   };
 
-  const clearQueue = () => {
+  const clearQueue = async () => {
     if (queue.length === 0) return;
     if (!confirm(`Clear all ${queue.length} queued ${queue.length === 1 ? "entry" : "entries"}?`)) return;
-    const ids = queue.map((t) => t.uid);
+    const snapshot = queue;
+    const ids = snapshot.map((t) => t.uid);
     setQueue([]);
     setProcessErrors([]);
-    if (ids.length) void sb().from("transaction_queue").delete().in("id", ids);
+    if (ids.length) {
+      const { error } = await sb().from("transaction_queue").delete().in("id", ids);
+      if (error) {
+        setQueue(snapshot); // restore — the delete didn't go through
+        showToast("bad", "Couldn't clear the queue — check your connection and try again.");
+      }
+    }
   };
 
   // ── Run the entire queue in safe order ────────────────────────────────
@@ -451,28 +488,49 @@ export default function TransactionsPage() {
     for (let i = 0; i < sortedQueue.length; i++) {
       setProcessIdx(i);
       const t = sortedQueue[i];
-      try {
-        const note = [
-          t.reason && `reason: ${t.reason}`,
-          t.invoice_no && `inv: ${t.invoice_no}`,
-          t.party_name && `party: ${t.party_name}`,
-          t.rate && `rate: ${t.rate}`,
-        ].filter(Boolean).join(" • ") || null;
+      const note = [
+        t.reason && `reason: ${t.reason}`,
+        t.invoice_no && `inv: ${t.invoice_no}`,
+        t.party_name && `party: ${t.party_name}`,
+        t.rate && `rate: ${t.rate}`,
+      ].filter(Boolean).join(" • ") || null;
 
-        const { error } = await sb().rpc("process_transaction", {
-          p_item_id: t.item_id,
-          p_action: t.action,
-          p_godown: t.godown,
-          p_qty: t.total_qty,
-          p_date: t.date,
-          p_note: note,
-          p_direction: t.direction,
-        });
-        if (error) throw error;
+      // Up to 3 attempts, but ONLY for transient network failures — a real DB
+      // rejection (stock check, constraint…) breaks out immediately with its
+      // own message. process_transaction is a POST, which postgrest-js does not
+      // auto-retry, so flaky mobile data otherwise surfaced as a raw
+      // "TypeError: Load failed" against an entry that was actually fine.
+      let lastErr: any = null;
+      let ok = false;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        if (attempt > 0) await sleep(attempt === 1 ? 500 : 1500); // back off, then retry
+        try {
+          const { error } = await sb().rpc("process_transaction", {
+            p_item_id: t.item_id,
+            p_action: t.action,
+            p_godown: t.godown,
+            p_qty: t.total_qty,
+            p_date: t.date,
+            p_note: note,
+            p_direction: t.direction,
+          });
+          if (error) throw error;
+          ok = true;
+          break;
+        } catch (e: any) {
+          lastErr = e;
+          if (!isNetworkError(e)) break; // deterministic failure — retrying won't help
+        }
+      }
+
+      if (ok) {
         processed++;
         succeeded.push(t.uid);
-      } catch (e: any) {
-        failures.push({ rowUid: t.uid, message: e?.message || "Unknown error" });
+      } else {
+        const message = isNetworkError(lastErr)
+          ? "Network error — couldn't reach the server. Check your connection and tap Process queue again."
+          : (lastErr?.message || "Unknown error");
+        failures.push({ rowUid: t.uid, message });
       }
     }
 
