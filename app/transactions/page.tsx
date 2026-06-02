@@ -129,6 +129,19 @@ function makeUid(): string {
   return Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
 }
 
+// Transaction-log label for a row's godown. A Transfer is recorded as a
+// per-godown leg with a direction (−1 = out of this godown, +1 = into it).
+// With only two godowns the movement is unambiguous, so show it as "A→B" /
+// "B→A" instead of a bare letter. Both legs of one transfer resolve to the
+// same arrow, so the pair reads consistently. Non-transfers show their godown.
+function godownLabel(t: Txn): string {
+  if (t.action !== "Transfer") return t.godown;
+  const other = t.godown === "A" ? "B" : "A";
+  const from = t.direction === -1 ? t.godown : other;
+  const to = t.direction === -1 ? other : t.godown;
+  return `${from}→${to}`;
+}
+
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 // True for transport-layer failures (offline, connection reset, tab suspended
@@ -1140,7 +1153,7 @@ export default function TransactionsPage() {
               const it = itemById.get(t.item_id);
               const isReversal = !!t.reverses_id;
               const alreadyReversed = txns.some((x) => x.reverses_id === t.id);
-              const showDirHint = t.action === "Adjustment" || t.action === "Return";
+              const showDirHint = t.action === "Adjustment" || t.action === "Return" || t.action === "Transfer";
               return (
                 <tr key={t.id} className="border-t border-zinc-100 dark:border-zinc-800/60 hover:bg-zinc-50 dark:hover:bg-zinc-800/30">
                   <td className="px-5 py-2.5 text-zinc-500 tnum">{(t.txn_date || "").slice(0, 10)}</td>
@@ -1148,7 +1161,7 @@ export default function TransactionsPage() {
                   <td className="px-3 py-2.5">
                     {it ? <span>{it.model} <span className="text-zinc-500">· {it.size} · {it.colour}</span></span> : <span className="text-zinc-500">?</span>}
                   </td>
-                  <td className="px-3 py-2.5 text-zinc-500">{t.godown}</td>
+                  <td className="px-3 py-2.5 text-zinc-500">{godownLabel(t)}</td>
                   <td className="px-3 py-2.5 text-right tnum">
                     <span className="inline-flex items-center gap-1 justify-end">
                       {showDirHint && (
@@ -1194,7 +1207,7 @@ export default function TransactionsPage() {
               const it = itemById.get(t.item_id);
               const isReversal = !!t.reverses_id;
               const alreadyReversed = txns.some((x) => x.reverses_id === t.id);
-              const showDirHint = t.action === "Adjustment" || t.action === "Return";
+              const showDirHint = t.action === "Adjustment" || t.action === "Return" || t.action === "Transfer";
               const note = t.reason || t.invoice_no || t.status || "";
               return (
                 <li key={t.id} className="px-4 py-3">
@@ -1206,7 +1219,7 @@ export default function TransactionsPage() {
                     {it ? <>{it.model} <span className="text-zinc-500">· {it.size} · {it.colour}</span></> : "?"}
                   </div>
                   <div className="flex items-center justify-between gap-2 text-xs text-zinc-500">
-                    <span>Godown {t.godown}</span>
+                    <span>{t.action === "Transfer" ? godownLabel(t) : `Godown ${t.godown}`}</span>
                     <span className="inline-flex items-center gap-1 tnum">
                       {showDirHint && (
                         t.direction === 1
