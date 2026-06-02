@@ -230,6 +230,43 @@ If you must touch one of these files: **read first, edit surgically, never repla
 
 ## 11. Changelog (latest first — add new entries at the top)
 
+### 2026-06-02 — Category system redo: one tree, no free-text subcategory
+
+The catalogue had **two** ways to categorise an item — `items.category_id` (the nestable tree) **and**
+a legacy free-text `items.subcategory` string — and the Items/Godown pages grouped by both. That dual
+model caused the two reported bugs:
+- "Subcategory" was shown as *optional* but behaved like a real axis, and category names carried a
+  **global** unique constraint → brittle.
+- Re-assigning an item **re-created a separate subcategory** even when one of the same name existed,
+  because free text has no dedupe/link.
+
+**Fix — the tree is now the single source of truth.** A "subcategory" is just a deeper node.
+
+1. **`db/2026-06-02-category-redo.sql`** (must be run):
+   - **Per-parent uniqueness** — drops the legacy global unique on `categories(name/normalised_name)`
+     and adds a partial unique index on `(coalesce(parent_id, sentinel), lower(name)) where not archived`.
+     So the same sub-name (e.g. "Modular", "Premium") can live under different parents, but never twice
+     under the same parent. This is what real deep categorisation needs.
+   - **`category_create` → get-or-create** — asking for a child that already exists under that parent
+     returns the existing one (un-archiving if needed) instead of erroring/duplicating. Kills bug #2.
+   - **`set_items_category(uuid[], uuid)`** — admin RPC to move any number of items to a category (or
+     NULL to clear). Keeps the legacy `category` text in sync and nulls `subcategory`.
+   - **Data fold** — every existing `items.subcategory` becomes a child node under the item's category
+     (or a top-level node) and the text column is cleared. Idempotent; smoke check prints
+     `items_with_legacy_subcat` (→ 0 after).
+2. **`components/item-form-modal.tsx`** — removed the free-text Subcategory input. The single tree
+   picker *is* the item's placement, with an inline **"+ New category / subcategory"** (parent picker +
+   name → `category_create` get-or-create → auto-selects the new node) and a live path preview. Stops
+   sending `p_subcategory` (so editing also clears any legacy value).
+3. **`app/items/page.tsx`** — groups purely by the tree path (depth 3 = "Category only"); card shows the
+   full path; **multi-select + "Move to category"** (admin): a Select toggle, checkboxes on cards/rows,
+   a floating action bar, and a destination-picker modal calling `set_items_category`.
+4. **`components/godown-view.tsx`** — same grouping rework so Godown A/B match the Items page exactly.
+
+`tsc --noEmit` + `next build` clean. **Run the SQL** to activate; the UI degrades gracefully before then.
+
+---
+
 ### 2026-06-02 — Queue fixes: deletes now persist + network-resilient processing
 
 Two bugs found while testing the persistent queue on mobile:

@@ -4,12 +4,14 @@ import {
   Plus, ChevronRight, ChevronDown,
   LayoutGrid, Table as TableIcon, Package,
   Pencil, X, Save, Loader2, AlertCircle,
+  Check, MoveRight, ListChecks,
 } from "lucide-react";
 import { Shell } from "@/components/shell";
 import { useAuth } from "@/app/providers";
 import { sb, type Item, type Stock } from "@/lib/supabase";
 import { colourCss, fmtN, matchesQuery } from "@/lib/utils";
 import { ItemFormModal } from "@/components/item-form-modal";
+import { CategoryTreePicker } from "@/components/category-tree-picker";
 import { pathById, type CatRow } from "@/lib/categories";
 import { FilterSheet, SheetField, FilterButton } from "@/components/filter-sheet";
 import { SearchBox } from "@/components/search-box";
@@ -24,16 +26,20 @@ type View = "grid" | "table";
 type Depth = 0 | 1 | 2 | 3;
 
 // ─── group helpers ────────────────────────────────────────────────────────
-// Group path per item: Brand, then EACH category-tree segment (so a nested
-// category like "Fans › Ceiling › Premium" becomes three expandable levels),
-// then Subcategory. `depth` controls how far down we group.
+// Group path per item. The category is the item's FULL place in the tree
+// (e.g. "Fans › Ceiling › Premium" → three expandable levels), so categorising
+// deeper just deepens the grouping automatically — no separate free-text axis.
+// `depth` picks the lens:
+//   1 = Brand
+//   2 = Brand › Category (full path)
+//   3 = Category (full path) only
 const SEP = "›";
 const groupPath = (i: Combined, depth: number): string[] => {
-  const out: string[] = [];
-  if (depth >= 1) out.push(i.brand || "(No brand)");
-  if (depth >= 2) out.push(...(i.category ? i.category.split(" › ") : ["(No category)"]));
-  if (depth >= 3) out.push(i.subcategory || "(No subcategory)");
-  return out;
+  const catSegs = i.category ? i.category.split(" › ") : ["(No category)"];
+  if (depth === 1) return [i.brand || "(No brand)"];
+  if (depth === 2) return [i.brand || "(No brand)", ...catSegs];
+  if (depth >= 3) return [...catSegs];
+  return [];
 };
 
 type Node = {
@@ -106,6 +112,19 @@ export default function ItemsPage() {
   const [creating, setCreating] = useState(false);
   const [editingDetails, setEditingDetails] = useState<Combined | null>(null);
   const [filtersOpen, setFiltersOpen] = useState(false);
+
+  // multi-select → bulk "Move to category" (admin)
+  const [selectMode, setSelectMode] = useState(false);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [moving, setMoving] = useState(false);
+  const toggleSelect = useCallback((id: string) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      next.has(id) ? next.delete(id) : next.add(id);
+      return next;
+    });
+  }, []);
+  const exitSelect = useCallback(() => { setSelectMode(false); setSelected(new Set()); }, []);
 
   // ─── load persisted UI state once ───────────────────────────────────────
   useEffect(() => {
@@ -308,7 +327,7 @@ export default function ItemsPage() {
             <option value={0}>No grouping</option>
             <option value={1}>Group: Brand</option>
             <option value={2}>Group: Brand · Category</option>
-            <option value={3}>Group: Brand · Category · Subcat.</option>
+            <option value={3}>Group: Category only</option>
           </select>
         </div>
 
@@ -331,6 +350,17 @@ export default function ItemsPage() {
             <TableIcon className="w-3.5 h-3.5" />
           </button>
         </div>
+
+        {isAdmin && (
+          <button
+            type="button"
+            onClick={() => (selectMode ? exitSelect() : setSelectMode(true))}
+            className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm border transition-colors flex-shrink-0 ${selectMode ? "bg-cyan-500/15 border-cyan-500/50 text-cyan-700 dark:text-cyan-300" : "bg-white dark:bg-zinc-900 border-zinc-200 dark:border-zinc-800 text-zinc-600 dark:text-zinc-300"}`}
+            title="Select items to move between categories"
+          >
+            <ListChecks className="w-3.5 h-3.5" /> {selectMode ? "Selecting" : "Select"}
+          </button>
+        )}
 
         {depth > 0 && (
           <div className="hidden md:flex items-center gap-1 text-xs">
@@ -375,7 +405,7 @@ export default function ItemsPage() {
             <option value={0}>No grouping</option>
             <option value={1}>Group: Brand</option>
             <option value={2}>Group: Brand · Category</option>
-            <option value={3}>Group: Brand · Category · Subcat.</option>
+            <option value={3}>Group: Category only</option>
           </select>
         </SheetField>
         {depth > 0 && (
@@ -392,9 +422,11 @@ export default function ItemsPage() {
       ) : filtered.length === 0 ? (
         <Empty />
       ) : view === "grid" ? (
-        <GridBody tree={tree} depth={depth} isOpen={isOpen} toggle={toggle} statusOf={statusOf} canWrite={canWrite} onEdit={onEdit} />
+        <GridBody tree={tree} depth={depth} isOpen={isOpen} toggle={toggle} statusOf={statusOf} canWrite={canWrite} onEdit={onEdit}
+          selectMode={selectMode} selected={selected} onToggleSelect={toggleSelect} />
       ) : (
-        <TableBody tree={tree} depth={depth} isOpen={isOpen} toggle={toggle} statusBadge={statusBadge} canWrite={canWrite} onEdit={onEdit} />
+        <TableBody tree={tree} depth={depth} isOpen={isOpen} toggle={toggle} statusBadge={statusBadge} canWrite={canWrite} onEdit={onEdit}
+          selectMode={selectMode} selected={selected} onToggleSelect={toggleSelect} />
       )}
 
       {/* ─── Manual override modal ───────────────────────────── */}
@@ -428,13 +460,47 @@ export default function ItemsPage() {
           onSaved={async () => { await loadData(); setEditingDetails(null); }}
         />
       )}
+
+      {/* ─── Bulk move action bar (select mode) ──────────────── */}
+      {selectMode && (
+        <div className="fixed inset-x-0 bottom-20 md:bottom-6 z-40 flex justify-center px-4 pointer-events-none">
+          <div className="pointer-events-auto flex items-center gap-3 bg-zinc-900 dark:bg-zinc-800 text-white rounded-full shadow-xl border border-white/10 pl-4 pr-2 py-2">
+            <span className="text-sm tabular-nums whitespace-nowrap">{selected.size} selected</span>
+            <button
+              type="button"
+              onClick={() => selected.size > 0 && setMoving(true)}
+              disabled={selected.size === 0}
+              className="inline-flex items-center gap-1.5 bg-cyan-500 hover:bg-cyan-400 disabled:opacity-40 disabled:cursor-not-allowed text-white px-3 py-1.5 rounded-full text-sm font-medium"
+            >
+              <MoveRight className="w-4 h-4" /> Move to…
+            </button>
+            <button type="button" onClick={exitSelect} className="text-zinc-300 hover:text-white px-2 py-1.5 rounded-full text-sm">Done</button>
+          </div>
+        </div>
+      )}
+      {moving && (
+        <MoveItemsModal
+          count={selected.size}
+          ids={[...selected]}
+          categories={categories}
+          onClose={() => setMoving(false)}
+          onMoved={async () => { await loadData(); setMoving(false); exitSelect(); }}
+        />
+      )}
     </Shell>
   );
 }
 
 // ─── grid view ────────────────────────────────────────────────────────────
+// Threaded through the renderers to power select-mode checkboxes + bulk move.
+type SelProps = {
+  selectMode?: boolean;
+  selected?: Set<string>;
+  onToggleSelect?: (id: string) => void;
+};
+
 function GridBody({
-  tree, depth, isOpen, toggle, statusOf, canWrite, onEdit,
+  tree, depth, isOpen, toggle, statusOf, canWrite, onEdit, selectMode, selected, onToggleSelect,
 }: {
   tree: Node[];
   depth: number;
@@ -443,24 +509,25 @@ function GridBody({
   statusOf: (i: Combined) => "out" | "low" | "ok";
   canWrite: boolean;
   onEdit: (i: Combined) => void;
-}) {
+} & SelProps) {
+  const sel = { selectMode, selected, onToggleSelect };
   // When grouping is off, just render one big grid.
   if (depth === 0) {
     return (
       <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5 gap-3">
-        {tree[0]?.items?.map(i => <Card key={i.id} item={i} statusOf={statusOf} canWrite={canWrite} onEdit={onEdit} />)}
+        {tree[0]?.items?.map(i => <Card key={i.id} item={i} statusOf={statusOf} canWrite={canWrite} onEdit={onEdit} {...sel} />)}
       </div>
     );
   }
   return (
     <div className="space-y-6">
-      {tree.map(node => <GroupSection key={node.key} node={node} level={0} isOpen={isOpen} toggle={toggle} statusOf={statusOf} canWrite={canWrite} onEdit={onEdit} />)}
+      {tree.map(node => <GroupSection key={node.key} node={node} level={0} isOpen={isOpen} toggle={toggle} statusOf={statusOf} canWrite={canWrite} onEdit={onEdit} {...sel} />)}
     </div>
   );
 }
 
 function GroupSection({
-  node, level, isOpen, toggle, statusOf, canWrite, onEdit,
+  node, level, isOpen, toggle, statusOf, canWrite, onEdit, selectMode, selected, onToggleSelect,
 }: {
   node: Node;
   level: number;
@@ -469,7 +536,8 @@ function GroupSection({
   statusOf: (i: Combined) => "out" | "low" | "ok";
   canWrite: boolean;
   onEdit: (i: Combined) => void;
-}) {
+} & SelProps) {
+  const sel = { selectMode, selected, onToggleSelect };
   const open = isOpen(node.key);
   // Heading sizes scale down with level.
   const headingClass =
@@ -493,34 +561,43 @@ function GroupSection({
       {open && node.children && (
         <div className="space-y-5">
           {node.children.map(c => (
-            <GroupSection key={c.key} node={c} level={level + 1} isOpen={isOpen} toggle={toggle} statusOf={statusOf} canWrite={canWrite} onEdit={onEdit} />
+            <GroupSection key={c.key} node={c} level={level + 1} isOpen={isOpen} toggle={toggle} statusOf={statusOf} canWrite={canWrite} onEdit={onEdit} {...sel} />
           ))}
         </div>
       )}
       {open && node.items && (
         <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5 gap-3">
-          {node.items.map(i => <Card key={i.id} item={i} statusOf={statusOf} canWrite={canWrite} onEdit={onEdit} />)}
+          {node.items.map(i => <Card key={i.id} item={i} statusOf={statusOf} canWrite={canWrite} onEdit={onEdit} {...sel} />)}
         </div>
       )}
     </section>
   );
 }
 
-function Card({ item, statusOf, canWrite, onEdit }: {
+function Card({ item, statusOf, canWrite, onEdit, selectMode, selected, onToggleSelect }: {
   item: Combined;
   statusOf: (i: Combined) => "out" | "low" | "ok";
   canWrite: boolean;
   onEdit: (i: Combined) => void;
-}) {
+} & SelProps) {
   const c = colourCss(item.colour);
   const total = item.totalA + item.totalB;
   const s = statusOf(item);
   const statusColour = s === "out" ? "text-rose-500" : s === "low" ? "text-amber-500" : "text-emerald-500";
+  const isSel = !!selected?.has(item.id);
   return (
-    <div className="group relative bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg p-3 hover:border-cyan-500/50 hover:shadow-sm dark:hover:shadow-cyan-500/5 transition-all cursor-pointer flex flex-col">
-      {/* Manual override edit button (only for admin/staff) — always visible
-          on touch so mobile users can find it; hover-reveal kept on md+. */}
-      {canWrite && (
+    <div
+      onClick={selectMode ? () => onToggleSelect?.(item.id) : undefined}
+      className={`group relative bg-white dark:bg-zinc-900 border rounded-lg p-3 transition-all cursor-pointer flex flex-col ${isSel ? "border-cyan-500 ring-2 ring-cyan-500/40" : "border-zinc-200 dark:border-zinc-800 hover:border-cyan-500/50 hover:shadow-sm dark:hover:shadow-cyan-500/5"}`}
+    >
+      {/* Selection checkbox (select mode) */}
+      {selectMode && (
+        <span className={`absolute top-2 left-2 z-10 w-5 h-5 rounded-md border flex items-center justify-center ${isSel ? "bg-cyan-500 border-cyan-500 text-white" : "bg-white/90 dark:bg-zinc-900/90 border-zinc-300 dark:border-zinc-600"}`}>
+          {isSel && <Check className="w-3.5 h-3.5" />}
+        </span>
+      )}
+      {/* Manual override edit button (admin/staff) — hidden while selecting. */}
+      {canWrite && !selectMode && (
         <button
           type="button"
           onClick={(e) => { e.stopPropagation(); onEdit(item); }}
@@ -563,15 +640,15 @@ function Card({ item, statusOf, canWrite, onEdit }: {
         {[item.size, item.colour].filter(Boolean).join(" · ") || "—"}
       </div>
 
-      {/* Category › Subcategory — shown on every card so categorisation is
-          visible even at the "No grouping" depth setting. Subtle grey to keep
+      {/* Full category path — shown on every card so the item's place in the
+          tree is visible even at the "No grouping" depth. Subtle grey to keep
           the model as the primary identifier. */}
-      {(item.category || item.subcategory) && (
+      {item.category && (
         <div
           className="text-[10px] text-zinc-400 dark:text-zinc-500 mb-3 truncate"
-          title={[item.category, item.subcategory].filter(Boolean).join(" › ")}
+          title={item.category}
         >
-          {[item.category, item.subcategory].filter(Boolean).join(" › ")}
+          {item.category}
         </div>
       )}
 
@@ -596,7 +673,7 @@ function Card({ item, statusOf, canWrite, onEdit }: {
 // list with the same grouping. Both render from the same tree so the toggle
 // state and counts stay in sync.
 function TableBody({
-  tree, depth, isOpen, toggle, statusBadge, canWrite, onEdit,
+  tree, depth, isOpen, toggle, statusBadge, canWrite, onEdit, selectMode, selected, onToggleSelect,
 }: {
   tree: Node[];
   depth: number;
@@ -605,15 +682,25 @@ function TableBody({
   statusBadge: (i: Combined) => React.ReactNode;
   canWrite: boolean;
   onEdit: (i: Combined) => void;
-}) {
+} & SelProps) {
   // ── mobile card row ────────────────────────────────────────────────────
   const renderMobileItem = (i: Combined) => {
     const total = i.totalA + i.totalB;
     const s = total === 0 ? "out" : total <= 2 ? "low" : "ok";
     const statusColour = s === "out" ? "text-rose-500" : s === "low" ? "text-amber-500" : "text-emerald-500";
     const swatch = colourCss(i.colour);
+    const isSel = !!selected?.has(i.id);
     return (
-      <div key={i.id} className="border-t border-zinc-200/60 dark:border-zinc-800/60 px-4 py-4 active:bg-zinc-50 dark:active:bg-zinc-800/30 flex gap-3">
+      <div
+        key={i.id}
+        onClick={selectMode ? () => onToggleSelect?.(i.id) : undefined}
+        className={`border-t border-zinc-200/60 dark:border-zinc-800/60 px-4 py-4 flex gap-3 ${isSel ? "bg-cyan-500/10" : "active:bg-zinc-50 dark:active:bg-zinc-800/30"}`}
+      >
+        {selectMode && (
+          <span className={`mt-0.5 w-5 h-5 rounded-md border flex items-center justify-center flex-shrink-0 ${isSel ? "bg-cyan-500 border-cyan-500 text-white" : "bg-white dark:bg-zinc-900 border-zinc-300 dark:border-zinc-600"}`}>
+            {isSel && <Check className="w-3.5 h-3.5" />}
+          </span>
+        )}
         {/* Colour swatch chip */}
         <div
           className="w-11 h-11 rounded-xl flex-shrink-0 flex items-center justify-center text-[10px] font-medium"
@@ -638,7 +725,7 @@ function TableBody({
               <span className="text-zinc-500">B <b className="text-zinc-900 dark:text-zinc-100">{fmtN(i.totalB)}</b></span>
               <span className={`${statusColour} font-semibold`}>● {fmtN(total)}</span>
             </div>
-            {canWrite && (
+            {canWrite && !selectMode && (
               <button
                 type="button"
                 onClick={(e) => { e.stopPropagation(); onEdit(i); }}
@@ -685,8 +772,13 @@ function TableBody({
 
   const renderItemRow = (i: Combined, indent: number) => {
     const c = colourCss(i.colour);
+    const isSel = !!selected?.has(i.id);
     return (
-      <tr key={i.id} className="group border-t border-zinc-200/50 dark:border-zinc-800/50 hover:bg-zinc-50 dark:hover:bg-zinc-800/40 cursor-pointer">
+      <tr
+        key={i.id}
+        onClick={selectMode ? () => onToggleSelect?.(i.id) : undefined}
+        className={`group border-t border-zinc-200/50 dark:border-zinc-800/50 cursor-pointer ${isSel ? "bg-cyan-500/10" : "hover:bg-zinc-50 dark:hover:bg-zinc-800/40"}`}
+      >
         <td className="px-5 py-2.5" style={{ paddingLeft: `${indent * 16 + 20}px` }}>
           {i.brand
             ? <span className="bg-cyan-500/15 text-cyan-600 dark:text-cyan-300 px-2 py-0.5 rounded text-[11px]">{i.brand}</span>
@@ -704,7 +796,11 @@ function TableBody({
         <td className="px-3 py-2.5 text-right tnum font-semibold">{fmtN(i.totalA + i.totalB)}</td>
         <td className="px-3 py-2.5 text-right">{statusBadge(i)}</td>
         <td className="px-5 py-2.5 text-right w-10">
-          {canWrite && (
+          {selectMode ? (
+            <span className={`inline-flex w-5 h-5 rounded-md border items-center justify-center ${isSel ? "bg-cyan-500 border-cyan-500 text-white" : "border-zinc-300 dark:border-zinc-600"}`}>
+              {isSel && <Check className="w-3.5 h-3.5" />}
+            </span>
+          ) : canWrite && (
             <button
               type="button"
               onClick={(e) => { e.stopPropagation(); onEdit(i); }}
@@ -1097,5 +1193,68 @@ function NumInput({
       onChange={(e) => onChange(e.target.value)}
       className="w-full bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-cyan-500 tnum disabled:opacity-50 disabled:cursor-not-allowed"
     />
+  );
+}
+
+// ─── bulk "Move to category" modal ────────────────────────────────────────
+// Repoints the selected items at one category node (or "— none —" to clear it)
+// via the set_items_category RPC. Pure catalogue move — never touches stock.
+function MoveItemsModal({
+  count, ids, categories, onClose, onMoved,
+}: {
+  count: number;
+  ids: string[];
+  categories: CatRow[];
+  onClose: () => void;
+  onMoved: () => void | Promise<void>;
+}) {
+  const [target, setTarget] = useState<string>("");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const targetPath = useMemo(() => (target ? pathById(categories).get(target) : ""), [target, categories]);
+
+  async function move() {
+    setError(null);
+    setSaving(true);
+    try {
+      const { error: e } = await sb().rpc("set_items_category", { p_item_ids: ids, p_category_id: target || null });
+      if (e) throw e;
+      await onMoved();
+    } catch (e: any) {
+      setError(e?.message || "Couldn't move the items.");
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/50 dark:bg-black/70 flex items-end sm:items-center justify-center p-0 sm:p-4" role="dialog" aria-modal="true" onClick={onClose}>
+      <div className="bg-white dark:bg-zinc-900 rounded-t-2xl sm:rounded-2xl w-full max-w-md shadow-lg border border-zinc-200 dark:border-zinc-800 animate-slide-up" onClick={(e) => e.stopPropagation()}>
+        <div className="px-5 py-4 border-b border-zinc-200 dark:border-zinc-800 flex items-center justify-between">
+          <h2 className="text-base font-semibold">Move {count} item{count === 1 ? "" : "s"}</h2>
+          <button onClick={onClose} aria-label="Close" className="text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200 p-1"><X className="w-5 h-5" /></button>
+        </div>
+        <div className="p-5 space-y-3">
+          <div className="text-[11px] uppercase tracking-wider text-zinc-500 font-medium">Destination category</div>
+          <CategoryTreePicker rows={categories} value={target} onChange={setTarget}
+            className="w-full bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-cyan-500" />
+          <p className="text-xs text-zinc-500 truncate">
+            {target ? `Into ${targetPath}` : "“— none —” clears the category (uncategorised)."}
+          </p>
+          {error && (
+            <div className="text-sm text-rose-600 dark:text-rose-300 bg-rose-500/10 border border-rose-500/30 rounded-md p-2.5 flex items-start gap-2">
+              <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
+              <span className="min-w-0 break-words">{error}</span>
+            </div>
+          )}
+        </div>
+        <div className="px-5 py-3 border-t border-zinc-200 dark:border-zinc-800 flex justify-end gap-2 bg-zinc-50 dark:bg-zinc-900/50" style={{ paddingBottom: "calc(0.75rem + env(safe-area-inset-bottom))" }}>
+          <button onClick={onClose} className="px-3 py-2 text-sm text-zinc-600 dark:text-zinc-300 hover:bg-zinc-200 dark:hover:bg-zinc-800 rounded-md">Cancel</button>
+          <button onClick={move} disabled={saving}
+            className="bg-cyan-500 hover:bg-cyan-400 disabled:opacity-40 text-white px-3.5 py-2 rounded-md text-sm font-medium inline-flex items-center gap-1.5">
+            {saving ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <MoveRight className="w-3.5 h-3.5" />} Move {count}
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }

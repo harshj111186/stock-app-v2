@@ -1,6 +1,6 @@
 "use client";
-import { useState } from "react";
-import { X, Save, Loader2, AlertCircle, Plus, Archive, ArchiveRestore } from "lucide-react";
+import { useState, useMemo } from "react";
+import { X, Save, Loader2, AlertCircle, Plus, Archive, ArchiveRestore, FolderPlus } from "lucide-react";
 import { sb, type Item } from "@/lib/supabase";
 import { CategoryTreePicker } from "@/components/category-tree-picker";
 import { pathById, type CatRow } from "@/lib/categories";
@@ -23,7 +23,12 @@ export function ItemFormModal({
   const [model, setModel] = useState(item?.model ?? "");
   const [brand, setBrand] = useState(item?.brand ?? "");
   const [categoryId, setCategoryId] = useState(item?.category_id ?? "");
-  const [subcategory, setSubcategory] = useState(item?.subcategory ?? "");
+  // Local copy of the tree so a newly-created (sub)category shows up instantly.
+  const [cats, setCats] = useState<CatRow[]>(categories);
+  const [showNewCat, setShowNewCat] = useState(false);
+  const [newCatName, setNewCatName] = useState("");
+  const [newCatParent, setNewCatParent] = useState<string>("");
+  const [creatingCat, setCreatingCat] = useState(false);
   const [size, setSize] = useState(item?.size ?? "");
   const [colour, setColour] = useState(item?.colour ?? "");
   const [caseSize, setCaseSize] = useState(String(item?.case_size ?? ""));
@@ -84,7 +89,6 @@ export function ItemFormModal({
         p_model: model.trim(),
         p_brand: brand.trim() || null,
         p_category_id: categoryId || null,
-        p_subcategory: subcategory.trim() || null,
         p_size: size.trim() || null,
         p_colour: colour.trim() || null,
         p_case_size: Number(caseSize || 0) | 0,
@@ -105,6 +109,36 @@ export function ItemFormModal({
       setError(e?.message || "Failed to save item.");
     } finally {
       setSaving(false);
+    }
+  }
+
+  const pathOf = useMemo(() => pathById(cats), [cats]);
+
+  async function createCategory() {
+    const name = newCatName.trim();
+    if (!name) return;
+    setCreatingCat(true);
+    setError(null);
+    try {
+      const { data, error: e } = await sb().rpc("category_create", {
+        p_name: name, p_parent_id: newCatParent || null,
+      });
+      if (e) throw e;
+      const newId = data as string;
+      // Re-pull the tree so the picker shows the new (or reused) node.
+      const { data: fresh } = await sb().from("categories").select("*");
+      const rows: CatRow[] = ((fresh || []) as any[]).map((x) => ({
+        id: x.id, name: x.name, parent_id: x.parent_id ?? null,
+        sort_order: x.sort_order ?? 0, archived: x.archived ?? false,
+      }));
+      setCats(rows);
+      setCategoryId(newId);
+      setShowNewCat(false);
+      setNewCatName("");
+    } catch (e: any) {
+      setError(e?.message || "Couldn't create the category.");
+    } finally {
+      setCreatingCat(false);
     }
   }
 
@@ -155,18 +189,58 @@ export function ItemFormModal({
             </Field>
           </div>
 
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-            <Field label="Category" hint="any level of the tree">
-              <CategoryTreePicker rows={categories} value={categoryId} onChange={setCategoryId} className={inputCls} />
-              {categoryId && (
-                <div className="text-[11px] text-zinc-500 mt-1 truncate">{pathById(categories).get(categoryId) || ""}</div>
-              )}
-            </Field>
-            <Field label="Subcategory">
-              <input value={subcategory} onChange={(e) => setSubcategory(e.target.value)}
-                placeholder="optional" className={inputCls} />
-            </Field>
-          </div>
+          <Field label="Category" hint="pick any level — this is where the item lives in the tree">
+            <CategoryTreePicker rows={cats} value={categoryId} onChange={setCategoryId} className={inputCls} />
+            {categoryId && (
+              <div className="text-[11px] text-zinc-500 mt-1 truncate">{pathOf.get(categoryId) || ""}</div>
+            )}
+            {!showNewCat ? (
+              <button
+                type="button"
+                onClick={() => { setNewCatParent(categoryId); setNewCatName(""); setShowNewCat(true); }}
+                className="mt-2 inline-flex items-center gap-1 text-[12px] text-cyan-600 dark:text-cyan-400 hover:underline"
+              >
+                <FolderPlus className="w-3.5 h-3.5" /> New category / subcategory
+              </button>
+            ) : (
+              <div className="mt-2 border border-cyan-500/30 bg-cyan-500/[0.04] rounded-md p-3 space-y-2">
+                <div>
+                  <div className="text-[10px] uppercase tracking-wider text-zinc-500 font-medium mb-1">Parent</div>
+                  <CategoryTreePicker rows={cats} value={newCatParent} onChange={setNewCatParent} className={inputCls} />
+                  <div className="text-[11px] text-zinc-500 mt-1 truncate">
+                    {newCatParent ? `Under ${pathOf.get(newCatParent) || "…"}` : "Creates a top-level category"}
+                  </div>
+                </div>
+                <div>
+                  <div className="text-[10px] uppercase tracking-wider text-zinc-500 font-medium mb-1">New name</div>
+                  <input
+                    value={newCatName}
+                    autoFocus
+                    onChange={(e) => setNewCatName(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); void createCategory(); } }}
+                    placeholder="e.g. Modular, Premium, Ceiling…"
+                    className={inputCls}
+                  />
+                </div>
+                <div className="flex items-center gap-2 pt-0.5">
+                  <button
+                    type="button" onClick={() => void createCategory()} disabled={creatingCat || !newCatName.trim()}
+                    className="bg-cyan-500 hover:bg-cyan-400 disabled:opacity-40 text-white px-3 py-1.5 rounded-md text-[13px] font-medium inline-flex items-center gap-1.5"
+                  >
+                    {creatingCat ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Plus className="w-3.5 h-3.5" />}
+                    Add &amp; select
+                  </button>
+                  <button
+                    type="button" onClick={() => { setShowNewCat(false); setNewCatName(""); }}
+                    className="px-3 py-1.5 text-[13px] text-zinc-600 dark:text-zinc-300 hover:bg-zinc-200 dark:hover:bg-zinc-800 rounded-md"
+                  >
+                    Cancel
+                  </button>
+                </div>
+                <p className="text-[11px] text-zinc-500">Reuses the existing one if that name already exists under the parent — no duplicates.</p>
+              </div>
+            )}
+          </Field>
 
           <div className="grid grid-cols-2 gap-4">
             <Field label="Size"><input value={size} onChange={(e) => setSize(e.target.value)} placeholder="e.g. 1200mm" className={inputCls} /></Field>

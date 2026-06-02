@@ -27,14 +27,15 @@ type ItemHere = Item & {
 
 // ─── grouping helpers ────────────────────────────────────────────────────
 const SEP = "›";
-// Group path per item: Brand, then EACH category-tree segment (so a nested
-// category becomes multiple expandable levels), then Subcategory.
+// Group path per item. The category is the item's FULL place in the tree, so
+// categorising deeper just deepens the grouping — no separate free-text axis.
+//   1 = Brand · 2 = Brand › Category(full) · 3 = Category(full) only
 const groupPath = (i: ItemHere, depth: number): string[] => {
-  const out: string[] = [];
-  if (depth >= 1) out.push(i.brand || "(No brand)");
-  if (depth >= 2) out.push(...(i.category ? i.category.split(" › ") : ["(No category)"]));
-  if (depth >= 3) out.push(i.subcategory || "(No subcategory)");
-  return out;
+  const catSegs = i.category ? i.category.split(" › ") : ["(No category)"];
+  if (depth === 1) return [i.brand || "(No brand)"];
+  if (depth === 2) return [i.brand || "(No brand)", ...catSegs];
+  if (depth >= 3) return [...catSegs];
+  return [];
 };
 
 type Node = {
@@ -281,7 +282,7 @@ export function GodownView({ godown }: { godown: Godown }) {
             <option value={0}>No grouping</option>
             <option value={1}>Group: Brand</option>
             <option value={2}>Group: Brand · Category</option>
-            <option value={3}>Group: Brand · Category · Subcat.</option>
+            <option value={3}>Group: Category only</option>
           </select>
         </div>
 
@@ -348,7 +349,7 @@ export function GodownView({ godown }: { godown: Godown }) {
             <option value={0}>No grouping</option>
             <option value={1}>Group: Brand</option>
             <option value={2}>Group: Brand · Category</option>
-            <option value={3}>Group: Brand · Category · Subcat.</option>
+            <option value={3}>Group: Category only</option>
           </select>
         </SheetField>
         {depth > 0 && (
