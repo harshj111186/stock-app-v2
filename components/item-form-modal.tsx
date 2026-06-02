@@ -39,8 +39,6 @@ export function ItemFormModal({
   const [gstPct, setGstPct] = useState(
     item?.gst_rate != null ? String(Math.round(item.gst_rate * 100)) : ""
   );
-  const [itemCode, setItemCode] = useState(item?.item_code ?? "");
-
   const [saving, setSaving] = useState(false);
   const [archiving, setArchiving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -98,7 +96,7 @@ export function ItemFormModal({
         p_reorder_point_b: Number(reorderB || 0) | 0,
       };
       if (mode === "create") {
-        const { error: e } = await c.rpc("create_item", { ...common, p_item_code: itemCode.trim() || null });
+        const { error: e } = await c.rpc("create_item", { ...common, p_item_code: null });
         if (e) throw e;
       } else {
         const { error: e } = await c.rpc("update_item", { p_item_id: item!.id, ...common });
@@ -177,17 +175,18 @@ export function ItemFormModal({
               placeholder="e.g. Renesa 1200mm" className={inputCls} />
           </Field>
 
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-            <Field label="Brand">
-              <input list="brand-list" value={brand} onChange={(e) => setBrand(e.target.value)}
-                placeholder="e.g. Goldmedal" className={inputCls} />
-              <datalist id="brand-list">{brands.map(b => <option key={b} value={b} />)}</datalist>
-            </Field>
-            <Field label="Item code" hint="auto if blank">
-              <input value={itemCode} onChange={(e) => setItemCode(e.target.value)}
-                placeholder="auto" className={inputCls} />
-            </Field>
-          </div>
+          <Field label="Brand">
+            <input list="brand-list" value={brand} onChange={(e) => setBrand(e.target.value)}
+              placeholder="e.g. Goldmedal" className={inputCls} />
+            <datalist id="brand-list">{brands.map(b => <option key={b} value={b} />)}</datalist>
+          </Field>
+          {mode === "create" ? (
+            <p className="text-[11px] text-zinc-500 -mt-1">The item code is generated automatically.</p>
+          ) : item?.item_code ? (
+            <p className="text-[11px] text-zinc-500 -mt-1">
+              Item code <span className="tnum text-zinc-600 dark:text-zinc-300">{item.item_code}</span> · auto-assigned, can’t be changed.
+            </p>
+          ) : null}
 
           <Field label="Category" hint="pick any level — this is where the item lives in the tree">
             <CategoryTreePicker rows={cats} value={categoryId} onChange={setCategoryId} className={inputCls} />
