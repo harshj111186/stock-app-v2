@@ -6,7 +6,7 @@ import {
 import { Shell } from "@/components/shell";
 import { useAuth } from "@/app/providers";
 import { sb, type Item, type Pricing } from "@/lib/supabase";
-import { fmtMoney, matchesQuery } from "@/lib/utils";
+import { fmtMoney, fmtN, matchesQuery } from "@/lib/utils";
 import { SearchBox } from "@/components/search-box";
 
 // Pricing values are stored as FRACTIONS in Supabase (0.18 = 18%, 0.15 = 15%)
@@ -30,6 +30,10 @@ type Row = Item & {
   baseDiscs: number[];   // stored fractions, in order
   baseGst: number;
   hasRow: boolean;
+  // Current physical stock (info only — not editable on this page).
+  stock: number;
+  stockA: number;
+  stockB: number;
 };
 type SaveState = "idle" | "saving" | "saved" | "error";
 
@@ -79,10 +83,11 @@ export default function PricingPage() {
   useEffect(() => {
     (async () => {
       const c = sb();
-      const [{ data: items, error: e1 }, { data: pricing, error: e2 }, { data: cats }] = await Promise.all([
+      const [{ data: items, error: e1 }, { data: pricing, error: e2 }, { data: cats }, { data: stock }] = await Promise.all([
         c.from("items").select("*").eq("archived", false).order("item_code"),
         c.from("pricing").select("*"),
         c.from("categories").select("id, name"),
+        c.from("godown_stock").select("*"),
       ]);
       if (e1 || e2) { setError((e1 || e2)!.message); setLoaded(true); return; }
       const catMap = new Map<string, string>(
@@ -90,9 +95,21 @@ export default function PricingPage() {
       );
       const pMap = new Map<string, Pricing>();
       (pricing || []).forEach((p: any) => pMap.set(p.item_id, p as Pricing));
+      // Current stock per item (info only): cases × case_size + loose, per godown.
+      const sMap = new Map<string, { A: { cases: number; loose: number }; B: { cases: number; loose: number } }>();
+      (stock || []).forEach((s: any) => {
+        const e = sMap.get(s.item_id) ?? { A: { cases: 0, loose: 0 }, B: { cases: 0, loose: 0 } };
+        if (s.godown === "A" || s.godown === "B") e[s.godown as "A" | "B"] = { cases: s.cases || 0, loose: s.loose || 0 };
+        sMap.set(s.item_id, e);
+      });
 
       const next: Row[] = (items || []).map((i: any) => {
         const p = pMap.get(i.id);
+        const cs = i.case_size || 0;
+        const sa = sMap.get(i.id)?.A ?? { cases: 0, loose: 0 };
+        const sbk = sMap.get(i.id)?.B ?? { cases: 0, loose: 0 };
+        const stockA = cs > 0 ? sa.cases * cs + sa.loose : sa.loose;
+        const stockB = cs > 0 ? sbk.cases * cs + sbk.loose : sbk.loose;
         // Prefer the explicit discounts array (post-migration). Fall back to
         // the legacy single `discount` column if the array is empty but the
         // legacy field is set — covers any row that wasn't backfilled.
@@ -113,6 +130,7 @@ export default function PricingPage() {
           baseDiscs,
           baseGst: gst,
           hasRow: !!p,
+          stockA, stockB, stock: stockA + stockB,
         };
       });
       setRows(next);
@@ -351,6 +369,7 @@ function PricingTable({
           <thead className="bg-zinc-50 dark:bg-zinc-900/50 border-b border-zinc-200 dark:border-zinc-800">
             <tr className="text-zinc-500 text-[11px] uppercase tracking-wider">
               <th className="text-left px-5 py-2.5 font-medium">Item</th>
+              <th className="text-right px-3 py-2.5 font-medium w-20">Stock</th>
               <th className="text-right px-3 py-2.5 font-medium w-28">LP (₹)</th>
               <th className="text-left px-3 py-2.5 font-medium">Discounts (%)</th>
               <th className="text-right px-3 py-2.5 font-medium w-28">Taxable (₹)</th>
@@ -439,6 +458,9 @@ function PricingMobileCard({
           </div>
           <div className="text-[11px] text-zinc-500 truncate">
             {[row.size, row.colour].filter(Boolean).join(" · ") || "—"}
+            <span className="ml-1 text-zinc-400" title={`A: ${fmtN(row.stockA)} · B: ${fmtN(row.stockB)}`}>
+              · stock <span className={`tnum ${row.stock === 0 ? "text-rose-500" : "text-zinc-600 dark:text-zinc-300"}`}>{fmtN(row.stock)}</span>
+            </span>
             {!row.hasRow && <span className="ml-1 text-amber-500 uppercase tracking-wider">unpriced</span>}
           </div>
         </div>
@@ -598,6 +620,16 @@ function PricingRow({
             <span className="ml-2 text-amber-500 text-[10px] uppercase tracking-wider">unpriced</span>
           )}
         </div>
+      </td>
+
+      {/* Current stock (info only) */}
+      <td className="px-3 py-2.5 text-right">
+        <span
+          className={`tnum text-xs ${row.stock === 0 ? "text-rose-500" : "text-zinc-600 dark:text-zinc-300"}`}
+          title={`A: ${fmtN(row.stockA)} · B: ${fmtN(row.stockB)}`}
+        >
+          {fmtN(row.stock)}
+        </span>
       </td>
 
       {/* LP */}
