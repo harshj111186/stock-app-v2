@@ -153,6 +153,16 @@ $$;
 
 grant execute on function set_items_category(uuid[], uuid) to authenticated;
 
+-- ── 3b. Make the legacy text columns nullable ───────────────────────────────
+-- items.subcategory (and items.category) were declared NOT NULL. That is the
+-- actual reason an "optional" subcategory errored when left blank on create, and
+-- why the fold below couldn't null the column out. The tree (category_id) is the
+-- source of truth now; these text columns are derived/legacy and may be null
+-- (e.g. an uncategorised item, or one moved to "— none —"). drop-not-null is a
+-- no-op if already nullable, so this stays safe to re-run.
+alter table items alter column subcategory drop not null;
+alter table items alter column category    drop not null;
+
 -- ── 4. Fold legacy free-text subcategories into the tree ────────────────────
 -- For each item that still has a free-text subcategory, ensure a child category
 -- of that name exists under the item's current category (or as a top-level node
