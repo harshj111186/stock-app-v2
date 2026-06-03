@@ -2,6 +2,8 @@
 import { createContext, useCallback, useContext, useEffect, useState, type ReactNode } from "react";
 import { useRouter, usePathname } from "next/navigation";
 import { sb, type Profile, PROFILE_COLUMNS } from "@/lib/supabase";
+import { isDemo, demoProfile, exitDemo } from "@/lib/demo";
+import { DemoHowItWorks } from "@/components/demo-how-it-works";
 import { PinGate } from "@/components/pin-gate";
 import { PendingApproval } from "@/components/pending-approval";
 
@@ -110,6 +112,9 @@ export function Providers({ children }: { children: ReactNode }) {
       document.documentElement.classList.add("dark");
     }
 
+    // Public demo mode: skip real auth entirely (no Supabase auth listener).
+    if (isDemo()) { setLoading(false); return; }
+
     let cancelled = false;
     let bootstrapped = false;
     const c = sb();
@@ -171,6 +176,7 @@ export function Providers({ children }: { children: ReactNode }) {
   // ─── Redirect: must be signed in to see anything except /login ────────
   useEffect(() => {
     if (loading) return;
+    if (isDemo()) return; // demo bypasses the auth redirect
     const onLogin = pathname?.endsWith("/login") || pathname?.endsWith("/login/");
     if (!profile && !onLogin) router.replace("/login");
     if (profile && onLogin) router.replace("/");
@@ -192,6 +198,26 @@ export function Providers({ children }: { children: ReactNode }) {
 
   // ─── Render ───────────────────────────────────────────────────────────
   const onLogin = pathname?.endsWith("/login") || pathname?.endsWith("/login/");
+
+  // Public demo mode: render the app directly with a mock admin profile, past
+  // all auth/PIN gates. Data comes from the mock client (no real DB).
+  if (isDemo()) {
+    const demoSignOut = async () => {
+      exitDemo();
+      window.location.assign(process.env.NODE_ENV === "production" ? "/stock-app-v2/login" : "/login");
+    };
+    return (
+      <AuthContext.Provider value={{ loading: false, profile: demoProfile() as Profile, signOut: demoSignOut, refreshProfile: async () => {} }}>
+        {children}
+        <DemoHowItWorks />
+        <div className="fixed bottom-3 left-1/2 -translate-x-1/2 z-[9999] flex items-center gap-2.5 rounded-full border border-amber-400/50 bg-amber-500/15 backdrop-blur px-3.5 py-1.5 text-xs text-amber-700 dark:text-amber-200 shadow-lg">
+          <span className="inline-flex items-center gap-1.5"><span className="w-1.5 h-1.5 rounded-full bg-amber-500" />Demo mode · sample data</span>
+          <button onClick={() => { try { window.dispatchEvent(new Event("demo:hiw")); } catch {} }} className="font-medium underline underline-offset-2 hover:text-amber-900 dark:hover:text-amber-100">How it works</button>
+          <button onClick={demoSignOut} className="font-medium underline underline-offset-2 hover:text-amber-900 dark:hover:text-amber-100">Exit</button>
+        </div>
+      </AuthContext.Provider>
+    );
+  }
 
   // Login page always renders directly — it has its own auth UI. (Shell + the
   // gates only matter for in-app pages.)

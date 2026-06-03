@@ -1,5 +1,6 @@
 "use client";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
+import { isDemo, createDemoClient } from "./demo";
 
 const url = process.env.NEXT_PUBLIC_SUPABASE_URL!;
 const key = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
@@ -19,7 +20,13 @@ type LockFn = <R>(name: string, acquireTimeout: number, fn: () => Promise<R>) =>
 const lockNoop: LockFn = async (_name, _acquireTimeout, fn) => fn();
 
 let _client: SupabaseClient | null = null;
+let _demoClient: SupabaseClient | null = null;
 export function sb(): SupabaseClient {
+  // Public demo mode: a fully mock client. Never contacts the real database.
+  if (isDemo()) {
+    if (!_demoClient) _demoClient = createDemoClient();
+    return _demoClient;
+  }
   if (!_client) {
     _client = createClient(url, key, {
       auth: {

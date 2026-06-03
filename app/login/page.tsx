@@ -3,6 +3,7 @@ import { useState } from "react";
 import { Package, KeyRound, AlertCircle, Loader2 } from "lucide-react";
 import { sb } from "@/lib/supabase";
 import { markPinUnlocked } from "@/app/providers";
+import { enterDemo } from "@/lib/demo";
 
 // Sign-in / sign-up.
 //
@@ -39,6 +40,12 @@ export default function LoginPage() {
   const [msg, setMsg] = useState("");
 
   const reset = () => { setErr(""); setMsg(""); };
+
+  // Public demo: enter mock mode (no real DB) and open the app.
+  const viewDemo = () => {
+    enterDemo();
+    window.location.assign(process.env.NODE_ENV === "production" ? "/stock-app-v2/" : "/");
+  };
 
   const validateSignup = (): string | null => {
     if (!/^\d{4}$/.test(pin)) return "PIN must be exactly 4 digits.";
@@ -148,6 +155,13 @@ export default function LoginPage() {
 
   return (
     <div className="min-h-screen flex items-center justify-center px-4 bg-zinc-50 dark:bg-zinc-950">
+      <button
+        type="button" onClick={viewDemo}
+        className="fixed top-4 right-4 z-50 inline-flex items-center gap-1.5 text-xs font-medium px-3.5 py-2 rounded-full border border-cyan-500/40 text-cyan-600 dark:text-cyan-300 bg-white/80 dark:bg-zinc-900/70 backdrop-blur hover:bg-cyan-500 hover:text-white hover:border-cyan-500 transition-colors shadow-sm"
+        title="Explore the app with sample data — no login needed"
+      >
+        View demo <span aria-hidden>→</span>
+      </button>
       <div className="w-full max-w-sm bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-xl p-8 shadow-lg shadow-zinc-200/30 dark:shadow-black/40">
         <div className="flex items-center gap-3 mb-6">
           <div className="w-9 h-9 bg-cyan-500 rounded-lg flex items-center justify-center">
