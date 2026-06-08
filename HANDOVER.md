@@ -2,7 +2,7 @@
 
 > Snapshot to resume work in a fresh session. **Read `PROGRESS.md` too** — it's the
 > full source of truth (this file is just the "where things stand right now" summary).
-> As of commit **`a5c471d`** (2026-06-02) — fully activated. Branch `main` is in sync with origin.
+> As of commit **`2103606`** (2026-06-03) — fully activated. Branch `main` is in sync with origin.
 
 ---
 
@@ -11,9 +11,16 @@
 Everything is **committed, pushed, live, and switched on**. Every `db/*.sql` (through
 `2026-06-02-category-redo.sql` — confirmed `items_with_legacy_subcat = 0`, 18 categories / 4 nested)
 has been run, and both Edge Functions (`master-login`, `admin-account`) are deployed. Nothing pending.
+The 2026-06-03 reconciliation tweaks (count steppers + prominent system stock) are client-only — no SQL.
 
-Only loose end (cosmetic): `db/diagnostics-reconciliation-integrity.sql` has an **uncommitted local
-edit** (the user's read-only diagnostic query, not from our work). Commit or leave it — zero app effect.
+A full re-audit on 2026-06-03 (8 subsystems, adversarially verified) found the codebase healthy.
+
+**Known follow-ups (low priority, not blocking):**
+- Low-stock threshold is computed 3 different ways (dashboard `Math.max(reorder_a+reorder_b,2)`,
+  godown-view per-godown reorder points, items page flat `≤2`). Unify into one `lib/utils` helper when
+  convenient — changes "low" semantics app-wide, so confirm intent first.
+- `db/diagnostics-reconciliation-integrity.sql` has an **uncommitted local edit** (the user's read-only
+  diagnostic query, not from our work). Commit or leave it — zero app effect.
 
 ---
 
