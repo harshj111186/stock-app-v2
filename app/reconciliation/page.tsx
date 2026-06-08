@@ -296,21 +296,42 @@ export default function ReconciliationPage() {
 
     writeDrafts(next);
   }, [profile?.id, writeDrafts]);
+  // Keep the system-stock baseline fresh too — it's now shown prominently next
+  // to each count, and an admin may adjust stock elsewhere mid-count.
+  const refreshAppStock = useCallback(async () => {
+    const { data: stock } = await sb().from("godown_stock").select("*");
+    if (!stock) return;
+    setAppStock((prev) => {
+      const blank: AppStock = { cases: 0, loose: 0, hasStockRow: false };
+      const next = new Map<string, { A: AppStock; B: AppStock }>();
+      for (const id of prev.keys()) next.set(id, { A: { ...blank }, B: { ...blank } });
+      (stock as any[]).forEach((s) => {
+        const cur = next.get(s.item_id);
+        if (!cur) return;
+        cur[s.godown as Godown] = { cases: s.cases ?? 0, loose: s.loose ?? 0, hasStockRow: true };
+      });
+      return next;
+    });
+  }, []);
+
   useEffect(() => {
-    if (!loaded) return;
-    const onVis = () => { if (document.visibilityState === "visible") void refreshDrafts(); };
+    // Pause polling during a commit — makeAdjustments mutates godown_stock one
+    // row at a time, and a mid-commit refreshAppStock would flicker the diff
+    // column as rows land. The post-commit load() is the authoritative refresh.
+    if (!loaded || processing) return;
+    const onVis = () => { if (document.visibilityState === "visible") { void refreshDrafts(); void refreshAppStock(); } };
     document.addEventListener("visibilitychange", onVis);
     // Admin actively reviewing — refresh fast (3s) so staff typing shows up
     // near-live. Otherwise (My count for everyone) drop to 30s; the user
     // doesn't need to see other counters' updates while they're entering
     // their own count.
     const intervalMs = mode === "reviewer" ? 3000 : 30000;
-    const id = window.setInterval(() => { void refreshDrafts(); }, intervalMs);
+    const id = window.setInterval(() => { void refreshDrafts(); void refreshAppStock(); }, intervalMs);
     return () => {
       document.removeEventListener("visibilitychange", onVis);
       window.clearInterval(id);
     };
-  }, [loaded, refreshDrafts, mode]);
+  }, [loaded, processing, refreshDrafts, refreshAppStock, mode]);
 
   // Optimistic local mutation; the actual DB write happens debounced below.
   const setField = useCallback((userId: string, itemId: string, field: Field, value: string) => {
@@ -1305,28 +1326,28 @@ function MyDesktopRow({
           />
         </td>
         <td className="px-2 py-2">
-          <ExprInput value={d.a_cases_raw} placeholder="—"
+          <ExprInput value={d.a_cases_raw} placeholder={String(app.A.cases)}
             onChange={(v) => onChange("a_cases", v)}
             onBlur={onBlur}
             tone={rd.A.userTouched ? (rd.A.valid ? "amber" : "rose") : "neutral"}
             ariaLabel={`Godown A cases for ${i.model}`} />
         </td>
         <td className="px-2 py-2">
-          <ExprInput value={d.a_loose_raw} placeholder="—"
+          <ExprInput value={d.a_loose_raw} placeholder={String(app.A.loose)}
             onChange={(v) => onChange("a_loose", v)}
             onBlur={onBlur}
             tone={rd.A.userTouched ? (rd.A.valid ? "amber" : "rose") : "neutral"}
             ariaLabel={`Godown A loose for ${i.model}`} />
         </td>
         <td className="px-2 py-2">
-          <ExprInput value={d.b_cases_raw} placeholder="—"
+          <ExprInput value={d.b_cases_raw} placeholder={String(app.B.cases)}
             onChange={(v) => onChange("b_cases", v)}
             onBlur={onBlur}
             tone={rd.B.userTouched ? (rd.B.valid ? "amber" : "rose") : "neutral"}
             ariaLabel={`Godown B cases for ${i.model}`} />
         </td>
         <td className="px-2 py-2">
-          <ExprInput value={d.b_loose_raw} placeholder="—"
+          <ExprInput value={d.b_loose_raw} placeholder={String(app.B.loose)}
             onChange={(v) => onChange("b_loose", v)}
             onBlur={onBlur}
             tone={rd.B.userTouched ? (rd.B.valid ? "amber" : "rose") : "neutral"}
@@ -1414,10 +1435,18 @@ function BreakupCell({
           ) : (
             <span className="text-[11px] text-zinc-400">not counted</span>
           )}
+          {youShown && side.valid && (
+            <span className={cn(
+              "text-[10px] tabular-nums font-semibold",
+              side.diff === 0 ? "text-zinc-400" : side.diff > 0 ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"
+            )}>
+              ({side.diff > 0 ? "+" : ""}{fmtN(side.diff)})
+            </span>
+          )}
         </div>
         <div className="flex flex-wrap items-baseline gap-x-2 pl-[18px]">
-          <span className="text-[10px] tabular-nums text-zinc-400">
-            app {breakupStr(itemCs, appSide.cases, appSide.loose)}
+          <span className="text-[10px] tabular-nums text-zinc-500">
+            system {breakupStr(itemCs, appSide.cases, appSide.loose)}
           </span>
           {othersForG.map((o, idx) => (
             <span key={idx} className="text-[10px] tabular-nums text-cyan-600/80 dark:text-cyan-400/80">
@@ -1438,7 +1467,7 @@ function BreakupCell({
 
 // ─── ExprInput ───────────────────────────────────────────────────────────
 function ExprInput({
-  value, placeholder, onChange, onBlur, tone, ariaLabel, compact = false,
+  value, placeholder, onChange, onBlur, tone, ariaLabel, compact = false, stepper = false,
 }: {
   value: string;
   placeholder: string;
@@ -1447,6 +1476,7 @@ function ExprInput({
   tone: "neutral" | "amber" | "rose";
   ariaLabel: string;
   compact?: boolean;
+  stepper?: boolean;
 }) {
   const parsed = parseExpr(value);
   const showsTotal = value.includes("+") && parsed !== null;
@@ -1457,8 +1487,8 @@ function ExprInput({
     tone === "rose" && "border-rose-500/60 focus:ring-rose-500/40 focus:border-rose-500",
     tone === "neutral" && "border-zinc-200 dark:border-zinc-800 focus:ring-cyan-500/40 focus:border-cyan-500"
   );
-  return (
-    <div className="relative">
+  const field = (
+    <div className="relative flex-1">
       <input type="text" inputMode="numeric" value={value} placeholder={placeholder}
         onChange={(e) => onChange(e.target.value)}
         onBlur={onBlur}
@@ -1468,6 +1498,29 @@ function ExprInput({
           = {fmtN(parsed!)}
         </span>
       )}
+    </div>
+  );
+  if (!stepper) return field;
+
+  // Stepper: −/+ adjust the running total by one without needing a "+" key
+  // (mobile numeric keyboards have none). Collapses any expression to its sum
+  // and writes back a plain integer; onBlur flushes the save immediately so a
+  // tap survives the tab being backgrounded.
+  const bump = (delta: number) => {
+    const next = Math.max(0, (parseExpr(value) ?? 0) + delta);
+    onChange(String(next));
+    onBlur?.();
+  };
+  const atZero = (parseExpr(value) ?? 0) <= 0;
+  const stepBtn =
+    "flex-shrink-0 w-8 rounded-md border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-100 text-lg leading-none font-medium select-none active:bg-zinc-200 dark:active:bg-zinc-700 disabled:opacity-40 flex items-center justify-center";
+  return (
+    <div className="flex items-stretch gap-1">
+      <button type="button" tabIndex={-1} onClick={() => bump(-1)} disabled={atZero}
+        className={stepBtn} aria-label={`Decrease ${ariaLabel}`}>−</button>
+      {field}
+      <button type="button" tabIndex={-1} onClick={() => bump(1)}
+        className={stepBtn} aria-label={`Increase ${ariaLabel}`}>+</button>
     </div>
   );
 }
@@ -1610,34 +1663,52 @@ function GodownBlock({
       <div className="mb-2">
         <span className="text-[11px] font-semibold text-zinc-600 dark:text-zinc-300 uppercase tracking-wider">{label}</span>
       </div>
-      <div className="space-y-1.5">
-        <div className="grid grid-cols-[auto_1fr] gap-1.5 items-center">
-          <span className="text-[10px] text-zinc-500 w-12">Cases</span>
-          <ExprInput value={d_cases} placeholder="—" onChange={onCases} onBlur={onBlur}
+      <div className="space-y-2">
+        {/* Label stacked ABOVE the input so the −/+ steppers get the full block
+            width on narrow phones (a side-by-side label would squeeze the
+            field to a few px in the 2-up card). */}
+        <div>
+          <span className="block text-[10px] text-zinc-500 mb-0.5">Cases</span>
+          <ExprInput value={d_cases} placeholder={String(appCases)} onChange={onCases} onBlur={onBlur} stepper
             tone={touched ? (side.valid ? "amber" : "rose") : "neutral"} ariaLabel={`${modelHint} cases`} />
         </div>
-        <div className="grid grid-cols-[auto_1fr] gap-1.5 items-center">
-          <span className="text-[10px] text-zinc-500 w-12">Loose</span>
-          <ExprInput value={d_loose} placeholder="—" onChange={onLoose} onBlur={onBlur}
+        <div>
+          <span className="block text-[10px] text-zinc-500 mb-0.5">Loose</span>
+          <ExprInput value={d_loose} placeholder={String(appLoose)} onChange={onLoose} onBlur={onBlur} stepper
             tone={touched ? (side.valid ? "amber" : "rose") : "neutral"} ariaLabel={`${modelHint} loose`} />
         </div>
       </div>
 
-      {/* Breakup: your count (when entered) + app reference + others */}
+      {/* System vs counted, with the difference — so the counter always sees
+          what the system thinks is here and what they're entering. */}
       <div className="mt-2 pt-2 border-t border-zinc-200/70 dark:border-zinc-700/50 space-y-0.5">
-        {touched && side.valid ? (
-          <div className="text-[11px] tabular-nums text-zinc-700 dark:text-zinc-200 font-medium">
-            You: {breakupStr(csNew, side.physCases, side.physLoose)}
-          </div>
-        ) : (
-          <div className="text-[11px] text-zinc-400">You: not counted</div>
-        )}
-        <div className="text-[10px] tabular-nums text-zinc-400">
-          App: {breakupStr(csOld, appCases, appLoose)}
+        <div className="flex items-baseline justify-between gap-2">
+          <span className="text-[10px] uppercase tracking-wide text-zinc-500">In system</span>
+          <span className="text-[11px] tabular-nums text-zinc-600 dark:text-zinc-300">{breakupStr(csOld, appCases, appLoose)}</span>
         </div>
+        <div className="flex items-baseline justify-between gap-2">
+          <span className="text-[10px] uppercase tracking-wide text-zinc-500">You count</span>
+          {touched && side.valid ? (
+            <span className="text-[11px] tabular-nums font-medium text-zinc-800 dark:text-zinc-100">{breakupStr(csNew, side.physCases, side.physLoose)}</span>
+          ) : (
+            <span className="text-[11px] text-zinc-400">not counted</span>
+          )}
+        </div>
+        {touched && side.valid && (
+          <div className="flex items-baseline justify-between gap-2">
+            <span className="text-[10px] uppercase tracking-wide text-zinc-500">Diff</span>
+            <span className={cn(
+              "text-[11px] tabular-nums font-semibold",
+              side.diff === 0 ? "text-zinc-400" : side.diff > 0 ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"
+            )}>
+              {side.diff > 0 ? "+" : ""}{fmtN(side.diff)} pcs
+            </span>
+          </div>
+        )}
         {others.map((o, idx) => (
-          <div key={idx} className="text-[10px] tabular-nums text-cyan-600/80 dark:text-cyan-400/80">
-            {o.name}: {fmtN(o.pcs)} pcs
+          <div key={idx} className="flex items-baseline justify-between gap-2 text-cyan-600/80 dark:text-cyan-400/80">
+            <span className="text-[10px] truncate">{o.name}</span>
+            <span className="text-[10px] tabular-nums flex-shrink-0">{fmtN(o.pcs)} pcs</span>
           </div>
         ))}
       </div>
@@ -1693,10 +1764,10 @@ function ReviewerView({
                   </div>
                 </div>
               </div>
-              <div className="text-right text-[10px] text-zinc-500 tabular-nums hidden sm:block">
-                <div>App: cs={i.case_size || 0}</div>
+              <div className="text-right text-[10px] text-zinc-500 tabular-nums">
+                <div className="font-medium text-zinc-600 dark:text-zinc-300">System · cs {i.case_size || 0}</div>
                 <div>A {fmtN(app.A.cases)}c {fmtN(app.A.loose)}L · B {fmtN(app.B.cases)}c {fmtN(app.B.loose)}L</div>
-                {last && <div>Last: {timeAgo(last.at)}{last.userName ? ` by ${last.userName}` : ""}</div>}
+                {last && <div className="hidden sm:block">Last: {timeAgo(last.at)}{last.userName ? ` by ${last.userName}` : ""}</div>}
               </div>
               {conflict?.any && (
                 <span className="bg-rose-500/15 text-rose-700 dark:text-rose-300 px-2 py-0.5 rounded text-[10px] uppercase tracking-wider font-medium flex-shrink-0">
@@ -1827,8 +1898,8 @@ function HintCard({ isAdmin, mode }: { isAdmin: boolean; mode: "my" | "reviewer"
         <Filter className="w-3.5 h-3.5" /> Tips
       </div>
       <div>
-        <strong>Quick adds:</strong> type <code className="px-1 bg-zinc-200 dark:bg-zinc-800 rounded">5</code> then later edit to{" "}
-        <code className="px-1 bg-zinc-200 dark:bg-zinc-800 rounded">5+1</code> if you find one more — the running total shows below the cell.
+        <strong>Quick adds:</strong> on a phone, tap the <strong>−</strong>/<strong>+</strong> buttons beside each box to add or remove pieces as you find them — or type{" "}
+        <code className="px-1 bg-zinc-200 dark:bg-zinc-800 rounded">5+1</code> to keep a running total. Each box shows what's <strong>in system</strong> vs what <strong>you count</strong>, with the difference.
       </div>
       <div>
         <strong>Per-user drafts:</strong> each counter has their own list. Your numbers don't overwrite anyone else's. Drafts autosave to the server, so closing the tab is safe.

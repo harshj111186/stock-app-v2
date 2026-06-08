@@ -230,6 +230,38 @@ If you must touch one of these files: **read first, edit surgically, never repla
 
 ## 11. Changelog (latest first — add new entries at the top)
 
+### 2026-06-03 — Reconciliation: count steppers + prominent system stock (+ full re-audit)
+
+Preceded by a **comprehensive re-audit** (8 subsystems mapped by parallel readers, every flagged
+risk adversarially verified). Result: codebase healthy. Only **one confirmed real issue**, low
+severity — see "Known follow-up" below. Both of these tweaks were independently surfaced by the audit
+as the only reconciliation UX gaps.
+
+1. **+/- steppers on the count boxes (`ExprInput`).** The shared `ExprInput` gained an optional
+   `stepper` prop → tappable **−/+** buttons (numeric keyboard unchanged). Tap to add/remove found
+   pieces without a "+" key (mobile keyboards have none). `bump()` collapses the expression to its sum
+   and clamps at 0; "−" disabled at 0; persists via the existing debounce + immediate flush. Enabled on
+   the **mobile My-count** cases/loose fields.
+2. **Current system stock shown plainly (staff + reviewer).** Each godown now shows a labelled
+   **In system → You count → Diff** block (coloured diff) right at the inputs:
+   - Mobile `GodownBlock`: reworked breakup + label stacked above each stepper row (so the steppers get
+     full width on 320–390px phones — caught by review, fixed).
+   - Desktop My table: count-input **placeholders = system values**; `BreakupCell` relabelled
+     `app`→`system` + a coloured diff chip.
+   - Reviewer header: `App:`→`System ·`, now visible on mobile too.
+   - New `refreshAppStock` keeps the system figure fresh on the visibility/interval poll; **paused while
+     a commit runs** (review caught a cosmetic mid-commit flicker — fixed by gating the poll on
+     `processing`).
+
+   Reviewed adversarially (3 lenses → verify); 2 real findings (small-phone squeeze + commit-time
+   flicker) fixed before ship. `tsc` + `next build` clean.
+
+**Known follow-up (low):** the low-stock threshold is computed 3 ways — dashboard
+`Math.max(reorder_a+reorder_b, 2)`, godown-view per-godown reorder points, items page flat `≤2`.
+Harmless but inconsistent; unify into one `lib/utils` helper (`lowStockThreshold`/`isLow`) when convenient.
+
+---
+
 ### 2026-06-02 — Category system redo: one tree, no free-text subcategory
 
 The catalogue had **two** ways to categorise an item — `items.category_id` (the nestable tree) **and**
