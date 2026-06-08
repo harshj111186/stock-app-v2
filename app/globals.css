@@ -80,6 +80,25 @@
     animation: shimmer 1.5s infinite;
   }
 
+  /* ── Touch-clean surface (Reconciliation) ───────────────────────────
+     On the count screen staff repeatedly tap numbers/labels; without this
+     a tap selects the text and Android pops the floating selection toolbar
+     (the little "G"/search chip), iOS pops the magnifier callout — both get
+     in the way of fast counting. We disable selection + the long-press
+     callout on the page chrome, but explicitly RE-ENABLE it on the actual
+     inputs so typing, caret placement and paste still work normally. */
+  .recon-page {
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-touch-callout: none;
+  }
+  .recon-page input,
+  .recon-page textarea {
+    -webkit-user-select: text;
+    user-select: text;
+    -webkit-touch-callout: default;
+  }
+
   /* ── Print styles ───────────────────────────────────────────────────
      Used by the Reports section (Sales register etc). Kills app chrome,
      forces black-on-white so dark-mode users get a legible printout,

@@ -6,14 +6,23 @@
 
 ---
 
-## ✅ Status: fully activated — no outstanding steps
+## ⚠️ Status: ONE migration to run, then fully activated
 
-Everything is **committed, pushed, live, and switched on**. Every `db/*.sql` (through
-`2026-06-02-category-redo.sql` — confirmed `items_with_legacy_subcat = 0`, 18 categories / 4 nested)
-has been run, and both Edge Functions (`master-login`, `admin-account`) are deployed. Nothing pending.
-The 2026-06-03 reconciliation tweaks (count steppers + prominent system stock) are client-only — no SQL.
+**Run `db/2026-06-09-reconciliation-coordination.sql` in Supabase → SQL editor.** It is required for the
+2026-06-09 reconciliation rework (multi-counter coordination): it creates `reconciliation_done`,
+relaxes the drafts SELECT policy to all authenticated (cross-counter visibility), adds `user_done` to
+the `reconciliation_drafts_with_user` view, and normalises the committed split in `apply_reconciliation`.
+Idempotent — safe to run once. **The app degrades gracefully if it hasn't run yet** (no done flags, staff
+only see their own drafts, no crash), but the done/freeze + done-aware-conflict + cross-staff-delta
+features only work after it's applied. The client (`app/reconciliation/page.tsx` + `globals.css`) is
+already committed/pushed/live.
 
-A full re-audit on 2026-06-03 (8 subsystems, adversarially verified) found the codebase healthy.
+Everything else is **committed, pushed, live, and switched on**. Every earlier `db/*.sql` (through
+`2026-06-02-category-redo.sql`) has been run, and both Edge Functions (`master-login`, `admin-account`)
+are deployed.
+
+A full re-audit on 2026-06-03 (8 subsystems, adversarially verified) found the codebase healthy; the
+2026-06-09 reconciliation logic was self-reviewed against the user's spec.
 
 **Known follow-ups (low priority, not blocking):**
 - Low-stock threshold is computed 3 different ways (dashboard `Math.max(reorder_a+reorder_b,2)`,

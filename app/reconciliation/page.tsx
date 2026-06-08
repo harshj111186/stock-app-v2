@@ -2,8 +2,8 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Printer, ClipboardCheck, CheckCircle2, AlertCircle,
-  RotateCcw, Loader2, Eraser, Filter, Eye, EyeOff, Users, ShieldCheck,
-  UserCircle2, Clock,
+  RotateCcw, Loader2, Filter, Eye, EyeOff, Users, ShieldCheck,
+  UserCircle2, Clock, Lock, LockOpen, CheckCheck, AlertTriangle,
 } from "lucide-react";
 import { Shell } from "@/components/shell";
 import { sb, type Item } from "@/lib/supabase";
@@ -52,6 +52,11 @@ type DBDraft = {
   user_email: string | null;
   user_name: string | null;
   user_role: string | null;
+  // Owner's "I have finished my whole count" flag (joined from
+  // reconciliation_done). When true, this counter's entries are frozen and a
+  // BLANK on an item someone else filled counts as "found nothing" (= 0).
+  user_done?: boolean;
+  user_done_at?: string | null;
 };
 
 // Local mirror, keyed by `${user_id}::${item_id}` so writes can be
@@ -147,8 +152,18 @@ export default function ReconciliationPage() {
     draftsRef.current = next;
     setDrafts(next);
   }, []);
+  // Display-name lookup (user_id → friendly name), populated by load(). Used by
+  // refreshDone (which doesn't re-fetch profiles) to name done-but-no-draft
+  // counters in the reviewer's conflict reasons.
+  const peopleRef = useRef<Map<string, string>>(new Map());
   const [lastRecon, setLastRecon] = useState<Map<string, LastReconciled>>(new Map());
+  // Per-user "count finished" flags (reconciliation_done), keyed by user_id.
+  // Includes users who marked done even if they have zero draft rows.
+  const [doneByUser, setDoneByUser] = useState<Map<string, { done: boolean; at: string | null; name: string | null }>>(new Map());
   const [loaded, setLoaded] = useState(false);
+
+  const itemById = useMemo(() => new Map(items.map(i => [i.id, i])), [items]);
+  const myDone = profile?.id ? (doneByUser.get(profile.id)?.done ?? false) : false;
 
   // UI mode
   const [mode, setMode] = useState<"my" | "reviewer">("my");
@@ -161,6 +176,8 @@ export default function ReconciliationPage() {
   const [brand, setBrand] = useState("");
   const [cat, setCat] = useState("");
   const [showOnlyChanged, setShowOnlyChanged] = useState(false);
+  // Reviewer-only: collapse the list to items that currently have a conflict.
+  const [conflictsOnly, setConflictsOnly] = useState(false);
 
   // Commit + toast state
   const [processing, setProcessing] = useState(false);
@@ -184,6 +201,7 @@ export default function ReconciliationPage() {
       { data: draftsData },
       { data: txns },
       { data: profiles },
+      { data: doneRows },
     ] = await Promise.all([
       c.from("items").select("*").eq("archived", false).order("item_code"),
       c.from("godown_stock").select("*"),
@@ -196,6 +214,7 @@ export default function ReconciliationPage() {
         .order("created_at", { ascending: false })
         .limit(2000),
       c.from("user_profiles").select("id, name, email"),
+      c.from("reconciliation_done").select("user_id, done, done_at"),
     ]);
 
     const blank: AppStock = { cases: 0, loose: 0, hasStockRow: false };
@@ -212,6 +231,19 @@ export default function ReconciliationPage() {
 
     const profileById = new Map<string, { name: string | null; email: string | null }>();
     (profiles || []).forEach((p: any) => profileById.set(p.id, { name: p.name ?? null, email: p.email ?? null }));
+    peopleRef.current = new Map(
+      (profiles || []).map((p: any) => [p.id, (p.name?.trim() || p.email?.split("@")[0] || "Counter") as string])
+    );
+
+    const doneMap = new Map<string, { done: boolean; at: string | null; name: string | null }>();
+    (doneRows || []).forEach((r: any) => {
+      const prof = profileById.get(r.user_id);
+      doneMap.set(r.user_id, {
+        done: !!r.done,
+        at: r.done_at ?? null,
+        name: prof?.name?.trim() || prof?.email?.split("@")[0] || null,
+      });
+    });
 
     const lastMap = new Map<string, LastReconciled>();
     (txns || []).forEach((t: any) => {
@@ -227,6 +259,7 @@ export default function ReconciliationPage() {
     setAppStock(stockMap);
     setCatNameById(new Map((cats || []).map((c: any) => [c.id, c.name])));
     writeDrafts(draftsMap);
+    setDoneByUser(doneMap);
     setLastRecon(lastMap);
     setLoaded(true);
   }, [writeDrafts]);
@@ -313,25 +346,45 @@ export default function ReconciliationPage() {
       return next;
     });
   }, []);
+  // Keep the per-user Done flags fresh so a counter sees when a teammate
+  // finishes (which can flip "pending" rows into conflicts) and the reviewer
+  // sees done state live. Preserves my own optimistic flag if a write is
+  // racing the poll by trusting the server value (single-writer per row).
+  const refreshDone = useCallback(async () => {
+    const { data } = await sb().from("reconciliation_done").select("user_id, done, done_at");
+    if (!data) return;
+    setDoneByUser((prev) => {
+      const next = new Map(prev);
+      const seen = new Set<string>();
+      (data as any[]).forEach((r) => {
+        seen.add(r.user_id);
+        const old = prev.get(r.user_id);
+        next.set(r.user_id, { done: !!r.done, at: r.done_at ?? null, name: old?.name ?? peopleRef.current.get(r.user_id) ?? null });
+      });
+      // Drop rows that no longer exist server-side (admin reset after commit).
+      for (const k of [...next.keys()]) if (!seen.has(k)) next.delete(k);
+      return next;
+    });
+  }, []);
 
   useEffect(() => {
     // Pause polling during a commit — makeAdjustments mutates godown_stock one
     // row at a time, and a mid-commit refreshAppStock would flicker the diff
     // column as rows land. The post-commit load() is the authoritative refresh.
     if (!loaded || processing) return;
-    const onVis = () => { if (document.visibilityState === "visible") { void refreshDrafts(); void refreshAppStock(); } };
+    const onVis = () => { if (document.visibilityState === "visible") { void refreshDrafts(); void refreshAppStock(); void refreshDone(); } };
     document.addEventListener("visibilitychange", onVis);
     // Admin actively reviewing — refresh fast (3s) so staff typing shows up
-    // near-live. Otherwise (My count for everyone) drop to 30s; the user
-    // doesn't need to see other counters' updates while they're entering
-    // their own count.
-    const intervalMs = mode === "reviewer" ? 3000 : 30000;
-    const id = window.setInterval(() => { void refreshDrafts(); void refreshAppStock(); }, intervalMs);
+    // near-live. In My count we now also surface other counters' deltas, so
+    // refresh at a calm 12s (was 30s) to keep peer numbers reasonably live
+    // without thrashing while someone is entering their own count.
+    const intervalMs = mode === "reviewer" ? 3000 : 12000;
+    const id = window.setInterval(() => { void refreshDrafts(); void refreshAppStock(); void refreshDone(); }, intervalMs);
     return () => {
       document.removeEventListener("visibilitychange", onVis);
       window.clearInterval(id);
     };
-  }, [loaded, processing, refreshDrafts, refreshAppStock, mode]);
+  }, [loaded, processing, refreshDrafts, refreshAppStock, refreshDone, mode]);
 
   // Optimistic local mutation; the actual DB write happens debounced below.
   const setField = useCallback((userId: string, itemId: string, field: Field, value: string) => {
@@ -445,6 +498,90 @@ export default function ReconciliationPage() {
     await sb().from("reconciliation_drafts").delete().eq("user_id", userId).eq("item_id", itemId);
   }, [writeDrafts]);
 
+  // ─── case-size rollover normalization ────────────────────────────────────
+  // If loose >= the effective case size, roll the excess up into cases:
+  //   case size 2, "3 loose"  → 1 case + 1 loose
+  //   case size 4, 2c + "9 L" → 4 cases + 1 loose
+  // Uses the row's own case_size entry if present, else the item's. Only
+  // rewrites a godown when a rollover actually happens (so a sub-case running
+  // total like "2+1" on a case size of 10 keeps its expression intact).
+  // Returns true if anything changed. Persists immediately.
+  const normalizeRow = useCallback((userId: string, itemId: string): boolean => {
+    const k = dkey(userId, itemId);
+    const cur = draftsRef.current.get(k);
+    if (!cur) return false;
+    const cs = parseExpr(cur.case_size_raw) ?? (itemById.get(itemId)?.case_size || 0);
+    if (cs <= 0) return false;
+    const next: DBDraft = { ...cur };
+    let changed = false;
+    for (const [cf, lf] of [["a_cases_raw", "a_loose_raw"], ["b_cases_raw", "b_loose_raw"]] as const) {
+      const l = parseExpr(next[lf]);
+      if (l === null || l < cs) continue;
+      const c = parseExpr(next[cf]) ?? 0;
+      next[cf] = String(c + Math.floor(l / cs));
+      next[lf] = String(l % cs);
+      changed = true;
+    }
+    if (!changed) return false;
+    next.updated_at = new Date().toISOString();
+    const m = new Map(draftsRef.current);
+    m.set(k, next);
+    writeDrafts(m);
+    // Supersede any in-flight debounced save for this row — we persist the
+    // normalized values right here, so the pending timer would only re-write
+    // the same thing.
+    const pending = saveTimers.current.get(k);
+    if (pending) { clearTimeout(pending); saveTimers.current.delete(k); }
+    void persistDraft(userId, itemId);
+    return true;
+  }, [itemById, writeDrafts, persistDraft]);
+
+  // onBlur for a My-count field: roll over loose→cases, then flush the save.
+  const commitRow = useCallback((userId: string, itemId: string) => {
+    const rolled = normalizeRow(userId, itemId);
+    if (!rolled) flushAllPendingSaves(); // normalizeRow already persisted if it rolled
+  }, [normalizeRow, flushAllPendingSaves]);
+
+  // One-time pass: tidy the CURRENT user's pre-existing drafts so any loose
+  // that already exceeds the case size shows normalized (#10). Runs once per
+  // load; new edits self-normalize on blur.
+  const normalizedOnce = useRef(false);
+  useEffect(() => {
+    if (!loaded || normalizedOnce.current || !profile?.id || items.length === 0) return;
+    normalizedOnce.current = true;
+    for (const [, d] of [...draftsRef.current]) {
+      if (d.user_id === profile.id) normalizeRow(d.user_id, d.item_id);
+    }
+  }, [loaded, items.length, profile?.id, normalizeRow]);
+
+  // ─── "count done" toggle (freeze / resume) ───────────────────────────────
+  const [doneSaving, setDoneSaving] = useState(false);
+  const toggleDone = useCallback(async () => {
+    if (!profile?.id || doneSaving) return;
+    const uid = profile.id;
+    const next = !myDone;
+    if (next) flushAllPendingSaves(); // capture any in-flight edit before freezing
+    setDoneSaving(true);
+    const nowIso = new Date().toISOString();
+    setDoneByUser(prev => {
+      const m = new Map(prev);
+      m.set(uid, { done: next, at: next ? nowIso : null, name: prev.get(uid)?.name ?? peopleRef.current.get(uid) ?? null });
+      return m;
+    });
+    const { error } = await sb().from("reconciliation_done").upsert(
+      { user_id: uid, done: next, done_at: next ? nowIso : null },
+      { onConflict: "user_id" }
+    );
+    setDoneSaving(false);
+    if (error) {
+      // roll back the optimistic flip
+      setDoneByUser(prev => { const m = new Map(prev); m.set(uid, { done: !next, at: !next ? nowIso : null, name: prev.get(uid)?.name ?? null }); return m; });
+      showToast("bad", `Couldn't update done state: ${error.message}`);
+      return;
+    }
+    showToast(next ? "ok" : "info", next ? "Count marked done — your entries are frozen." : "Resumed — your entries are editable again.");
+  }, [profile?.id, myDone, doneSaving, flushAllPendingSaves]);
+
   // Unmount cleanup — fire every pending save BEFORE the route transition
   // tears React state down. persistDraft reads from the ref, so the actual
   // upsert request still goes out cleanly even after the component is gone
@@ -541,35 +678,96 @@ export default function ReconciliationPage() {
     return { A, B, csOld, csNew, caseSizeChanged, caseSizeValid: csValid, hasAnyChange, invalid };
   }, []);
 
-  // Item-level conflict: across the drafts for this item, is there any
-  // field where two users entered different non-empty values?
+  // Item-level conflict — computed at the PIECE level per godown so a
+  // different cases/loose split of the same total isn't a false conflict
+  // (and the normalizer keeps splits canonical anyway). Two rules raise a
+  // conflict for a godown:
+  //   1. two counters who entered it disagree on the piece total, OR
+  //   2. at least one counter entered it AND a counter who has marked their
+  //      whole count DONE recorded nothing there (a finished counter's blank
+  //      = "found none" = 0, which disagrees with a non-zero entry).
+  // Rule 2 is gated on "done" so an item another counter simply hasn't
+  // reached yet stays pending, not conflicting.
   type ItemConflict = {
     case_size: boolean;
     a_cases: boolean;
     a_loose: boolean;
     b_cases: boolean;
     b_loose: boolean;
+    a: boolean;      // godown A piece-level conflict
+    b: boolean;      // godown B piece-level conflict
     any: boolean;
+    reason: string | null;          // concise, human-readable
+    missingDoneNames: string[];     // done counters who found none where others did
   };
-  const computeItemConflict = (drs: DBDraft[]): ItemConflict => {
-    const distinct = (key: keyof DBDraft) => {
-      const s = new Set<number>();
-      for (const d of drs) {
-        const raw = String(d[key] || "");
-        if (!raw.trim()) continue;
-        const p = parseExpr(raw);
-        if (p === null) continue; // invalid → not counted as a value
-        s.add(p);
+  const computeItemConflict = useCallback((item: Item, drs: DBDraft[]): ItemConflict => {
+    const itemCs = item.case_size || 0;
+    const nonEmpty = drs.filter(d => !isDraftEmpty(d));
+
+    const csSet = new Set<number>();
+    for (const d of nonEmpty) {
+      const raw = d.case_size_raw.trim();
+      if (!raw) continue;
+      const p = parseExpr(raw);
+      if (p !== null) csSet.add(p);
+    }
+    const csConflict = csSet.size > 1;
+
+    const evalSide = (g: Godown) => {
+      const entries: { name: string; pcs: number }[] = [];
+      const enteredUserIds = new Set<string>();
+      for (const d of nonEmpty) {
+        const cRaw = (g === "A" ? d.a_cases_raw : d.b_cases_raw) || "";
+        const lRaw = (g === "A" ? d.a_loose_raw : d.b_loose_raw) || "";
+        if (cRaw.trim() === "" && lRaw.trim() === "") continue;
+        const pc = parseExpr(cRaw);
+        const pl = parseExpr(lRaw);
+        const valid = (cRaw.trim() === "" || pc !== null) && (lRaw.trim() === "" || pl !== null);
+        if (!valid) continue; // invalid input isn't a countable opinion
+        const cs = parseExpr(d.case_size_raw) ?? itemCs;
+        entries.push({ name: displayUser(d), pcs: pieces(cs, pc ?? 0, pl ?? 0) });
+        enteredUserIds.add(d.user_id);
       }
-      return s.size > 1;
+      const missers: string[] = [];
+      if (entries.length > 0) {
+        for (const [uid, info] of doneByUser) {
+          if (!info.done || enteredUserIds.has(uid)) continue;
+          missers.push(info.name || peopleRef.current.get(uid) || "a counter");
+        }
+      }
+      const valSet = new Set<number>(entries.map(e => e.pcs));
+      if (entries.length > 0 && missers.length > 0) valSet.add(0);
+      return { conflict: valSet.size > 1, entries, missers };
     };
-    const cs = distinct("case_size_raw");
-    const ac = distinct("a_cases_raw");
-    const al = distinct("a_loose_raw");
-    const bc = distinct("b_cases_raw");
-    const bl = distinct("b_loose_raw");
-    return { case_size: cs, a_cases: ac, a_loose: al, b_cases: bc, b_loose: bl, any: cs || ac || al || bc || bl };
-  };
+
+    const A = evalSide("A");
+    const B = evalSide("B");
+
+    const sideReason = (g: string, s: { entries: { name: string; pcs: number }[]; missers: string[] }) => {
+      const bits = s.entries.map(e => `${e.name.split(" ")[0]} ${fmtN(e.pcs)}`);
+      for (const m of s.missers) bits.push(`${m.split(" ")[0]} none (done)`);
+      return `${g}: ${bits.join(" vs ")}`;
+    };
+    const parts: string[] = [];
+    if (A.conflict) parts.push(sideReason("A", A));
+    if (B.conflict) parts.push(sideReason("B", B));
+    if (csConflict) parts.push(`case size ${[...csSet].join(" vs ")}`);
+
+    const missingDoneNames = [...new Set([
+      ...(A.conflict ? A.missers : []),
+      ...(B.conflict ? B.missers : []),
+    ])];
+
+    return {
+      case_size: csConflict,
+      a_cases: A.conflict, a_loose: A.conflict,
+      b_cases: B.conflict, b_loose: B.conflict,
+      a: A.conflict, b: B.conflict,
+      any: A.conflict || B.conflict || csConflict,
+      reason: parts.length ? parts.join("  ·  ") : null,
+      missingDoneNames,
+    };
+  }, [doneByUser]);
 
   // ─── derived: enriched items + filter list ─────────────────────────────
   const itemsEnriched = useMemo(() => items.map(i => ({
@@ -600,11 +798,16 @@ export default function ReconciliationPage() {
           if (drs.length === 0) return false;
         }
       }
+      // Reviewer "conflicts only" — collapse to items needing a decision.
+      if (conflictsOnly && mode === "reviewer") {
+        const drs = draftsByItem.get(i.id) || [];
+        if (!computeItemConflict(i, drs).any) return false;
+      }
       const hay = `${i.brand || ""} ${i.model} ${i.size} ${i.colour} ${i.categoryName || ""} ${i.subcategory || ""} ${i.item_code}`;
       if (!matchesQuery(hay, q)) return false;
       return true;
     });
-  }, [itemsEnriched, q, brand, cat, showOnlyChanged, draftsByItem, mode, profile?.id]);
+  }, [itemsEnriched, q, brand, cat, showOnlyChanged, conflictsOnly, draftsByItem, mode, profile?.id, computeItemConflict]);
 
   // ─── derived: header stats ─────────────────────────────────────────────
   const stats = useMemo(() => {
@@ -623,11 +826,24 @@ export default function ReconciliationPage() {
         const rd = computeDiff(i, app, d);
         if (rd.invalid) invalid++;
       }
-      const c = computeItemConflict(drs);
+      const c = computeItemConflict(i, drs);
       if (c.any) conflicts++;
     });
     return { myStaged, anyStaged, conflicts, invalid, usersWithDrafts };
-  }, [items, appStock, draftsByItem, computeDiff, profile?.id]);
+  }, [items, appStock, draftsByItem, computeDiff, computeItemConflict, profile?.id]);
+
+  // Surface new conflicts to the reviewer without them having to watch the
+  // screen — a toast fires when the conflict count rises (e.g. a counter just
+  // marked done and left an item blank that another filled).
+  const prevConflicts = useRef(0);
+  useEffect(() => {
+    if (!loaded) return;
+    if (mode === "reviewer" && stats.conflicts > prevConflicts.current && stats.conflicts > 0) {
+      showToast("bad", `${stats.conflicts} ${stats.conflicts === 1 ? "item needs" : "items need"} review (conflict).`);
+    }
+    prevConflicts.current = stats.conflicts;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [stats.conflicts, mode, loaded]);
 
   // ─── commit (admin only) ───────────────────────────────────────────────
   const makeAdjustments = async () => {
@@ -656,7 +872,7 @@ export default function ReconciliationPage() {
       if (nonEmpty.length === 0) continue;
 
       const label = `${i.brand ? i.brand + " · " : ""}${i.model}${i.size ? " " + i.size : ""}`;
-      const conflict = computeItemConflict(nonEmpty);
+      const conflict = computeItemConflict(i, nonEmpty);
       if (conflict.any) {
         skipped.push({ itemId: i.id, label, reason: "conflict between users" });
         continue;
@@ -792,12 +1008,25 @@ export default function ReconciliationPage() {
     }
 
     await load();
+
+    // Reset stale "done" flags: a counter whose drafts were all committed
+    // shouldn't carry a frozen/done state into the next stock-take cycle.
+    try {
+      const stillCounting = new Set<string>();
+      for (const [, d] of draftsRef.current) if (!isDraftEmpty(d)) stillCounting.add(d.user_id);
+      const toReset: string[] = [];
+      for (const [uid, info] of doneByUser) if (info.done && !stillCounting.has(uid)) toReset.push(uid);
+      if (toReset.length > 0) {
+        await sb().from("reconciliation_done").update({ done: false, done_at: null }).in("user_id", toReset);
+        await refreshDone();
+      }
+    } catch { /* non-fatal: a stale flag self-resolves when the counter resumes */ }
   };
 
   // ─── render ────────────────────────────────────────────────────────────
   return (
     <Shell title="Reconciliation">
-      <div className="no-print">
+      <div className="no-print recon-page">
         <Header
           loaded={loaded}
           totalItems={items.length}
@@ -811,16 +1040,39 @@ export default function ReconciliationPage() {
           brand={brand} setBrand={setBrand}
           cat={cat} setCat={setCat}
           showOnlyChanged={showOnlyChanged} setShowOnlyChanged={setShowOnlyChanged}
+          conflictsOnly={conflictsOnly} setConflictsOnly={setConflictsOnly}
+          conflictCount={stats.conflicts}
           brands={brands} cats={cats}
           shownCount={filtered.length}
           mode={mode} setMode={setMode} isAdmin={isAdmin}
           usersWithDrafts={stats.usersWithDrafts.size}
+          myDone={myDone}
+          onToggleDone={toggleDone}
+          doneSaving={doneSaving}
           onPrint={() => window.print()}
           onCommit={makeAdjustments}
           canCommit={canCommit && stats.anyStaged > 0 && !processing}
           processing={processing}
           progress={progress}
         />
+
+        {mode === "my" && myDone && (
+          <div className="mb-4 flex items-center gap-3 rounded-lg border border-emerald-500/40 bg-emerald-500/10 px-4 py-2.5">
+            <Lock className="w-4 h-4 text-emerald-600 dark:text-emerald-400 flex-shrink-0" />
+            <div className="text-sm text-emerald-800 dark:text-emerald-200 flex-1 min-w-0">
+              <span className="font-medium">Your count is marked done and frozen.</span>{" "}
+              <span className="text-emerald-700/80 dark:text-emerald-300/70">Any item you left blank now counts as “found none” for the reviewer. Resume to edit.</span>
+            </div>
+            <button
+              type="button"
+              onClick={toggleDone}
+              disabled={doneSaving}
+              className="inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm font-medium border border-emerald-500/50 bg-white dark:bg-zinc-900 text-emerald-700 dark:text-emerald-300 hover:bg-emerald-50 dark:hover:bg-emerald-500/10 disabled:opacity-60 flex-shrink-0"
+            >
+              <LockOpen className="w-3.5 h-3.5" /> Resume editing
+            </button>
+          </div>
+        )}
 
         {!loaded ? (
           <SkeletonBody />
@@ -833,18 +1085,22 @@ export default function ReconciliationPage() {
             drafts={drafts}
             lastRecon={lastRecon}
             currentUserId={profile?.id ?? ""}
+            frozen={myDone}
             computeDiff={computeDiff}
             setField={setField}
-            flushSaves={flushAllPendingSaves}
+            commitRow={commitRow}
             resetMyRow={(itemId) => { if (profile?.id) void deleteDraft(profile.id, itemId); }}
             errorsByItem={errorsByItem(errors)}
             otherUsersByItem={(itemId) => {
               const drs = draftsByItem.get(itemId) || [];
               return drs.filter(d => d.user_id !== profile?.id && !isDraftEmpty(d));
             }}
+            doneByUser={doneByUser}
             conflictByItem={(itemId) => {
-              const drs = (draftsByItem.get(itemId) || []).filter(d => !isDraftEmpty(d));
-              return drs.length > 1 ? computeItemConflict(drs) : null;
+              const item = itemById.get(itemId);
+              if (!item) return null;
+              const drs = draftsByItem.get(itemId) || [];
+              return computeItemConflict(item, drs);
             }}
           />
         ) : (
@@ -856,9 +1112,10 @@ export default function ReconciliationPage() {
             computeDiff={computeDiff}
             computeItemConflict={computeItemConflict}
             setField={setField}
-            flushSaves={flushAllPendingSaves}
+            commitRow={commitRow}
             deleteDraft={deleteDraft}
             currentUserId={profile?.id ?? ""}
+            doneByUser={doneByUser}
             errorsByItem={errorsByItem(errors)}
           />
         )}
@@ -954,17 +1211,22 @@ function Header({
 function Toolbar({
   q, setQ, brand, setBrand, cat, setCat,
   showOnlyChanged, setShowOnlyChanged,
+  conflictsOnly, setConflictsOnly, conflictCount,
   brands, cats, shownCount,
   mode, setMode, isAdmin, usersWithDrafts,
+  myDone, onToggleDone, doneSaving,
   onPrint, onCommit, canCommit, processing, progress,
 }: {
   q: string; setQ: (s: string) => void;
   brand: string; setBrand: (s: string) => void;
   cat: string; setCat: (s: string) => void;
   showOnlyChanged: boolean; setShowOnlyChanged: (b: boolean) => void;
+  conflictsOnly: boolean; setConflictsOnly: (b: boolean) => void;
+  conflictCount: number;
   brands: string[]; cats: string[]; shownCount: number;
   mode: "my" | "reviewer"; setMode: (m: "my" | "reviewer") => void;
   isAdmin: boolean; usersWithDrafts: number;
+  myDone: boolean; onToggleDone: () => void; doneSaving: boolean;
   onPrint: () => void; onCommit: () => void;
   canCommit: boolean; processing: boolean;
   progress: { done: number; total: number };
@@ -1046,6 +1308,53 @@ function Toolbar({
               <ShieldCheck className="w-3.5 h-3.5" /> Reviewer
             </button>
           </div>
+        )}
+
+        {/* Reviewer: jump straight to the items that need a decision. */}
+        {isAdmin && mode === "reviewer" && (
+          <button
+            type="button"
+            onClick={() => setConflictsOnly(!conflictsOnly)}
+            className={cn(
+              "inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm border transition-colors",
+              conflictsOnly
+                ? "bg-rose-500/15 border-rose-500/50 text-rose-700 dark:text-rose-300"
+                : conflictCount > 0
+                  ? "bg-white dark:bg-zinc-900 border-rose-300/60 dark:border-rose-500/30 text-rose-600 dark:text-rose-300 hover:border-rose-400"
+                  : "bg-white dark:bg-zinc-900 border-zinc-200 dark:border-zinc-800 text-zinc-500 hover:border-zinc-300 dark:hover:border-zinc-700"
+            )}
+            aria-pressed={conflictsOnly}
+            title="Show only items with a conflict"
+          >
+            <AlertTriangle className="w-3.5 h-3.5" />
+            {conflictsOnly ? "Conflicts only" : "Conflicts"}
+            {conflictCount > 0 && (
+              <span className="ml-0.5 px-1.5 rounded-full bg-rose-500 text-white text-[10px] font-semibold tabular-nums">{conflictCount}</span>
+            )}
+          </button>
+        )}
+
+        {/* My count: freeze/unfreeze my entries. Marking done turns any item I
+            leave blank but a teammate filled into a flagged conflict. */}
+        {mode === "my" && (
+          <button
+            type="button"
+            onClick={onToggleDone}
+            disabled={doneSaving}
+            className={cn(
+              "inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm border transition-colors disabled:opacity-60",
+              myDone
+                ? "bg-emerald-500/15 border-emerald-500/50 text-emerald-700 dark:text-emerald-300"
+                : "bg-white dark:bg-zinc-900 border-zinc-200 dark:border-zinc-800 text-zinc-700 dark:text-zinc-200 hover:border-emerald-400 dark:hover:border-emerald-500/40"
+            )}
+            aria-pressed={myDone}
+            title={myDone ? "Resume editing your count" : "Freeze my count as done"}
+          >
+            {doneSaving
+              ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              : myDone ? <Lock className="w-3.5 h-3.5" /> : <CheckCheck className="w-3.5 h-3.5" />}
+            {myDone ? "Done (frozen)" : "Mark my count done"}
+          </button>
         )}
 
         <div className="inline-flex items-center gap-1.5 text-[11px] text-zinc-500 px-2 py-1.5 rounded-md bg-zinc-50 dark:bg-zinc-800/50 border border-zinc-200 dark:border-zinc-800">
@@ -1138,27 +1447,34 @@ type ItemConflictType = {
   a_loose: boolean;
   b_cases: boolean;
   b_loose: boolean;
+  a: boolean;
+  b: boolean;
   any: boolean;
+  reason: string | null;
+  missingDoneNames: string[];
 };
+type DoneMap = Map<string, { done: boolean; at: string | null; name: string | null }>;
 
 // ─── MyView (default for everyone) ───────────────────────────────────────
 function MyView({
-  items, appStock, drafts, lastRecon, currentUserId,
-  computeDiff, setField, flushSaves, resetMyRow, errorsByItem,
-  otherUsersByItem, conflictByItem,
+  items, appStock, drafts, lastRecon, currentUserId, frozen,
+  computeDiff, setField, commitRow, resetMyRow, errorsByItem,
+  otherUsersByItem, conflictByItem, doneByUser,
 }: {
   items: (Item & { categoryName: string | null })[];
   appStock: Map<string, { A: AppStock; B: AppStock }>;
   drafts: Map<DraftKey, DBDraft>;
   lastRecon: Map<string, LastReconciled>;
   currentUserId: string;
+  frozen: boolean;
   computeDiff: (i: Item, app: { A: AppStock; B: AppStock }, d: DBDraft) => RowDiffType;
   setField: (uid: string, iid: string, f: Field, v: string) => void;
-  flushSaves: () => void;
+  commitRow: (uid: string, iid: string) => void;
   resetMyRow: (itemId: string) => void;
   errorsByItem: Map<string, string[]>;
   otherUsersByItem: (itemId: string) => DBDraft[];
   conflictByItem: (itemId: string) => ItemConflictType | null;
+  doneByUser: DoneMap;
 }) {
   return (
     <>
@@ -1168,13 +1484,15 @@ function MyView({
         drafts={drafts}
         lastRecon={lastRecon}
         currentUserId={currentUserId}
+        frozen={frozen}
         computeDiff={computeDiff}
         setField={setField}
-        flushSaves={flushSaves}
+        commitRow={commitRow}
         resetMyRow={resetMyRow}
         errorsByItem={errorsByItem}
         otherUsersByItem={otherUsersByItem}
         conflictByItem={conflictByItem}
+        doneByUser={doneByUser}
       />
       <MobileCards
         items={items}
@@ -1182,13 +1500,15 @@ function MyView({
         drafts={drafts}
         lastRecon={lastRecon}
         currentUserId={currentUserId}
+        frozen={frozen}
         computeDiff={computeDiff}
         setField={setField}
-        flushSaves={flushSaves}
+        commitRow={commitRow}
         resetMyRow={resetMyRow}
         errorsByItem={errorsByItem}
         otherUsersByItem={otherUsersByItem}
         conflictByItem={conflictByItem}
+        doneByUser={doneByUser}
       />
     </>
   );
@@ -1196,22 +1516,24 @@ function MyView({
 
 // ─── DesktopTable (My view) ──────────────────────────────────────────────
 function DesktopTable({
-  items, appStock, drafts, lastRecon, currentUserId,
-  computeDiff, setField, flushSaves, resetMyRow, errorsByItem,
-  otherUsersByItem, conflictByItem,
+  items, appStock, drafts, lastRecon, currentUserId, frozen,
+  computeDiff, setField, commitRow, resetMyRow, errorsByItem,
+  otherUsersByItem, conflictByItem, doneByUser,
 }: {
   items: (Item & { categoryName: string | null })[];
   appStock: Map<string, { A: AppStock; B: AppStock }>;
   drafts: Map<DraftKey, DBDraft>;
   lastRecon: Map<string, LastReconciled>;
   currentUserId: string;
+  frozen: boolean;
   computeDiff: (i: Item, app: { A: AppStock; B: AppStock }, d: DBDraft) => RowDiffType;
   setField: (uid: string, iid: string, f: Field, v: string) => void;
-  flushSaves: () => void;
+  commitRow: (uid: string, iid: string) => void;
   resetMyRow: (itemId: string) => void;
   errorsByItem: Map<string, string[]>;
   otherUsersByItem: (itemId: string) => DBDraft[];
   conflictByItem: (itemId: string) => ItemConflictType | null;
+  doneByUser: DoneMap;
 }) {
   return (
     <div className="hidden md:block bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg overflow-hidden">
@@ -1244,8 +1566,10 @@ function DesktopTable({
                 others={others}
                 conflict={conflict}
                 last={last}
+                frozen={frozen}
+                doneByUser={doneByUser}
                 onChange={(field, value) => setField(currentUserId, i.id, field, value)}
-                onBlur={flushSaves}
+                onBlur={() => commitRow(currentUserId, i.id)}
                 onReset={() => resetMyRow(i.id)}
                 errors={errorsByItem.get(i.id)}
               />
@@ -1269,7 +1593,7 @@ function makeEmptyDraft(uid: string, iid: string): DBDraft {
 }
 
 function MyDesktopRow({
-  i, app, d, rd, others, conflict, last, onChange, onBlur, onReset, errors,
+  i, app, d, rd, others, conflict, last, frozen, doneByUser, onChange, onBlur, onReset, errors,
 }: {
   i: Item & { categoryName: string | null };
   app: { A: AppStock; B: AppStock };
@@ -1278,6 +1602,8 @@ function MyDesktopRow({
   others: DBDraft[];
   conflict: ItemConflictType | null;
   last?: LastReconciled;
+  frozen: boolean;
+  doneByUser: DoneMap;
   onChange: (field: Field, value: string) => void;
   onBlur: () => void;
   onReset: () => void;
@@ -1311,7 +1637,7 @@ function MyDesktopRow({
               <div className="text-[11px] text-zinc-500 truncate">
                 {[i.size, i.colour, i.categoryName].filter(Boolean).join(" · ")}
               </div>
-              <RowMeta last={last} others={others} conflict={conflict} />
+              <RowMeta last={last} others={others} conflict={conflict} doneByUser={doneByUser} />
             </div>
           </div>
         </td>
@@ -1321,6 +1647,7 @@ function MyDesktopRow({
             placeholder={String(rd.csOld)}
             onChange={(v) => onChange("case_size", v)}
             onBlur={onBlur}
+            disabled={frozen}
             tone={rd.caseSizeChanged ? "amber" : (!rd.caseSizeValid ? "rose" : "neutral")}
             ariaLabel={`Case size for ${i.model}`}
           />
@@ -1329,6 +1656,7 @@ function MyDesktopRow({
           <ExprInput value={d.a_cases_raw} placeholder="—"
             onChange={(v) => onChange("a_cases", v)}
             onBlur={onBlur}
+            disabled={frozen}
             tone={rd.A.userTouched ? (rd.A.valid ? "amber" : "rose") : "neutral"}
             ariaLabel={`Godown A cases for ${i.model}`} />
         </td>
@@ -1336,6 +1664,7 @@ function MyDesktopRow({
           <ExprInput value={d.a_loose_raw} placeholder="—"
             onChange={(v) => onChange("a_loose", v)}
             onBlur={onBlur}
+            disabled={frozen}
             tone={rd.A.userTouched ? (rd.A.valid ? "amber" : "rose") : "neutral"}
             ariaLabel={`Godown A loose for ${i.model}`} />
         </td>
@@ -1343,6 +1672,7 @@ function MyDesktopRow({
           <ExprInput value={d.b_cases_raw} placeholder="—"
             onChange={(v) => onChange("b_cases", v)}
             onBlur={onBlur}
+            disabled={frozen}
             tone={rd.B.userTouched ? (rd.B.valid ? "amber" : "rose") : "neutral"}
             ariaLabel={`Godown B cases for ${i.model}`} />
         </td>
@@ -1350,11 +1680,12 @@ function MyDesktopRow({
           <ExprInput value={d.b_loose_raw} placeholder="—"
             onChange={(v) => onChange("b_loose", v)}
             onBlur={onBlur}
+            disabled={frozen}
             tone={rd.B.userTouched ? (rd.B.valid ? "amber" : "rose") : "neutral"}
             ariaLabel={`Godown B loose for ${i.model}`} />
         </td>
         <td className="px-3 py-2 align-top">
-          <BreakupCell rd={rd} app={app} item={i} others={others} />
+          <BreakupCell rd={rd} app={app} item={i} others={others} doneByUser={doneByUser} />
         </td>
         <td className="px-2 py-2">
           {myTouched && (
@@ -1378,7 +1709,7 @@ function MyDesktopRow({
   );
 }
 
-function RowMeta({ last, others, conflict }: { last?: LastReconciled; others: DBDraft[]; conflict: ItemConflictType | null }) {
+function RowMeta({ last, others, conflict, doneByUser }: { last?: LastReconciled; others: DBDraft[]; conflict: ItemConflictType | null; doneByUser: DoneMap }) {
   const lines: React.ReactNode[] = [];
   if (last) {
     lines.push(
@@ -1388,7 +1719,9 @@ function RowMeta({ last, others, conflict }: { last?: LastReconciled; others: DB
     );
   }
   if (others.length > 0) {
-    const names = others.map(displayUser).join(", ");
+    const names = others
+      .map(o => `${displayUser(o)}${doneByUser.get(o.user_id)?.done ? " (done)" : ""}`)
+      .join(", ");
     lines.push(
       <span key="others" className={cn(
         "inline-flex items-center gap-1 text-[10px]",
@@ -1396,6 +1729,13 @@ function RowMeta({ last, others, conflict }: { last?: LastReconciled; others: DB
       )}>
         {conflict?.any ? <AlertCircle className="w-3 h-3" /> : <Users className="w-3 h-3" />}
         {conflict?.any ? "Disagrees with " : "Also counted by "}{names}
+      </span>
+    );
+  }
+  if (conflict?.any && conflict.reason) {
+    lines.push(
+      <span key="reason" className="inline-flex items-center gap-1 text-[10px] text-rose-600/90 dark:text-rose-400/90 tabular-nums">
+        <AlertTriangle className="w-3 h-3" /> {conflict.reason}
       </span>
     );
   }
@@ -1409,21 +1749,23 @@ function RowMeta({ last, others, conflict }: { last?: LastReconciled; others: DB
 //   - the app's current value as a grey "app: …" reference
 //   - any other counters' entered totals for that godown
 function BreakupCell({
-  rd, app, item, others,
+  rd, app, item, others, doneByUser,
 }: {
   rd: RowDiffType;
   app: { A: AppStock; B: AppStock };
   item: Item;
   others: DBDraft[];
+  doneByUser: DoneMap;
 }) {
   const itemCs = item.case_size || 0;
   const row = (g: Godown) => {
     const side = g === "A" ? rd.A : rd.B;
     const appSide = g === "A" ? app.A : app.B;
     const youShown = side.userTouched || rd.caseSizeChanged;
+    const myPcs = youShown && side.valid ? side.physPieces : null;
     const othersForG = others
-      .map(o => ({ name: displayUser(o), s: draftSide(o, g, itemCs) }))
-      .filter(o => o.s.touched);
+      .map(o => ({ o, name: displayUser(o), s: draftSide(o, g, itemCs) }))
+      .filter(x => x.s.touched);
     return (
       <div className="leading-tight">
         <div className="flex items-baseline gap-1.5">
@@ -1448,11 +1790,19 @@ function BreakupCell({
           <span className="text-[10px] tabular-nums text-zinc-500">
             system {breakupStr(itemCs, appSide.cases, appSide.loose)}
           </span>
-          {othersForG.map((o, idx) => (
-            <span key={idx} className="text-[10px] tabular-nums text-cyan-600/80 dark:text-cyan-400/80">
-              {o.name.split(" ")[0]} {fmtN(o.s.pcs)}
-            </span>
-          ))}
+          {othersForG.map((x, idx) => {
+            const delta = myPcs !== null ? x.s.pcs - myPcs : null;
+            const isDone = doneByUser.get(x.o.user_id)?.done;
+            return (
+              <span key={idx} className={cn(
+                "text-[10px] tabular-nums",
+                delta !== null && delta !== 0 ? "text-rose-600/90 dark:text-rose-400/90 font-medium" : "text-cyan-600/80 dark:text-cyan-400/80"
+              )}>
+                {x.name.split(" ")[0]}{isDone ? "✓" : ""} {fmtN(x.s.pcs)}
+                {delta !== null && delta !== 0 && <span> ({delta > 0 ? "+" : ""}{fmtN(delta)})</span>}
+              </span>
+            );
+          })}
         </div>
       </div>
     );
@@ -1467,7 +1817,7 @@ function BreakupCell({
 
 // ─── ExprInput ───────────────────────────────────────────────────────────
 function ExprInput({
-  value, placeholder, onChange, onBlur, tone, ariaLabel, compact = false, stepper = false,
+  value, placeholder, onChange, onBlur, tone, ariaLabel, compact = false, stepper = false, disabled = false,
 }: {
   value: string;
   placeholder: string;
@@ -1477,12 +1827,16 @@ function ExprInput({
   ariaLabel: string;
   compact?: boolean;
   stepper?: boolean;
+  disabled?: boolean;
 }) {
   const parsed = parseExpr(value);
   const showsTotal = value.includes("+") && parsed !== null;
   const cls = cn(
-    "w-full tabular-nums text-center text-sm bg-white dark:bg-zinc-900 border rounded-md focus:outline-none focus:ring-1",
+    "w-full tabular-nums text-center text-sm border rounded-md focus:outline-none focus:ring-1",
     compact ? "px-1 py-0.5 text-[12px]" : "px-1.5 py-1",
+    disabled
+      ? "bg-zinc-100 dark:bg-zinc-800/60 text-zinc-500 dark:text-zinc-400 cursor-not-allowed"
+      : "bg-white dark:bg-zinc-900",
     tone === "amber" && "border-amber-500/50 focus:ring-amber-500/40 focus:border-amber-500",
     tone === "rose" && "border-rose-500/60 focus:ring-rose-500/40 focus:border-rose-500",
     tone === "neutral" && "border-zinc-200 dark:border-zinc-800 focus:ring-cyan-500/40 focus:border-cyan-500"
@@ -1492,6 +1846,7 @@ function ExprInput({
       <input type="text" inputMode="numeric" value={value} placeholder={placeholder}
         onChange={(e) => onChange(e.target.value)}
         onBlur={onBlur}
+        disabled={disabled}
         className={cls} aria-label={ariaLabel} />
       {showsTotal && (
         <span className="pointer-events-none absolute -bottom-3.5 left-1/2 -translate-x-1/2 text-[9px] text-zinc-500 tabular-nums whitespace-nowrap">
@@ -1507,6 +1862,7 @@ function ExprInput({
   // and writes back a plain integer; onBlur flushes the save immediately so a
   // tap survives the tab being backgrounded.
   const bump = (delta: number) => {
+    if (disabled) return;
     const next = Math.max(0, (parseExpr(value) ?? 0) + delta);
     onChange(String(next));
     onBlur?.();
@@ -1516,10 +1872,10 @@ function ExprInput({
     "flex-shrink-0 w-8 rounded-md border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-100 text-lg leading-none font-medium select-none active:bg-zinc-200 dark:active:bg-zinc-700 disabled:opacity-40 flex items-center justify-center";
   return (
     <div className="flex items-stretch gap-1">
-      <button type="button" tabIndex={-1} onClick={() => bump(-1)} disabled={atZero}
+      <button type="button" tabIndex={-1} onClick={() => bump(-1)} disabled={atZero || disabled}
         className={stepBtn} aria-label={`Decrease ${ariaLabel}`}>−</button>
       {field}
-      <button type="button" tabIndex={-1} onClick={() => bump(1)}
+      <button type="button" tabIndex={-1} onClick={() => bump(1)} disabled={disabled}
         className={stepBtn} aria-label={`Increase ${ariaLabel}`}>+</button>
     </div>
   );
@@ -1527,22 +1883,24 @@ function ExprInput({
 
 // ─── mobile cards (My view) ──────────────────────────────────────────────
 function MobileCards({
-  items, appStock, drafts, lastRecon, currentUserId,
-  computeDiff, setField, flushSaves, resetMyRow, errorsByItem,
-  otherUsersByItem, conflictByItem,
+  items, appStock, drafts, lastRecon, currentUserId, frozen,
+  computeDiff, setField, commitRow, resetMyRow, errorsByItem,
+  otherUsersByItem, conflictByItem, doneByUser,
 }: {
   items: (Item & { categoryName: string | null })[];
   appStock: Map<string, { A: AppStock; B: AppStock }>;
   drafts: Map<DraftKey, DBDraft>;
   lastRecon: Map<string, LastReconciled>;
   currentUserId: string;
+  frozen: boolean;
   computeDiff: (i: Item, app: { A: AppStock; B: AppStock }, d: DBDraft) => RowDiffType;
   setField: (uid: string, iid: string, f: Field, v: string) => void;
-  flushSaves: () => void;
+  commitRow: (uid: string, iid: string) => void;
   resetMyRow: (itemId: string) => void;
   errorsByItem: Map<string, string[]>;
   otherUsersByItem: (itemId: string) => DBDraft[];
   conflictByItem: (itemId: string) => ItemConflictType | null;
+  doneByUser: DoneMap;
 }) {
   return (
     <div className="md:hidden space-y-2">
@@ -1577,9 +1935,9 @@ function MobileCards({
                 <div className="text-[11px] text-zinc-500 truncate">
                   {[i.size, i.colour, i.categoryName].filter(Boolean).join(" · ")}
                 </div>
-                <RowMeta last={last} others={others} conflict={conflict} />
+                <RowMeta last={last} others={others} conflict={conflict} doneByUser={doneByUser} />
               </div>
-              {rd.hasAnyChange && (
+              {rd.hasAnyChange && !frozen && (
                 <button onClick={() => resetMyRow(i.id)} className="text-zinc-400 hover:text-rose-500 p-1.5 -mr-1.5" aria-label="Reset row">
                   <RotateCcw className="w-3.5 h-3.5" />
                 </button>
@@ -1592,7 +1950,8 @@ function MobileCards({
                 value={my.case_size_raw}
                 placeholder={String(rd.csOld)}
                 onChange={(v) => setField(currentUserId, i.id, "case_size", v)}
-                onBlur={flushSaves}
+                onBlur={() => commitRow(currentUserId, i.id)}
+                disabled={frozen}
                 tone={rd.caseSizeChanged ? "amber" : (!rd.caseSizeValid ? "rose" : "neutral")}
                 ariaLabel={`Case size for ${i.model}`}
               />
@@ -1606,11 +1965,17 @@ function MobileCards({
                 side={rd.A}
                 touched={rd.A.userTouched || rd.caseSizeChanged}
                 csNew={rd.csNew} csOld={rd.csOld}
-                others={others.map(o => ({ name: displayUser(o).split(" ")[0], side: draftSide(o, "A", i.case_size || 0) }))
-                  .filter(o => o.side.touched).map(o => ({ name: o.name, pcs: o.side.pcs }))}
+                frozen={frozen}
+                others={others.map(o => ({ o, name: displayUser(o).split(" ")[0], side: draftSide(o, "A", i.case_size || 0) }))
+                  .filter(x => x.side.touched)
+                  .map(x => ({
+                    name: x.name, pcs: x.side.pcs,
+                    delta: (rd.A.userTouched && rd.A.valid) ? x.side.pcs - rd.A.physPieces : null,
+                    done: !!doneByUser.get(x.o.user_id)?.done,
+                  }))}
                 onCases={(v) => setField(currentUserId, i.id, "a_cases", v)}
                 onLoose={(v) => setField(currentUserId, i.id, "a_loose", v)}
-                onBlur={flushSaves}
+                onBlur={() => commitRow(currentUserId, i.id)}
                 modelHint={`${i.model} A`}
               />
               <GodownBlock
@@ -1620,11 +1985,17 @@ function MobileCards({
                 side={rd.B}
                 touched={rd.B.userTouched || rd.caseSizeChanged}
                 csNew={rd.csNew} csOld={rd.csOld}
-                others={others.map(o => ({ name: displayUser(o).split(" ")[0], side: draftSide(o, "B", i.case_size || 0) }))
-                  .filter(o => o.side.touched).map(o => ({ name: o.name, pcs: o.side.pcs }))}
+                frozen={frozen}
+                others={others.map(o => ({ o, name: displayUser(o).split(" ")[0], side: draftSide(o, "B", i.case_size || 0) }))
+                  .filter(x => x.side.touched)
+                  .map(x => ({
+                    name: x.name, pcs: x.side.pcs,
+                    delta: (rd.B.userTouched && rd.B.valid) ? x.side.pcs - rd.B.physPieces : null,
+                    done: !!doneByUser.get(x.o.user_id)?.done,
+                  }))}
                 onCases={(v) => setField(currentUserId, i.id, "b_cases", v)}
                 onLoose={(v) => setField(currentUserId, i.id, "b_loose", v)}
-                onBlur={flushSaves}
+                onBlur={() => commitRow(currentUserId, i.id)}
                 modelHint={`${i.model} B`}
               />
             </div>
@@ -1644,7 +2015,7 @@ function MobileCards({
 
 function GodownBlock({
   label, appCases, appLoose, d_cases, d_loose, side, touched,
-  csNew, csOld, others,
+  csNew, csOld, others, frozen,
   onCases, onLoose, onBlur, modelHint,
 }: {
   label: string;
@@ -1653,7 +2024,8 @@ function GodownBlock({
   side: RowDiffType["A"];
   touched: boolean;
   csNew: number; csOld: number;
-  others: { name: string; pcs: number }[];
+  others: { name: string; pcs: number; delta: number | null; done: boolean }[];
+  frozen: boolean;
   onCases: (v: string) => void; onLoose: (v: string) => void;
   onBlur: () => void;
   modelHint: string;
@@ -1669,12 +2041,12 @@ function GodownBlock({
             field to a few px in the 2-up card). */}
         <div>
           <span className="block text-[10px] text-zinc-500 mb-0.5">Cases</span>
-          <ExprInput value={d_cases} placeholder="—" onChange={onCases} onBlur={onBlur} stepper
+          <ExprInput value={d_cases} placeholder="—" onChange={onCases} onBlur={onBlur} stepper disabled={frozen}
             tone={touched ? (side.valid ? "amber" : "rose") : "neutral"} ariaLabel={`${modelHint} cases`} />
         </div>
         <div>
           <span className="block text-[10px] text-zinc-500 mb-0.5">Loose</span>
-          <ExprInput value={d_loose} placeholder="—" onChange={onLoose} onBlur={onBlur} stepper
+          <ExprInput value={d_loose} placeholder="—" onChange={onLoose} onBlur={onBlur} stepper disabled={frozen}
             tone={touched ? (side.valid ? "amber" : "rose") : "neutral"} ariaLabel={`${modelHint} loose`} />
         </div>
       </div>
@@ -1705,10 +2077,17 @@ function GodownBlock({
             </span>
           </div>
         )}
+        {/* Other counters' totals for THIS godown, with the delta vs your count
+            so you can spot and recheck a disagreement before the reviewer. */}
         {others.map((o, idx) => (
-          <div key={idx} className="flex items-baseline justify-between gap-2 text-cyan-600/80 dark:text-cyan-400/80">
-            <span className="text-[10px] truncate">{o.name}</span>
-            <span className="text-[10px] tabular-nums flex-shrink-0">{fmtN(o.pcs)} pcs</span>
+          <div key={idx} className={cn(
+            "flex items-baseline justify-between gap-2",
+            o.delta !== null && o.delta !== 0 ? "text-rose-600/90 dark:text-rose-400/90 font-medium" : "text-cyan-600/80 dark:text-cyan-400/80"
+          )}>
+            <span className="text-[10px] truncate">{o.name}{o.done ? " ✓" : ""}</span>
+            <span className="text-[10px] tabular-nums flex-shrink-0">
+              {fmtN(o.pcs)} pcs{o.delta !== null && o.delta !== 0 ? ` (${o.delta > 0 ? "+" : ""}${fmtN(o.delta)})` : ""}
+            </span>
           </div>
         ))}
       </div>
@@ -1719,18 +2098,19 @@ function GodownBlock({
 // ─── ReviewerView (admin only) ───────────────────────────────────────────
 function ReviewerView({
   items, appStock, draftsByItem, lastRecon, computeDiff, computeItemConflict,
-  setField, flushSaves, deleteDraft, currentUserId, errorsByItem,
+  setField, commitRow, deleteDraft, currentUserId, doneByUser, errorsByItem,
 }: {
   items: (Item & { categoryName: string | null })[];
   appStock: Map<string, { A: AppStock; B: AppStock }>;
   draftsByItem: Map<string, DBDraft[]>;
   lastRecon: Map<string, LastReconciled>;
   computeDiff: (i: Item, app: { A: AppStock; B: AppStock }, d: DBDraft) => RowDiffType;
-  computeItemConflict: (drs: DBDraft[]) => ItemConflictType;
+  computeItemConflict: (i: Item, drs: DBDraft[]) => ItemConflictType;
   setField: (uid: string, iid: string, f: Field, v: string) => void;
-  flushSaves: () => void;
+  commitRow: (uid: string, iid: string) => void;
   deleteDraft: (uid: string, iid: string) => void;
   currentUserId: string;
+  doneByUser: DoneMap;
   errorsByItem: Map<string, string[]>;
 }) {
   return (
@@ -1740,11 +2120,12 @@ function ReviewerView({
         if (!app) return null;
         const drs = draftsByItem.get(i.id) || [];
         const nonEmpty = drs.filter(d => !isDraftEmpty(d));
-        const conflict = nonEmpty.length > 1 ? computeItemConflict(nonEmpty) : null;
+        const conflict = nonEmpty.length > 0 ? computeItemConflict(i, nonEmpty) : null;
+        const ready = nonEmpty.length > 0 && !conflict?.any;
         const tint = conflict?.any
           ? "border-rose-500/40"
           : nonEmpty.length > 0
-            ? "border-amber-500/40"
+            ? "border-emerald-500/40"
             : "border-zinc-200 dark:border-zinc-800";
         const last = lastRecon.get(i.id);
         const errs = errorsByItem.get(i.id);
@@ -1769,12 +2150,25 @@ function ReviewerView({
                 <div>A {fmtN(app.A.cases)}c {fmtN(app.A.loose)}L · B {fmtN(app.B.cases)}c {fmtN(app.B.loose)}L</div>
                 {last && <div className="hidden sm:block">Last: {timeAgo(last.at)}{last.userName ? ` by ${last.userName}` : ""}</div>}
               </div>
-              {conflict?.any && (
+              {conflict?.any ? (
                 <span className="bg-rose-500/15 text-rose-700 dark:text-rose-300 px-2 py-0.5 rounded text-[10px] uppercase tracking-wider font-medium flex-shrink-0">
                   Conflict
                 </span>
-              )}
+              ) : ready ? (
+                <span className="bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 px-2 py-0.5 rounded text-[10px] uppercase tracking-wider font-medium flex-shrink-0">
+                  Ready
+                </span>
+              ) : null}
             </div>
+
+            {/* Plain-language reason so the reviewer resolves fast without
+                decoding the cells. */}
+            {conflict?.any && conflict.reason && (
+              <div className="px-3 py-1.5 bg-rose-500/5 border-t border-rose-500/15 text-[11px] text-rose-700 dark:text-rose-300 flex items-start gap-1.5 tabular-nums">
+                <AlertTriangle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
+                <div>{conflict.reason}</div>
+              </div>
+            )}
 
             {nonEmpty.length === 0 ? (
               <div className="px-3 py-2 text-[11px] text-zinc-500 italic">No drafts yet — open My count to add yours.</div>
@@ -1788,9 +2182,10 @@ function ReviewerView({
                     d={d}
                     conflict={conflict}
                     isMe={d.user_id === currentUserId}
+                    userDone={!!doneByUser.get(d.user_id)?.done}
                     computeDiff={computeDiff}
                     onChange={(field, value) => setField(d.user_id, i.id, field, value)}
-                    onBlur={flushSaves}
+                    onBlur={() => commitRow(d.user_id, i.id)}
                     onClear={() => deleteDraft(d.user_id, i.id)}
                   />
                 ))}
@@ -1811,13 +2206,14 @@ function ReviewerView({
 }
 
 function ReviewerUserRow({
-  i, app, d, conflict, isMe, computeDiff, onChange, onBlur, onClear,
+  i, app, d, conflict, isMe, userDone, computeDiff, onChange, onBlur, onClear,
 }: {
   i: Item;
   app: { A: AppStock; B: AppStock };
   d: DBDraft;
   conflict: ItemConflictType | null;
   isMe: boolean;
+  userDone: boolean;
   computeDiff: (i: Item, app: { A: AppStock; B: AppStock }, d: DBDraft) => RowDiffType;
   onChange: (field: Field, value: string) => void;
   onBlur: () => void;
@@ -1825,34 +2221,67 @@ function ReviewerUserRow({
 }) {
   const rd = computeDiff(i, app, d);
   const name = displayUser(d);
+  // Per-godown computed total: what THIS counter says is in A and in B,
+  // each next to the system figure + the difference, shown separately so the
+  // reviewer reads A and B at a glance without re-doing the case math.
+  const sideTotal = (g: Godown) => {
+    const s = g === "A" ? rd.A : rd.B;
+    if (!s.userTouched) {
+      return (
+        <span className="text-zinc-400">
+          {g}: <span className="italic">—</span> <span className="text-zinc-400/80">(sys {fmtN(s.appPieces)})</span>
+        </span>
+      );
+    }
+    return (
+      <span className="text-zinc-600 dark:text-zinc-300">
+        {g}: <span className="font-medium tabular-nums text-zinc-800 dark:text-zinc-100">{fmtN(s.physPieces)}</span>{" "}
+        <span className="text-zinc-400">
+          (sys {fmtN(s.appPieces)}
+          {s.valid && <span className={cn(s.diff === 0 ? "" : s.diff > 0 ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400")}>{`, ${s.diff > 0 ? "+" : ""}${fmtN(s.diff)}`}</span>})
+        </span>
+      </span>
+    );
+  };
   return (
     <div className={cn("px-3 py-2 grid grid-cols-[140px_1fr_24px] sm:grid-cols-[160px_1fr_28px] gap-2 items-start", isMe && "bg-cyan-500/5")}>
       <div className="min-w-0">
         <div className="flex items-center gap-1.5">
-          <UserCircle2 className="w-3.5 h-3.5 text-zinc-500" />
+          <UserCircle2 className="w-3.5 h-3.5 text-zinc-500 flex-shrink-0" />
           <span className="text-[12px] font-medium truncate">{name}{isMe && <span className="text-zinc-400 ml-1">(you)</span>}</span>
+          {userDone && (
+            <span className="inline-flex items-center gap-0.5 px-1 rounded bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 text-[9px] uppercase tracking-wide font-medium flex-shrink-0">
+              <Lock className="w-2.5 h-2.5" /> done
+            </span>
+          )}
         </div>
         <div className="text-[10px] text-zinc-500 truncate">
           {d.user_role || "—"}{d.updated_at ? ` · ${timeAgo(d.updated_at)}` : ""}
         </div>
       </div>
 
-      <div className="grid grid-cols-5 gap-1.5">
-        <ReviewerCell label="Case sz" value={d.case_size_raw} placeholder={String(i.case_size || 0)}
-          onChange={(v) => onChange("case_size", v)} onBlur={onBlur} conflict={!!conflict?.case_size}
-          tone={tonefor(d.case_size_raw, rd.caseSizeValid, rd.caseSizeChanged)} ariaLabel={`Case size by ${name}`} />
-        <ReviewerCell label="A c" value={d.a_cases_raw} placeholder={String(app.A.cases)}
-          onChange={(v) => onChange("a_cases", v)} onBlur={onBlur} conflict={!!conflict?.a_cases}
-          tone={tonefor(d.a_cases_raw, rd.A.valid, rd.A.userTouched)} ariaLabel={`A cases by ${name}`} />
-        <ReviewerCell label="A L" value={d.a_loose_raw} placeholder={String(app.A.loose)}
-          onChange={(v) => onChange("a_loose", v)} onBlur={onBlur} conflict={!!conflict?.a_loose}
-          tone={tonefor(d.a_loose_raw, rd.A.valid, rd.A.userTouched)} ariaLabel={`A loose by ${name}`} />
-        <ReviewerCell label="B c" value={d.b_cases_raw} placeholder={String(app.B.cases)}
-          onChange={(v) => onChange("b_cases", v)} onBlur={onBlur} conflict={!!conflict?.b_cases}
-          tone={tonefor(d.b_cases_raw, rd.B.valid, rd.B.userTouched)} ariaLabel={`B cases by ${name}`} />
-        <ReviewerCell label="B L" value={d.b_loose_raw} placeholder={String(app.B.loose)}
-          onChange={(v) => onChange("b_loose", v)} onBlur={onBlur} conflict={!!conflict?.b_loose}
-          tone={tonefor(d.b_loose_raw, rd.B.valid, rd.B.userTouched)} ariaLabel={`B loose by ${name}`} />
+      <div className="min-w-0">
+        <div className="grid grid-cols-5 gap-1.5">
+          <ReviewerCell label="Case sz" value={d.case_size_raw} placeholder={String(i.case_size || 0)}
+            onChange={(v) => onChange("case_size", v)} onBlur={onBlur} conflict={!!conflict?.case_size}
+            tone={tonefor(d.case_size_raw, rd.caseSizeValid, rd.caseSizeChanged)} ariaLabel={`Case size by ${name}`} />
+          <ReviewerCell label="A c" value={d.a_cases_raw} placeholder={String(app.A.cases)}
+            onChange={(v) => onChange("a_cases", v)} onBlur={onBlur} conflict={!!conflict?.a_cases}
+            tone={tonefor(d.a_cases_raw, rd.A.valid, rd.A.userTouched)} ariaLabel={`A cases by ${name}`} />
+          <ReviewerCell label="A L" value={d.a_loose_raw} placeholder={String(app.A.loose)}
+            onChange={(v) => onChange("a_loose", v)} onBlur={onBlur} conflict={!!conflict?.a_loose}
+            tone={tonefor(d.a_loose_raw, rd.A.valid, rd.A.userTouched)} ariaLabel={`A loose by ${name}`} />
+          <ReviewerCell label="B c" value={d.b_cases_raw} placeholder={String(app.B.cases)}
+            onChange={(v) => onChange("b_cases", v)} onBlur={onBlur} conflict={!!conflict?.b_cases}
+            tone={tonefor(d.b_cases_raw, rd.B.valid, rd.B.userTouched)} ariaLabel={`B cases by ${name}`} />
+          <ReviewerCell label="B L" value={d.b_loose_raw} placeholder={String(app.B.loose)}
+            onChange={(v) => onChange("b_loose", v)} onBlur={onBlur} conflict={!!conflict?.b_loose}
+            tone={tonefor(d.b_loose_raw, rd.B.valid, rd.B.userTouched)} ariaLabel={`B loose by ${name}`} />
+        </div>
+        <div className="mt-1.5 flex flex-wrap gap-x-4 gap-y-0.5 text-[10px] tabular-nums">
+          {sideTotal("A")}
+          {sideTotal("B")}
+        </div>
       </div>
 
       <button onClick={onClear} className="text-zinc-400 hover:text-rose-500 p-1 self-center" title={`Clear ${name}'s draft`} aria-label={`Clear ${name}'s draft`}>
@@ -1902,17 +2331,24 @@ function HintCard({ isAdmin, mode }: { isAdmin: boolean; mode: "my" | "reviewer"
         <code className="px-1 bg-zinc-200 dark:bg-zinc-800 rounded">5+1</code> to keep a running total. Each box shows what's <strong>in system</strong> vs what <strong>you count</strong>, with the difference.
       </div>
       <div>
-        <strong>Per-user drafts:</strong> each counter has their own list. Your numbers don't overwrite anyone else's. Drafts autosave to the server, so closing the tab is safe.
+        <strong>Per-user drafts:</strong> each counter has their own list — your numbers never overwrite anyone else's. You can see other counters' totals under each godown with the <strong>difference vs your count</strong> in red, so you can recheck before the reviewer does.
+      </div>
+      <div>
+        <strong>Loose auto-packs:</strong> if you enter more loose than the case size (e.g. 3 loose on a case of 2), it rolls up to 1 case + 1 loose automatically when you leave the box.
+      </div>
+      <div>
+        <strong>Mark my count done</strong> freezes your entries so they can't change by accident. While you're done, any item you left <em>blank</em> but a teammate filled is read as “found none” and flagged to the reviewer as a conflict. Hit <strong>Resume editing</strong> if you find more.
       </div>
       {!isAdmin && (
         <div>
-          <strong>No commit button:</strong> only admin commits. Once your count is done, tell admin to review and adjust.
+          <strong>No commit button:</strong> only admin commits. Once your count is done, mark it done and tell admin to review and adjust.
         </div>
       )}
       {isAdmin && (
         <div>
-          <strong>Reviewer mode</strong> shows every user's draft for each item. If two users disagree, the item is flagged{" "}
-          <span className="inline-block px-1 bg-rose-500/15 text-rose-700 dark:text-rose-300 rounded text-[10px]">Conflict</span> and skipped from commit. Edit anyone's row inline to resolve, or ask them to recount.
+          <strong>Reviewer mode</strong> shows every counter's draft per item with each one's A/B totals. Disagreements (or a “done” counter who missed an item others found) are flagged{" "}
+          <span className="inline-block px-1 bg-rose-500/15 text-rose-700 dark:text-rose-300 rounded text-[10px]">Conflict</span> with the reason spelled out and skipped from commit. Use <strong>Conflicts</strong> to see only those. Agreed items show{" "}
+          <span className="inline-block px-1 bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 rounded text-[10px]">Ready</span>. Edit anyone's row inline to resolve, or ask them to recount.
         </div>
       )}
       <div>

@@ -230,6 +230,52 @@ If you must touch one of these files: **read first, edit surgically, never repla
 
 ## 11. Changelog (latest first — add new entries at the top)
 
+### 2026-06-09 — Reconciliation: multi-counter coordination (done/freeze, done-aware conflicts, rollover, deltas)
+
+Big reconciliation rework so several staff can independently count the same stock and the reviewer
+can resolve fast. **Requires a new migration: `db/2026-06-09-reconciliation-coordination.sql`** (run
+in Supabase → SQL editor). All client changes are in `app/reconciliation/page.tsx` + one CSS rule.
+
+Backend (`2026-06-09-reconciliation-coordination.sql`):
+- **Cross-counter read visibility.** `drafts_select` RLS relaxed to `using(true)` → any authenticated
+  user can now READ all drafts (writes still own-or-admin). This powers staff seeing each other's
+  totals + deltas. *Until this runs, staff only see their own drafts (graceful: deltas just don't show).*
+- **`reconciliation_done` table** (per-user `done` flag + RLS, select-all / mutate-own-or-admin).
+- **View** `reconciliation_drafts_with_user` now also returns `user_done` / `user_done_at`.
+- **`apply_reconciliation`** normalises the committed split (rolls loose ≥ case size into cases) so
+  stored stock stays tidy. Same signature, same Adjustment delta — only the stored split changes.
+
+Client (10 tweaks the user asked for):
+1. **Reviewer "Conflicts" filter** — toolbar toggle (with a live count badge) collapses the list to
+   only items with a conflict.
+2. **Touch-clean surface (#2)** — `.recon-page` sets `user-select:none` + `-webkit-touch-callout:none`
+   (inputs re-enable both) so tapping labels/numbers no longer pops the Android "G"/selection chip or
+   iOS callout. (in `globals.css`)
+3. **A and B shown separately** — reviewer now shows each counter's **A** and **B** computed totals
+   (entered vs system vs diff) on their own line; mobile already separates A/B.
+4. **Case-size rollover (#4)** — loose ≥ case size auto-packs into cases (cs 2, 3 loose → 1c 1L) on
+   blur/stepper. `normalizeRow()` + `commitRow()` (onBlur). Only rolls when needed (keeps sub-case
+   running-total expressions intact).
+5. **System + own entries clarity** — kept the In system / You count / Diff block; reviewer per-counter
+   A/B totals carry the system figure + signed diff.
+6/8. **Done/freeze + done-aware conflicts.** "Mark my count done" (toolbar, everyone) freezes that
+   counter's entries (reversible via "Resume editing"; a banner shows while frozen). Conflict model
+   rewritten to **per-godown piece level**: two counters disagree on a godown's pieces → conflict; OR a
+   counter who is **done** left a godown blank that another filled → their blank = "found none" (0) →
+   conflict. Gated on *done* so an item others simply haven't reached yet stays pending, not conflicting.
+7. **Faster reviewing** — `Ready`/`Conflict` badges, a plain-language **reason** under each conflict
+   (e.g. `A: Ravi 18 vs Sara none (done)`), and a toast when the conflict count rises (no need to watch).
+9. **Cross-staff deltas (#9)** — under each godown a counter sees other counters' totals with the
+   **difference vs their own** (red when non-zero) + a ✓ if that counter is done.
+10. **Existing entries normalized (#10)** — one-time pass on load tidies the current user's pre-existing
+    over-case loose, plus the server normalises on commit.
+
+Commit also **resets stale `done` flags** for counters whose drafts were all cleared. `tsc` + `next build`
+clean (`/reconciliation` 16.8 kB). **No re-audit found new issues; logic self-reviewed (conflict model,
+rollover, done gating) against the spec.**
+
+---
+
 ### 2026-06-03 — Reconciliation: count steppers + prominent system stock (+ full re-audit)
 
 Preceded by a **comprehensive re-audit** (8 subsystems mapped by parallel readers, every flagged
