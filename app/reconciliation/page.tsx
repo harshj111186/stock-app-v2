@@ -1326,28 +1326,28 @@ function MyDesktopRow({
           />
         </td>
         <td className="px-2 py-2">
-          <ExprInput value={d.a_cases_raw} placeholder={String(app.A.cases)}
+          <ExprInput value={d.a_cases_raw} placeholder="—"
             onChange={(v) => onChange("a_cases", v)}
             onBlur={onBlur}
             tone={rd.A.userTouched ? (rd.A.valid ? "amber" : "rose") : "neutral"}
             ariaLabel={`Godown A cases for ${i.model}`} />
         </td>
         <td className="px-2 py-2">
-          <ExprInput value={d.a_loose_raw} placeholder={String(app.A.loose)}
+          <ExprInput value={d.a_loose_raw} placeholder="—"
             onChange={(v) => onChange("a_loose", v)}
             onBlur={onBlur}
             tone={rd.A.userTouched ? (rd.A.valid ? "amber" : "rose") : "neutral"}
             ariaLabel={`Godown A loose for ${i.model}`} />
         </td>
         <td className="px-2 py-2">
-          <ExprInput value={d.b_cases_raw} placeholder={String(app.B.cases)}
+          <ExprInput value={d.b_cases_raw} placeholder="—"
             onChange={(v) => onChange("b_cases", v)}
             onBlur={onBlur}
             tone={rd.B.userTouched ? (rd.B.valid ? "amber" : "rose") : "neutral"}
             ariaLabel={`Godown B cases for ${i.model}`} />
         </td>
         <td className="px-2 py-2">
-          <ExprInput value={d.b_loose_raw} placeholder={String(app.B.loose)}
+          <ExprInput value={d.b_loose_raw} placeholder="—"
             onChange={(v) => onChange("b_loose", v)}
             onBlur={onBlur}
             tone={rd.B.userTouched ? (rd.B.valid ? "amber" : "rose") : "neutral"}
@@ -1669,12 +1669,12 @@ function GodownBlock({
             field to a few px in the 2-up card). */}
         <div>
           <span className="block text-[10px] text-zinc-500 mb-0.5">Cases</span>
-          <ExprInput value={d_cases} placeholder={String(appCases)} onChange={onCases} onBlur={onBlur} stepper
+          <ExprInput value={d_cases} placeholder="—" onChange={onCases} onBlur={onBlur} stepper
             tone={touched ? (side.valid ? "amber" : "rose") : "neutral"} ariaLabel={`${modelHint} cases`} />
         </div>
         <div>
           <span className="block text-[10px] text-zinc-500 mb-0.5">Loose</span>
-          <ExprInput value={d_loose} placeholder={String(appLoose)} onChange={onLoose} onBlur={onBlur} stepper
+          <ExprInput value={d_loose} placeholder="—" onChange={onLoose} onBlur={onBlur} stepper
             tone={touched ? (side.valid ? "amber" : "rose") : "neutral"} ariaLabel={`${modelHint} loose`} />
         </div>
       </div>
