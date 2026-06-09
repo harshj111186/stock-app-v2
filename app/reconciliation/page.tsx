@@ -610,17 +610,27 @@ export default function ReconciliationPage() {
     const k = dkey(userId, itemId);
     const cur = draftsRef.current.get(k);
     if (!cur) return false;
-    const cs = parseExpr(cur.case_size_raw) ?? (itemById.get(itemId)?.case_size || 0);
-    if (cs <= 0) return false;
+    const itemCs = itemById.get(itemId)?.case_size || 0;
     const next: DBDraft = { ...cur };
     let changed = false;
-    for (const [cf, lf] of [["a_cases_raw", "a_loose_raw"], ["b_cases_raw", "b_loose_raw"]] as const) {
-      const l = parseExpr(next[lf]);
-      if (l === null || l < cs) continue;
-      const c = parseExpr(next[cf]) ?? 0;
-      next[cf] = String(c + Math.floor(l / cs));
-      next[lf] = String(l % cs);
+    // Collapse a case size that just equals the system value (the pre-filled
+    // default) back to empty — it isn't a real change, so it shouldn't make the
+    // draft count as "staged" or create a phantom row. A genuinely different
+    // case size stays and flows through the normal change/conflict/commit logic.
+    if (next.case_size_raw.trim() !== "" && parseExpr(next.case_size_raw) === itemCs) {
+      next.case_size_raw = "";
       changed = true;
+    }
+    const cs = parseExpr(next.case_size_raw) ?? itemCs;
+    if (cs > 0) {
+      for (const [cf, lf] of [["a_cases_raw", "a_loose_raw"], ["b_cases_raw", "b_loose_raw"]] as const) {
+        const l = parseExpr(next[lf]);
+        if (l === null || l < cs) continue;
+        const c = parseExpr(next[cf]) ?? 0;
+        next[cf] = String(c + Math.floor(l / cs));
+        next[lf] = String(l % cs);
+        changed = true;
+      }
     }
     if (!changed) return false;
     next.updated_at = new Date().toISOString();
@@ -1856,6 +1866,7 @@ function MyDesktopRow({
         <td className="px-2 py-3 align-top">
           <ExprInput
             value={d.case_size_raw}
+            prefill={String(rd.csOld)}
             onChange={(v) => onChange("case_size", v)}
             onBlur={onBlur}
             disabled={frozen}
@@ -1863,7 +1874,7 @@ function MyDesktopRow({
             tone={rd.caseSizeChanged ? "amber" : (!rd.caseSizeValid ? "rose" : "neutral")}
             ariaLabel={`Case size for ${i.model}`}
           />
-          <div className="mt-1 flex justify-center"><SysChip>{rd.csOld}</SysChip></div>
+          {rd.caseSizeChanged && <div className="mt-1 flex justify-center"><SysChip label="WAS">{rd.csOld}</SysChip></div>}
         </td>
         <td className="px-2 py-3 align-top">
           <GodownPanel g="A" appSide={app.A} side={rd.A} csOld={rd.csOld} csNew={rd.csNew}
@@ -1939,7 +1950,7 @@ function RowMeta({ last, others, conflict, doneByUser }: { last?: LastReconciled
 
 // ─── ExprInput ───────────────────────────────────────────────────────────
 function ExprInput({
-  value, placeholder = "—", onChange, onBlur, tone, ariaLabel, compact = false, stepper = false, disabled = false,
+  value, placeholder = "—", onChange, onBlur, tone, ariaLabel, compact = false, stepper = false, disabled = false, prefill,
 }: {
   value: string;
   placeholder?: string;          // defaults to "—" — NEVER pass a system value here
@@ -1950,9 +1961,15 @@ function ExprInput({
   compact?: boolean;
   stepper?: boolean;
   disabled?: boolean;
+  // When set AND the value is empty, show this as the box's real (editable)
+  // value, and select-all on focus so the first keystroke replaces it cleanly.
+  // Used ONLY for case size (a pre-filled default), never for count boxes.
+  prefill?: string;
 }) {
   const parsed = parseExpr(value);
   const showsTotal = value.includes("+") && parsed !== null;
+  const usingPrefill = value === "" && prefill !== undefined && prefill !== "";
+  const displayValue = usingPrefill ? prefill! : value;
   const cls = cn(
     "w-full tabular-nums text-center border rounded-md focus:outline-none focus:ring-2 transition-colors",
     compact ? "min-h-9 text-[13px] px-1.5" : "min-h-11 text-base font-semibold px-2.5",
@@ -1965,9 +1982,10 @@ function ExprInput({
   );
   const field = (
     <div className="flex-1 flex flex-col gap-0.5 min-w-0">
-      <input type="text" inputMode="numeric" value={value} placeholder={placeholder}
+      <input type="text" inputMode="numeric" value={displayValue} placeholder={placeholder}
         onChange={(e) => onChange(e.target.value)}
         onBlur={onBlur}
+        onFocus={usingPrefill ? (e) => e.currentTarget.select() : undefined}
         disabled={disabled}
         className={cls} aria-label={ariaLabel} />
       {/* Reserved caption slot for the running-total sum — fixed height so it
@@ -1986,11 +2004,12 @@ function ExprInput({
   // typing flow (intentional — not a focus target).
   const bump = (delta: number) => {
     if (disabled) return;
-    const next = Math.max(0, (parseExpr(value) ?? 0) + delta);
+    // Bump from the SHOWN number (so a pre-filled case size steps 6→7, not 0→1).
+    const next = Math.max(0, (parseExpr(displayValue) ?? 0) + delta);
     onChange(String(next));
     onBlur?.();
   };
-  const atZero = (parseExpr(value) ?? 0) <= 0;
+  const atZero = (parseExpr(displayValue) ?? 0) <= 0;
   const stepBtn =
     "flex-shrink-0 min-w-11 min-h-11 rounded-lg border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-100 select-none active:scale-95 active:bg-zinc-200 dark:active:bg-zinc-700 hover:border-violet-400 disabled:opacity-40 disabled:active:scale-100 flex items-center justify-center transition";
   return (
@@ -2049,15 +2068,17 @@ function MobileCards({
               )}
             </div>
 
-            {/* Case-size strip — system value sits BESIDE the box, never inside it */}
+            {/* Case-size strip — pre-filled with the system value (it rarely
+                changes); only the "was N" reference appears once it's changed. */}
             <div className="grid grid-cols-[1fr_auto] items-center gap-2 mb-3 rounded-lg bg-zinc-50/70 dark:bg-zinc-800/40 px-3 py-2">
               <div className="flex items-center gap-2 min-w-0">
                 <span className="text-[10px] uppercase tracking-wider text-zinc-500">Case size</span>
-                <SysChip>{rd.csOld}</SysChip>
+                {rd.caseSizeChanged && <SysChip label="WAS">{rd.csOld}</SysChip>}
               </div>
               <div className="w-[148px]">
                 <ExprInput
                   value={my.case_size_raw}
+                  prefill={String(rd.csOld)}
                   onChange={(v) => setField(currentUserId, i.id, "case_size", v)}
                   onBlur={() => commitRow(currentUserId, i.id)}
                   disabled={frozen}
@@ -2317,12 +2338,12 @@ function ReviewerUserRow({
         </button>
       </div>
 
-      {/* Case size — system beside the box */}
+      {/* Case size — pre-filled with the system value; "was N" shows if changed */}
       <div className="flex items-center gap-2 mb-2">
         <span className="text-[10px] uppercase tracking-wide text-zinc-500">Case size</span>
-        <SysChip>{i.case_size || 0}</SysChip>
+        {rd.caseSizeChanged && <SysChip label="WAS">{i.case_size || 0}</SysChip>}
         <div className="w-[120px]">
-          <ExprInput value={d.case_size_raw} onChange={(v) => onChange("case_size", v)} onBlur={onBlur} compact
+          <ExprInput value={d.case_size_raw} prefill={String(i.case_size || 0)} onChange={(v) => onChange("case_size", v)} onBlur={onBlur} compact
             tone={csTone} ariaLabel={`Case size by ${name}`} />
         </div>
       </div>

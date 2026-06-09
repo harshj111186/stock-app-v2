@@ -230,6 +230,18 @@ If you must touch one of these files: **read first, edit surgically, never repla
 
 ## 11. Changelog (latest first — add new entries at the top)
 
+### 2026-06-09 — Reconciliation: case size pre-filled with the system value
+
+Case size (which rarely changes) is now PRE-FILLED into its input as a real, editable value (the
+deliberate exception to "no system value in the box" — count boxes stay empty "—"). Implemented as a
+display-only `prefill` on `ExprInput` (select-all on focus so editing replaces it; the stepper bumps from
+the shown number): `case_size_raw` stays empty until someone actually changes it, so all the existing
+change → stage → conflict → commit logic is untouched. `normalizeRow` now collapses a case size that just
+equals the system value back to empty (no phantom "staged" row). The "was N" system reference shows beside
+the box only once it's been changed. `tsc` + build clean. No SQL.
+
+---
+
 ### 2026-06-09 — Reconciliation: full My-count + Reviewer revamp (design-system rebuild + bug kills)
 
 Complete presentation rebuild of `/reconciliation` (client-only, no SQL) guided by a multi-agent design
