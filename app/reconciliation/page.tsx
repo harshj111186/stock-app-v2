@@ -658,14 +658,21 @@ export default function ReconciliationPage() {
     const side = (cRaw: string, lRaw: string, appSide: AppStock): SideDiff => {
       const pc = parseExpr(cRaw);
       const pl = parseExpr(lRaw);
-      const physCases = pc ?? appSide.cases;
-      const physLoose = pl ?? appSide.loose;
+      const userTouched = cRaw.trim() !== "" || lRaw.trim() !== "";
+      // CRITICAL: a blank field on a godown you've STARTED counting means 0
+      // (found none) — NOT the system value. Falling back to the system number
+      // for the empty sibling silently inflated "You count" (e.g. enter 1 case,
+      // leave loose blank → it added the system's loose). Only a wholly
+      // untouched godown falls back to system, so its diff stays 0. This now
+      // matches the other-counter path (draftSide) and conflict detection,
+      // which already treat blanks as 0.
+      const physCases = pc ?? (userTouched ? 0 : appSide.cases);
+      const physLoose = pl ?? (userTouched ? 0 : appSide.loose);
       const appPieces = pieces(csOld, appSide.cases, appSide.loose);
       const physPieces = pieces(csNew, physCases, physLoose);
       const valid =
         (cRaw.trim() === "" || pc !== null) &&
         (lRaw.trim() === "" || pl !== null);
-      const userTouched = cRaw.trim() !== "" || lRaw.trim() !== "";
       const diff = (userTouched || caseSizeChanged) ? physPieces - appPieces : 0;
       return { diff, valid, userTouched, physCases, physLoose, appPieces, physPieces };
     };
