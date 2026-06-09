@@ -4,6 +4,7 @@ import {
   Printer, ClipboardCheck, CheckCircle2, AlertCircle,
   RotateCcw, Loader2, Filter, Eye, EyeOff, Users, ShieldCheck,
   UserCircle2, Clock, Lock, LockOpen, CheckCheck, AlertTriangle, UserPlus,
+  Minus, Plus,
 } from "lucide-react";
 import { Shell } from "@/components/shell";
 import { sb, type Item } from "@/lib/supabase";
@@ -130,6 +131,86 @@ function timeAgo(iso: string): string {
 
 const displayUser = (d: DBDraft) =>
   d.user_name?.trim() || d.user_email?.split("@")[0] || "Unknown";
+
+// ─── design-system primitives ─────────────────────────────────────────────
+// One visual grammar reused on every surface so a non-technical user learns it
+// once:  system reference = quiet zinc, always labelled, NEVER inside a box ·
+// the count input is the only white/bordered element (shows "—" when empty) ·
+// the diff is the single saturated signal (emerald = surplus, rose = shortage).
+
+// SSR-safe media query so we mount EITHER the desktop table OR the mobile
+// cards — never both (halves the DOM/handlers on the heaviest screen).
+function useMediaQuery(query: string): boolean {
+  const [match, setMatch] = useState(false);
+  useEffect(() => {
+    const m = window.matchMedia(query);
+    const on = () => setMatch(m.matches);
+    on();
+    m.addEventListener("change", on);
+    return () => m.removeEventListener("change", on);
+  }, [query]);
+  return match;
+}
+
+// Labelled system-reference chip (quiet; never an input).
+function SysChip({ label = "SYS", children, className }: { label?: string; children: React.ReactNode; className?: string }) {
+  return (
+    <span className={cn("inline-flex items-center gap-1 rounded px-1.5 py-0.5 bg-zinc-100 dark:bg-zinc-800/80 text-[11px] tabular-nums text-zinc-600 dark:text-zinc-300", className)}>
+      <span className="text-[9px] font-semibold tracking-wider text-zinc-400 dark:text-zinc-500">{label}</span>
+      {children}
+    </span>
+  );
+}
+
+// The single coloured signal — render ONLY when a side was counted & valid.
+function DiffPill({ diff }: { diff: number }) {
+  const cls = diff === 0
+    ? "bg-zinc-100 dark:bg-zinc-800 text-zinc-500 dark:text-zinc-400"
+    : diff > 0
+      ? "bg-emerald-500/15 text-emerald-700 dark:text-emerald-300"
+      : "bg-rose-500/15 text-rose-700 dark:text-rose-300";
+  const txt = diff === 0 ? "In balance" : `${diff > 0 ? "+" : "−"}${fmtN(Math.abs(diff))} pcs`;
+  return <span className={cn("inline-flex items-center rounded-full px-2 py-0.5 text-xs font-semibold tabular-nums whitespace-nowrap", cls)}>{txt}</span>;
+}
+
+// Labelled "done" badge (accessible — replaces bare ✓ glyphs).
+function DoneBadge() {
+  return (
+    <span className="inline-flex items-center gap-0.5 px-1 rounded bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 text-[9px] uppercase tracking-wide font-medium">
+      <Lock className="w-2.5 h-2.5" /> done
+    </span>
+  );
+}
+
+// One "label … value (+ optional trailing pill)" reference line.
+function LedgerRow({ label, value, tone = "ref", trailing }: { label: string; value: React.ReactNode; tone?: "ref" | "you"; trailing?: React.ReactNode }) {
+  return (
+    <div className="flex items-baseline justify-between gap-2">
+      <span className="text-[10px] uppercase tracking-wide text-zinc-500 flex-shrink-0">{label}</span>
+      <span className="flex items-baseline gap-2 min-w-0 justify-end">
+        <span className={cn("text-[11px] tabular-nums", tone === "you" ? "font-medium text-zinc-800 dark:text-zinc-100" : "text-zinc-500 dark:text-zinc-400")}>{value}</span>
+        {trailing}
+      </span>
+    </div>
+  );
+}
+
+// Cross-staff delta line (subordinate to your own DiffPill). The word
+// over/under/match carries the meaning so it isn't colour-only.
+function PeerLine({ name, pcs, delta, done }: { name: string; pcs: number; delta: number | null; done: boolean }) {
+  const off = delta !== null && delta !== 0;
+  const txt = delta === null
+    ? `${fmtN(pcs)} pcs`
+    : delta === 0
+      ? `${fmtN(pcs)} pcs (match)`
+      : `${fmtN(pcs)} pcs (${delta > 0 ? "+" : "−"}${fmtN(Math.abs(delta))} ${delta > 0 ? "over" : "under"})`;
+  return (
+    <div className={cn("flex items-baseline justify-between gap-2 text-[10px] tabular-nums", off ? "text-rose-600/90 dark:text-rose-400/90 font-medium" : "text-cyan-700/80 dark:text-cyan-400/80")}>
+      <span className="truncate inline-flex items-center gap-1">{name}{done && <Lock className="w-2.5 h-2.5 flex-shrink-0" />}</span>
+      <span className="flex-shrink-0">{txt}</span>
+    </div>
+  );
+}
 
 // ─── component ───────────────────────────────────────────────────────────
 export default function ReconciliationPage() {
@@ -284,61 +365,40 @@ export default function ReconciliationPage() {
   // up here so the polling refresh below can check whether a row is
   // mid-save and skip it.
   const saveTimers = useRef<Map<DraftKey, number>>(new Map());
+  // Keys with an unsaved local edit (set on keystroke, cleared once the server
+  // ack confirms the row matches what we sent). The poll never overwrites a
+  // key that is "in flight" — either a debounce timer is pending OR it's dirty.
+  // This replaces the old client-timestamp comparison, which could clobber a
+  // freshly-typed value on a clock-skewed phone (server clock > client clock).
+  const dirtyRef = useRef<Set<DraftKey>>(new Set());
 
-  // Refresh drafts on tab visibility regain + every 30s so other users'
-  // edits show up without a full page reload. CRITICAL: this merges
-  // server rows into local state — it does NOT replace the map. The
-  // current user's rows are protected from being clobbered while typing
-  // (the 5-second "input resets" bug came from blindly overwriting them).
-  //
-  // Rules:
-  //   - Other users' rows: trust the server completely (replace + drop
-  //     missing).
-  //   - My own rows with a pending save timer: leave alone — local is
-  //     in flight.
-  //   - My own rows without a pending save: adopt server value only when
-  //     server's updated_at is strictly newer (so a slightly-out-of-date
-  //     poll doesn't roll my latest keystroke back).
-  //   - My own rows missing from the server (admin committed them):
-  //     drop locally unless a pending save is still in flight or the row
-  //     is local-only (never persisted yet).
+  // Refresh drafts on visibility regain + on the poll so other counters' edits
+  // (and admin actions) show up without a full reload. The server is the
+  // source of truth for every row EXCEPT one that is in flight (pending
+  // debounce save or dirty) or a never-persisted local row (e.g. an
+  // admin-added "Add a count for…" row awaiting its first keystroke). This
+  // single in-flight guard protects whoever is editing — your own row, an
+  // admin editing a staffer's row, or an admin-added row mid-entry — so no
+  // poll can roll a keystroke back.
   const refreshDrafts = useCallback(async () => {
-    const myId = profile?.id;
-    if (!myId) return;
+    if (!profile?.id) return;
     const { data } = await sb().from("reconciliation_drafts_with_user").select("*");
     const serverByKey = new Map<string, DBDraft>();
     (data || []).forEach((d: any) => serverByKey.set(dkey(d.user_id, d.item_id), d as DBDraft));
 
-    const prev = draftsRef.current;
-    const next = new Map(prev);
+    const next = new Map(draftsRef.current);
+    const inFlight = (k: string) => saveTimers.current.has(k) || dirtyRef.current.has(k);
 
-    // 1) Other users' rows — server is the source of truth, EXCEPT a row the
-    //    admin just added for someone (id "local-…") that hasn't persisted yet
-    //    (it persists the moment a value is typed into it).
-    for (const [k, local] of [...prev]) {
-      if (local.user_id !== myId && !serverByKey.has(k) && !local.id.startsWith("local-")) next.delete(k);
-    }
-    for (const [k, server] of serverByKey) {
-      if (server.user_id !== myId) next.set(k, server);
-    }
-
-    // 2) My own rows — protect in-flight edits.
-    for (const [k, server] of serverByKey) {
-      if (server.user_id !== myId) continue;
-      if (saveTimers.current.has(k)) continue; // mid-save, don't touch
-      const local = next.get(k);
-      if (!local || (local.updated_at && server.updated_at > local.updated_at) || !local.updated_at) {
-        next.set(k, server);
-      }
-    }
-
-    // 3) My own rows that no longer exist on the server (admin committed).
-    for (const [k, local] of [...next]) {
-      if (local.user_id !== myId) continue;
-      if (serverByKey.has(k)) continue;
-      if (saveTimers.current.has(k)) continue;
-      if (local.id.startsWith("local-")) continue; // never persisted, keep
+    // Drop local rows the server no longer has (e.g. admin committed them),
+    // unless in flight or never persisted.
+    for (const [k, local] of [...draftsRef.current]) {
+      if (inFlight(k) || serverByKey.has(k) || local.id.startsWith("local-")) continue;
       next.delete(k);
+    }
+    // Adopt every server row that isn't being edited locally right now.
+    for (const [k, server] of serverByKey) {
+      if (inFlight(k)) continue;
+      next.set(k, server);
     }
 
     writeDrafts(next);
@@ -403,6 +463,7 @@ export default function ReconciliationPage() {
   // Optimistic local mutation; the actual DB write happens debounced below.
   const setField = useCallback((userId: string, itemId: string, field: Field, value: string) => {
     const k = dkey(userId, itemId);
+    dirtyRef.current.add(k); // unsaved edit — the poll must not overwrite this row
     const cur = draftsRef.current.get(k);
     const merged: DBDraft = cur
       ? { ...cur, [FIELDS_RAW[field]]: value, updated_at: new Date().toISOString() }
@@ -467,26 +528,26 @@ export default function ReconciliationPage() {
       const next = new Map(draftsRef.current);
       next.delete(k);
       writeDrafts(next);
+      dirtyRef.current.delete(k); // nothing left to save
       if (!isLocal) {
         await sb().from("reconciliation_drafts").delete().eq("user_id", userId).eq("item_id", itemId);
       }
       return;
     }
 
+    // Snapshot exactly what we send, so on ack we can tell whether the user
+    // typed more in the meantime (in which case a newer save is already queued
+    // and we must stay dirty).
+    const payload = {
+      case_size_raw: snap.case_size_raw,
+      a_cases_raw: snap.a_cases_raw,
+      a_loose_raw: snap.a_loose_raw,
+      b_cases_raw: snap.b_cases_raw,
+      b_loose_raw: snap.b_loose_raw,
+    };
     const { data, error } = await sb()
       .from("reconciliation_drafts")
-      .upsert(
-        {
-          user_id: userId,
-          item_id: itemId,
-          case_size_raw: snap.case_size_raw,
-          a_cases_raw: snap.a_cases_raw,
-          a_loose_raw: snap.a_loose_raw,
-          b_cases_raw: snap.b_cases_raw,
-          b_loose_raw: snap.b_loose_raw,
-        },
-        { onConflict: "user_id,item_id" }
-      )
+      .upsert({ user_id: userId, item_id: itemId, ...payload }, { onConflict: "user_id,item_id" })
       .select("id, updated_at")
       .single();
     if (error) {
@@ -498,9 +559,16 @@ export default function ReconciliationPage() {
     if (data) {
       const cur = draftsRef.current.get(k);
       if (!cur) return;
+      const unchanged =
+        cur.case_size_raw === payload.case_size_raw && cur.a_cases_raw === payload.a_cases_raw &&
+        cur.a_loose_raw === payload.a_loose_raw && cur.b_cases_raw === payload.b_cases_raw &&
+        cur.b_loose_raw === payload.b_loose_raw;
       const next = new Map(draftsRef.current);
-      next.set(k, { ...cur, id: data.id, updated_at: data.updated_at });
+      // Always clear the "local-" id (it's persisted now); only adopt the
+      // server updated_at + clear dirty when the row still matches what we sent.
+      next.set(k, unchanged ? { ...cur, id: data.id, updated_at: data.updated_at } : { ...cur, id: data.id });
       writeDrafts(next);
+      if (unchanged) dirtyRef.current.delete(k);
     }
   }, [writeDrafts]);
 
@@ -509,6 +577,9 @@ export default function ReconciliationPage() {
     const next = new Map(draftsRef.current);
     next.delete(k);
     writeDrafts(next);
+    dirtyRef.current.delete(k);
+    const t = saveTimers.current.get(k);
+    if (t) { clearTimeout(t); saveTimers.current.delete(k); }
     await sb().from("reconciliation_drafts").delete().eq("user_id", userId).eq("item_id", itemId);
   }, [writeDrafts]);
 
@@ -541,6 +612,7 @@ export default function ReconciliationPage() {
     const m = new Map(draftsRef.current);
     m.set(k, next);
     writeDrafts(m);
+    dirtyRef.current.add(k); // protect the rolled value until the ack lands
     // Supersede any in-flight debounced save for this row — we persist the
     // normalized values right here, so the pending timer would only re-write
     // the same thing.
@@ -700,12 +772,18 @@ export default function ReconciliationPage() {
       // which already treat blanks as 0.
       const physCases = pc ?? (userTouched ? 0 : appSide.cases);
       const physLoose = pl ?? (userTouched ? 0 : appSide.loose);
+      // "In system" display = current stock at its CURRENT case size.
       const appPieces = pieces(csOld, appSide.cases, appSide.loose);
       const physPieces = pieces(csNew, physCases, physLoose);
       const valid =
         (cRaw.trim() === "" || pc !== null) &&
         (lRaw.trim() === "" || pl !== null);
-      const diff = (userTouched || caseSizeChanged) ? physPieces - appPieces : 0;
+      // The committed change re-reads the OLD stock at the NEW case size (that's
+      // what apply_reconciliation does once items.case_size is updated), so the
+      // diff must compare both sides under csNew — otherwise a case-size edit
+      // shows a phantom delta that won't actually be committed.
+      const appPiecesAtNew = pieces(csNew, appSide.cases, appSide.loose);
+      const diff = (userTouched || caseSizeChanged) ? physPieces - appPiecesAtNew : 0;
       return { diff, valid, userTouched, physCases, physLoose, appPieces, physPieces };
     };
 
@@ -860,11 +938,9 @@ export default function ReconciliationPage() {
       drs.forEach(d => usersWithDrafts.add(d.user_id));
       const mine = drs.find(d => d.user_id === profile?.id);
       if (mine && !isDraftEmpty(mine)) myStaged++;
-      // Any per-row invalid?
-      for (const d of drs) {
-        const rd = computeDiff(i, app, d);
-        if (rd.invalid) invalid++;
-      }
+      // Count invalid PER ITEM (any counter's entry not a valid number → +1),
+      // consistent with conflicts/staged which are also per item.
+      if (drs.some(d => computeDiff(i, app, d).invalid)) invalid++;
       const c = computeItemConflict(i, drs);
       if (c.any) conflicts++;
     });
@@ -917,30 +993,28 @@ export default function ReconciliationPage() {
         continue;
       }
 
-      // Pick the agreed value per field — for each field grab the first
-      // non-empty raw across drafts (they all agree, so any non-empty works)
-      const agreedRaw = (k: "case_size_raw" | "a_cases_raw" | "a_loose_raw" | "b_cases_raw" | "b_loose_raw") => {
-        for (const d of nonEmpty) {
-          const v = String(d[k] || "").trim();
-          if (v) return v;
-        }
-        return "";
-      };
-      const csRaw = agreedRaw("case_size_raw");
-      const acRaw = agreedRaw("a_cases_raw");
-      const alRaw = agreedRaw("a_loose_raw");
-      const bcRaw = agreedRaw("b_cases_raw");
-      const blRaw = agreedRaw("b_loose_raw");
+      // Conflict-free ⇒ everyone who entered a given godown agrees on its piece
+      // total. Build the committed row by taking EACH godown WHOLE from one
+      // counter who actually entered THAT godown — never assemble it field by
+      // field across counters (that could pair one person's cases with
+      // another's loose and commit a number nobody entered). case size from any
+      // non-empty entry. apply_reconciliation re-normalises the split, so which
+      // agreeing counter we pick can't change the stored result.
+      const touchedG = (d: DBDraft, g: Godown) =>
+        (g === "A" ? d.a_cases_raw : d.b_cases_raw).trim() !== "" ||
+        (g === "A" ? d.a_loose_raw : d.b_loose_raw).trim() !== "";
+      const repA = nonEmpty.find(d => touchedG(d, "A"));
+      const repB = nonEmpty.find(d => touchedG(d, "B"));
+      const csRaw = nonEmpty.find(d => d.case_size_raw.trim() !== "")?.case_size_raw || "";
 
-      // Build a synthetic draft from the agreed values to reuse computeDiff.
       const merged: DBDraft = {
         ...emptyDraft,
         item_id: i.id,
         case_size_raw: csRaw,
-        a_cases_raw: acRaw,
-        a_loose_raw: alRaw,
-        b_cases_raw: bcRaw,
-        b_loose_raw: blRaw,
+        a_cases_raw: repA?.a_cases_raw ?? "",
+        a_loose_raw: repA?.a_loose_raw ?? "",
+        b_cases_raw: repB?.b_cases_raw ?? "",
+        b_loose_raw: repB?.b_loose_raw ?? "",
       };
       const rd = computeDiff(i, app, merged);
       if (rd.invalid) {
@@ -949,15 +1023,17 @@ export default function ReconciliationPage() {
       }
       if (!rd.hasAnyChange) continue;
 
+      // Only write a godown that was actually counted. A case-size-only change
+      // updates items.case_size (below) WITHOUT re-stamping untouched godowns —
+      // physical cases/loose don't change, only how pieces are computed.
       const sides: SideInfo[] = (["A", "B"] as Godown[]).map(g => {
         const side = g === "A" ? rd.A : rd.B;
-        const needsWrite = side.userTouched || rd.caseSizeChanged;
         return {
           godown: g,
           diff: side.diff,
           physCases: side.physCases,
           physLoose: side.physLoose,
-          needsWrite,
+          needsWrite: side.userTouched,
         };
       }).filter(s => s.needsWrite);
 
@@ -1021,12 +1097,17 @@ export default function ReconciliationPage() {
         done++; setProgress({ done, total: totalSteps });
       }
 
-      // Delete all users' drafts for this item.
-      if (!failedItems.has(j.itemId)) {
+      // Clear the drafts that fed this commit — scoped to exactly those
+      // counters (j.userIdsToWipe), NOT every draft on the item. A counter who
+      // started entering this item AFTER we snapshotted (e.g. during a long
+      // bulk commit) keeps their draft for the next cycle instead of it being
+      // silently wiped unapplied.
+      if (!failedItems.has(j.itemId) && j.userIdsToWipe.length > 0) {
         const { error: delErr } = await sb()
           .from("reconciliation_drafts")
           .delete()
-          .eq("item_id", j.itemId);
+          .eq("item_id", j.itemId)
+          .in("user_id", j.userIdsToWipe);
         if (delErr) {
           newErrors.push({ itemId: j.itemId, message: `Draft cleanup failed: ${delErr.message}` });
         }
@@ -1089,7 +1170,7 @@ export default function ReconciliationPage() {
     if (!failed) {
       for (const g of ["A", "B"] as Godown[]) {
         const sideRd = g === "A" ? rd.A : rd.B;
-        if (!(sideRd.userTouched || rd.caseSizeChanged)) continue; // only write what was counted
+        if (!sideRd.userTouched) continue; // only write a godown that was actually counted (case-size change alone never re-stamps stock)
         const { error } = await sb().rpc("apply_reconciliation", {
           p_item_id: item.id,
           p_godown: g,
@@ -1217,12 +1298,15 @@ export default function ReconciliationPage() {
         <HintCard isAdmin={isAdmin} mode={mode} />
 
         {toast && (
-          <div className={cn(
-            "fixed bottom-20 md:bottom-6 left-1/2 -translate-x-1/2 z-50 px-4 py-2 rounded-lg shadow-lg text-sm font-medium",
-            toast.kind === "ok" && "bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 border border-emerald-500/40",
-            toast.kind === "bad" && "bg-rose-500/15 text-rose-700 dark:text-rose-300 border border-rose-500/40",
-            toast.kind === "info" && "bg-cyan-500/15 text-cyan-700 dark:text-cyan-300 border border-cyan-500/40",
-          )}>
+          <div
+            role="status"
+            aria-live={toast.kind === "bad" ? "assertive" : "polite"}
+            className={cn(
+              "fixed bottom-20 md:bottom-6 left-1/2 -translate-x-1/2 z-50 px-4 py-2 rounded-lg shadow-lg text-sm font-medium",
+              toast.kind === "ok" && "bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 border border-emerald-500/40",
+              toast.kind === "bad" && "bg-rose-500/15 text-rose-700 dark:text-rose-300 border border-rose-500/40",
+              toast.kind === "info" && "bg-cyan-500/15 text-cyan-700 dark:text-cyan-300 border border-cyan-500/40",
+            )}>
             {toast.text}
           </div>
         )}
@@ -1292,7 +1376,7 @@ function Header({
               <> · <span className="text-rose-600 dark:text-rose-400 font-medium">{fmtN(stats.conflicts)} conflict{stats.conflicts === 1 ? "" : "s"}</span></>
             )}
             {stats.invalid > 0 && (
-              <> · <span className="text-rose-600 dark:text-rose-400 font-medium">{fmtN(stats.invalid)} invalid</span></>
+              <> · <span className="text-rose-600 dark:text-rose-400 font-medium" title="an entry isn't a valid number yet">{fmtN(stats.invalid)} need{stats.invalid === 1 ? "s" : ""} fixing</span></>
             )}
           </>
         )}
@@ -1550,11 +1634,8 @@ type ItemConflictType = {
 type DoneMap = Map<string, { done: boolean; at: string | null; name: string | null }>;
 
 // ─── MyView (default for everyone) ───────────────────────────────────────
-function MyView({
-  items, appStock, drafts, lastRecon, currentUserId, frozen,
-  computeDiff, setField, commitRow, resetMyRow, errorsByItem,
-  otherUsersByItem, conflictByItem, doneByUser,
-}: {
+// Shared prop shape for the My-count views.
+type MyViewProps = {
   items: (Item & { categoryName: string | null })[];
   appStock: Map<string, { A: AppStock; B: AppStock }>;
   drafts: Map<DraftKey, DBDraft>;
@@ -1569,42 +1650,102 @@ function MyView({
   otherUsersByItem: (itemId: string) => DBDraft[];
   conflictByItem: (itemId: string) => ItemConflictType | null;
   doneByUser: DoneMap;
+};
+
+// Render EXACTLY ONE of the two layouts (never both mounted + CSS-hidden).
+function MyView(props: MyViewProps) {
+  const isDesktop = useMediaQuery("(min-width: 768px)");
+  return isDesktop ? <DesktopTable {...props} /> : <MobileCards {...props} />;
+}
+
+function makeEmptyDraft(uid: string, iid: string): DBDraft {
+  return {
+    id: `local-${uid}::${iid}`,
+    user_id: uid, item_id: iid,
+    case_size_raw: "", a_cases_raw: "", a_loose_raw: "",
+    b_cases_raw: "", b_loose_raw: "",
+    updated_at: "",
+    user_email: null, user_name: null, user_role: null,
+  };
+}
+
+// Status rail colour shared by every card/row so state reads at a glance.
+function statusRail(rd: RowDiffType, conflict: ItemConflictType | null, others: number, frozen: boolean): string {
+  if (frozen) return "border-l-emerald-500";
+  if (rd.invalid || conflict?.any) return "border-l-rose-500";
+  if (rd.hasAnyChange) return "border-l-amber-500";
+  if (others > 0) return "border-l-cyan-500";
+  return "border-l-zinc-200 dark:border-l-zinc-800";
+}
+
+// Build the per-godown peer rows (other counters' totals + delta vs mine).
+function buildPeers(others: DBDraft[], g: Godown, itemCs: number, mySide: RowDiffType["A"], doneByUser: DoneMap) {
+  const myPcs = mySide.userTouched && mySide.valid ? mySide.physPieces : null;
+  return others
+    .map(o => ({ o, s: draftSide(o, g, itemCs) }))
+    .filter(x => x.s.touched)
+    .map(x => ({
+      name: displayUser(x.o).split(" ")[0],
+      pcs: x.s.pcs,
+      delta: myPcs !== null ? x.s.pcs - myPcs : null,
+      done: !!doneByUser.get(x.o.user_id)?.done,
+    }));
+}
+
+// ─── GodownPanel — the System→You→Diff atom, reused on every surface ──────
+function GodownPanel({
+  g, appSide, side, csOld, csNew, cRaw, lRaw,
+  onCases, onLoose, onBlur, stepper, compact, frozen, peers, ariaPrefix,
+}: {
+  g: Godown;
+  appSide: AppStock;
+  side: RowDiffType["A"];
+  csOld: number; csNew: number;
+  cRaw: string; lRaw: string;
+  onCases: (v: string) => void; onLoose: (v: string) => void; onBlur: () => void;
+  stepper: boolean; compact: boolean; frozen: boolean;
+  peers: { name: string; pcs: number; delta: number | null; done: boolean }[];
+  ariaPrefix: string;
 }) {
+  const touched = side.userTouched;
+  const rail = g === "A" ? "border-l-cyan-500/70" : "border-l-violet-500/70";
+  const head = g === "A" ? "text-cyan-700 dark:text-cyan-300" : "text-violet-700 dark:text-violet-300";
+  const tone: "neutral" | "amber" | "rose" = touched ? (side.valid ? "amber" : "rose") : "neutral";
+  // One box filled, sibling blank on a counted godown → make the implied 0 explicit.
+  const onlyCases = cRaw.trim() !== "" && lRaw.trim() === "";
+  const onlyLoose = lRaw.trim() !== "" && cRaw.trim() === "";
   return (
-    <>
-      <DesktopTable
-        items={items}
-        appStock={appStock}
-        drafts={drafts}
-        lastRecon={lastRecon}
-        currentUserId={currentUserId}
-        frozen={frozen}
-        computeDiff={computeDiff}
-        setField={setField}
-        commitRow={commitRow}
-        resetMyRow={resetMyRow}
-        errorsByItem={errorsByItem}
-        otherUsersByItem={otherUsersByItem}
-        conflictByItem={conflictByItem}
-        doneByUser={doneByUser}
-      />
-      <MobileCards
-        items={items}
-        appStock={appStock}
-        drafts={drafts}
-        lastRecon={lastRecon}
-        currentUserId={currentUserId}
-        frozen={frozen}
-        computeDiff={computeDiff}
-        setField={setField}
-        commitRow={commitRow}
-        resetMyRow={resetMyRow}
-        errorsByItem={errorsByItem}
-        otherUsersByItem={otherUsersByItem}
-        conflictByItem={conflictByItem}
-        doneByUser={doneByUser}
-      />
-    </>
+    <div className={cn("rounded-xl border-l-4 bg-zinc-50/70 dark:bg-zinc-800/40 p-2.5", rail)}>
+      <div className="flex items-center justify-between gap-2 mb-2">
+        <span className={cn("text-[11px] font-semibold uppercase tracking-wider", head)}>Godown {g}</span>
+        <SysChip label="SYS">{fmtN(side.appPieces)} pcs</SysChip>
+      </div>
+      <div className={cn(compact ? "grid grid-cols-2 gap-2" : "space-y-2")}>
+        <div>
+          <span className="block text-[10px] uppercase tracking-wide text-zinc-500 mb-0.5">Cases</span>
+          <ExprInput value={cRaw} onChange={onCases} onBlur={onBlur} stepper={stepper} compact={compact} disabled={frozen}
+            tone={tone} ariaLabel={`${ariaPrefix} godown ${g} cases`} />
+        </div>
+        <div>
+          <span className="block text-[10px] uppercase tracking-wide text-zinc-500 mb-0.5">Loose</span>
+          <ExprInput value={lRaw} onChange={onLoose} onBlur={onBlur} stepper={stepper} compact={compact} disabled={frozen}
+            tone={tone} ariaLabel={`${ariaPrefix} godown ${g} loose`} />
+        </div>
+      </div>
+      <div className="mt-2 pt-2 border-t border-zinc-200/70 dark:border-zinc-700/50 space-y-1">
+        <LedgerRow label="In system" value={breakupStr(csOld, appSide.cases, appSide.loose)} />
+        <LedgerRow
+          label="You count"
+          tone="you"
+          value={touched && side.valid ? breakupStr(csNew, side.physCases, side.physLoose) : <span className="italic text-zinc-400">not counted</span>}
+          trailing={touched && side.valid ? <DiffPill diff={side.diff} /> : undefined}
+        />
+        {touched && side.valid && (onlyCases || onlyLoose) && (
+          <div className="text-[10px] text-zinc-500">{onlyCases ? "loose: 0 — none counted" : "cases: 0 — none counted"}</div>
+        )}
+        {peers.map((p, idx) => <PeerLine key={idx} {...p} />)}
+      </div>
+    </div>
   );
 }
 
@@ -1613,34 +1754,16 @@ function DesktopTable({
   items, appStock, drafts, lastRecon, currentUserId, frozen,
   computeDiff, setField, commitRow, resetMyRow, errorsByItem,
   otherUsersByItem, conflictByItem, doneByUser,
-}: {
-  items: (Item & { categoryName: string | null })[];
-  appStock: Map<string, { A: AppStock; B: AppStock }>;
-  drafts: Map<DraftKey, DBDraft>;
-  lastRecon: Map<string, LastReconciled>;
-  currentUserId: string;
-  frozen: boolean;
-  computeDiff: (i: Item, app: { A: AppStock; B: AppStock }, d: DBDraft) => RowDiffType;
-  setField: (uid: string, iid: string, f: Field, v: string) => void;
-  commitRow: (uid: string, iid: string) => void;
-  resetMyRow: (itemId: string) => void;
-  errorsByItem: Map<string, string[]>;
-  otherUsersByItem: (itemId: string) => DBDraft[];
-  conflictByItem: (itemId: string) => ItemConflictType | null;
-  doneByUser: DoneMap;
-}) {
+}: MyViewProps) {
   return (
-    <div className="hidden md:block bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg overflow-hidden">
-      <table className="w-full text-sm">
+    <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg overflow-x-auto">
+      <table className="w-full text-sm min-w-[860px]">
         <thead className="bg-zinc-50 dark:bg-zinc-900/50 border-b border-zinc-200 dark:border-zinc-800">
           <tr className="text-zinc-500 text-[11px] uppercase tracking-wider">
-            <th className="text-left px-3 py-2.5 font-medium w-[300px]">Item</th>
-            <th className="text-center px-2 py-2.5 font-medium w-[78px]">Case size</th>
-            <th className="text-center px-2 py-2.5 font-medium w-[78px]">A cases</th>
-            <th className="text-center px-2 py-2.5 font-medium w-[78px]">A loose</th>
-            <th className="text-center px-2 py-2.5 font-medium w-[78px]">B cases</th>
-            <th className="text-center px-2 py-2.5 font-medium w-[78px]">B loose</th>
-            <th className="text-left px-3 py-2.5 font-medium w-[210px]">Count breakup</th>
+            <th className="text-left px-3 py-2.5 font-medium">Item</th>
+            <th className="text-center px-2 py-2.5 font-medium w-[110px]">Case size</th>
+            <th className="text-left px-2 py-2.5 font-medium w-[300px]">Godown A</th>
+            <th className="text-left px-2 py-2.5 font-medium w-[300px]">Godown B</th>
             <th className="w-8" />
           </tr>
         </thead>
@@ -1675,17 +1798,6 @@ function DesktopTable({
   );
 }
 
-function makeEmptyDraft(uid: string, iid: string): DBDraft {
-  return {
-    id: `local-${uid}::${iid}`,
-    user_id: uid, item_id: iid,
-    case_size_raw: "", a_cases_raw: "", a_loose_raw: "",
-    b_cases_raw: "", b_loose_raw: "",
-    updated_at: "",
-    user_email: null, user_name: null, user_role: null,
-  };
-}
-
 function MyDesktopRow({
   i, app, d, rd, others, conflict, last, frozen, doneByUser, onChange, onBlur, onReset, errors,
 }: {
@@ -1704,25 +1816,16 @@ function MyDesktopRow({
   errors?: string[];
 }) {
   const myTouched = rd.hasAnyChange;
-  const hasOtherDrafts = others.length > 0;
-  const inConflict = !!conflict?.any;
   const hasErr = (errors?.length ?? 0) > 0;
-  const rowTint = rd.invalid
-    ? "bg-rose-500/5"
-    : inConflict
-      ? "bg-rose-500/5"
-      : myTouched
-        ? "bg-amber-500/5"
-        : hasOtherDrafts
-          ? "bg-cyan-500/5"
-          : "";
+  const itemCs = i.case_size || 0;
+  const rail = statusRail(rd, conflict, others.length, frozen);
   return (
     <Fragment>
-      <tr className={cn("border-t border-zinc-200/50 dark:border-zinc-800/50 align-middle", rowTint)}>
-        <td className="px-3 py-2">
-          <div className="flex items-center gap-2 min-w-0">
+      <tr className="border-t border-zinc-200/50 dark:border-zinc-800/50 align-top">
+        <td className={cn("px-3 py-3 border-l-4", rail)}>
+          <div className="flex items-start gap-2 min-w-0">
             {i.brand && (
-              <span className="bg-cyan-500/15 text-cyan-600 dark:text-cyan-300 px-1.5 py-0.5 rounded text-[10px] uppercase tracking-wider font-medium flex-shrink-0">
+              <span className="bg-cyan-500/15 text-cyan-600 dark:text-cyan-300 px-1.5 py-0.5 rounded text-[10px] uppercase tracking-wider font-medium flex-shrink-0 mt-0.5">
                 {i.brand}
               </span>
             )}
@@ -1735,63 +1838,43 @@ function MyDesktopRow({
             </div>
           </div>
         </td>
-        <td className="px-2 py-2">
+        <td className="px-2 py-3 align-top">
           <ExprInput
             value={d.case_size_raw}
-            placeholder={String(rd.csOld)}
             onChange={(v) => onChange("case_size", v)}
             onBlur={onBlur}
             disabled={frozen}
+            compact
             tone={rd.caseSizeChanged ? "amber" : (!rd.caseSizeValid ? "rose" : "neutral")}
             ariaLabel={`Case size for ${i.model}`}
           />
+          <div className="mt-1 flex justify-center"><SysChip>{rd.csOld}</SysChip></div>
         </td>
-        <td className="px-2 py-2">
-          <ExprInput value={d.a_cases_raw} placeholder="—"
-            onChange={(v) => onChange("a_cases", v)}
-            onBlur={onBlur}
-            disabled={frozen}
-            tone={rd.A.userTouched ? (rd.A.valid ? "amber" : "rose") : "neutral"}
-            ariaLabel={`Godown A cases for ${i.model}`} />
+        <td className="px-2 py-3 align-top">
+          <GodownPanel g="A" appSide={app.A} side={rd.A} csOld={rd.csOld} csNew={rd.csNew}
+            cRaw={d.a_cases_raw} lRaw={d.a_loose_raw}
+            onCases={(v) => onChange("a_cases", v)} onLoose={(v) => onChange("a_loose", v)} onBlur={onBlur}
+            stepper={false} compact frozen={frozen}
+            peers={buildPeers(others, "A", itemCs, rd.A, doneByUser)} ariaPrefix={i.model} />
         </td>
-        <td className="px-2 py-2">
-          <ExprInput value={d.a_loose_raw} placeholder="—"
-            onChange={(v) => onChange("a_loose", v)}
-            onBlur={onBlur}
-            disabled={frozen}
-            tone={rd.A.userTouched ? (rd.A.valid ? "amber" : "rose") : "neutral"}
-            ariaLabel={`Godown A loose for ${i.model}`} />
+        <td className="px-2 py-3 align-top">
+          <GodownPanel g="B" appSide={app.B} side={rd.B} csOld={rd.csOld} csNew={rd.csNew}
+            cRaw={d.b_cases_raw} lRaw={d.b_loose_raw}
+            onCases={(v) => onChange("b_cases", v)} onLoose={(v) => onChange("b_loose", v)} onBlur={onBlur}
+            stepper={false} compact frozen={frozen}
+            peers={buildPeers(others, "B", itemCs, rd.B, doneByUser)} ariaPrefix={i.model} />
         </td>
-        <td className="px-2 py-2">
-          <ExprInput value={d.b_cases_raw} placeholder="—"
-            onChange={(v) => onChange("b_cases", v)}
-            onBlur={onBlur}
-            disabled={frozen}
-            tone={rd.B.userTouched ? (rd.B.valid ? "amber" : "rose") : "neutral"}
-            ariaLabel={`Godown B cases for ${i.model}`} />
-        </td>
-        <td className="px-2 py-2">
-          <ExprInput value={d.b_loose_raw} placeholder="—"
-            onChange={(v) => onChange("b_loose", v)}
-            onBlur={onBlur}
-            disabled={frozen}
-            tone={rd.B.userTouched ? (rd.B.valid ? "amber" : "rose") : "neutral"}
-            ariaLabel={`Godown B loose for ${i.model}`} />
-        </td>
-        <td className="px-3 py-2 align-top">
-          <BreakupCell rd={rd} app={app} item={i} others={others} doneByUser={doneByUser} />
-        </td>
-        <td className="px-2 py-2">
-          {myTouched && (
-            <button type="button" onClick={onReset} className="text-zinc-400 hover:text-rose-500 p-1" title="Reset row" aria-label="Reset row">
+        <td className="px-2 py-3 align-top">
+          {myTouched && !frozen && (
+            <button type="button" onClick={onReset} className="text-zinc-400 hover:text-rose-500 p-1.5" title="Reset row" aria-label="Reset row">
               <RotateCcw className="w-3.5 h-3.5" />
             </button>
           )}
         </td>
       </tr>
       {hasErr && (
-        <tr className="bg-rose-500/5 border-t border-rose-500/20">
-          <td colSpan={8} className="px-3 py-2 text-[11px] text-rose-700 dark:text-rose-300">
+        <tr className="bg-rose-500/5">
+          <td colSpan={5} className="px-3 py-2 text-[11px] text-rose-700 dark:text-rose-300 border-l-4 border-l-rose-500">
             <div className="flex items-start gap-1.5">
               <AlertCircle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
               <div>{errors!.join(" · ")}</div>
@@ -1805,6 +1888,29 @@ function MyDesktopRow({
 
 function RowMeta({ last, others, conflict, doneByUser }: { last?: LastReconciled; others: DBDraft[]; conflict: ItemConflictType | null; doneByUser: DoneMap }) {
   const lines: React.ReactNode[] = [];
+  if (others.length > 0) {
+    lines.push(
+      <span key="others" className={cn(
+        "inline-flex items-center gap-1 text-[10px]",
+        conflict?.any ? "text-rose-600 dark:text-rose-400 font-medium" : "text-cyan-600 dark:text-cyan-400"
+      )}>
+        {conflict?.any ? <AlertCircle className="w-3 h-3" /> : <Users className="w-3 h-3" />}
+        {conflict?.any ? "Disagrees with " : "Also counted by "}
+        {others.map((o, idx) => (
+          <span key={o.user_id} className="inline-flex items-center gap-0.5">
+            {idx > 0 && ", "}{displayUser(o)}{doneByUser.get(o.user_id)?.done && <Lock className="w-2.5 h-2.5" />}
+          </span>
+        ))}
+      </span>
+    );
+  }
+  if (conflict?.any && conflict.reason) {
+    lines.push(
+      <span key="reason" className="inline-flex items-center gap-1 text-[10px] text-rose-600/90 dark:text-rose-400/90 tabular-nums">
+        <AlertTriangle className="w-3 h-3 flex-shrink-0" /> {conflict.reason}
+      </span>
+    );
+  }
   if (last) {
     lines.push(
       <span key="last" className="inline-flex items-center gap-1 text-[10px] text-zinc-400">
@@ -1812,109 +1918,16 @@ function RowMeta({ last, others, conflict, doneByUser }: { last?: LastReconciled
       </span>
     );
   }
-  if (others.length > 0) {
-    const names = others
-      .map(o => `${displayUser(o)}${doneByUser.get(o.user_id)?.done ? " (done)" : ""}`)
-      .join(", ");
-    lines.push(
-      <span key="others" className={cn(
-        "inline-flex items-center gap-1 text-[10px]",
-        conflict?.any ? "text-rose-600 dark:text-rose-400 font-medium" : "text-cyan-600 dark:text-cyan-400"
-      )}>
-        {conflict?.any ? <AlertCircle className="w-3 h-3" /> : <Users className="w-3 h-3" />}
-        {conflict?.any ? "Disagrees with " : "Also counted by "}{names}
-      </span>
-    );
-  }
-  if (conflict?.any && conflict.reason) {
-    lines.push(
-      <span key="reason" className="inline-flex items-center gap-1 text-[10px] text-rose-600/90 dark:text-rose-400/90 tabular-nums">
-        <AlertTriangle className="w-3 h-3" /> {conflict.reason}
-      </span>
-    );
-  }
   if (lines.length === 0) return null;
   return <div className="mt-1 flex flex-wrap gap-x-3 gap-y-0.5">{lines}</div>;
 }
 
-// Per-godown breakup shown in the My-count desktop table. For each godown:
-//   - the user's entered count as "Xc×cs + YL = Z pcs" (only when they
-//     touched that side or changed the case size)
-//   - the app's current value as a grey "app: …" reference
-//   - any other counters' entered totals for that godown
-function BreakupCell({
-  rd, app, item, others, doneByUser,
-}: {
-  rd: RowDiffType;
-  app: { A: AppStock; B: AppStock };
-  item: Item;
-  others: DBDraft[];
-  doneByUser: DoneMap;
-}) {
-  const itemCs = item.case_size || 0;
-  const row = (g: Godown) => {
-    const side = g === "A" ? rd.A : rd.B;
-    const appSide = g === "A" ? app.A : app.B;
-    const youShown = side.userTouched || rd.caseSizeChanged;
-    const myPcs = youShown && side.valid ? side.physPieces : null;
-    const othersForG = others
-      .map(o => ({ o, name: displayUser(o), s: draftSide(o, g, itemCs) }))
-      .filter(x => x.s.touched);
-    return (
-      <div className="leading-tight">
-        <div className="flex items-baseline gap-1.5">
-          <span className="text-[10px] font-semibold text-zinc-500 w-3">{g}</span>
-          {youShown ? (
-            <span className="text-[11px] tabular-nums text-zinc-700 dark:text-zinc-200">
-              {breakupStr(rd.csNew, side.physCases, side.physLoose)}
-            </span>
-          ) : (
-            <span className="text-[11px] text-zinc-400">not counted</span>
-          )}
-          {youShown && side.valid && (
-            <span className={cn(
-              "text-[10px] tabular-nums font-semibold",
-              side.diff === 0 ? "text-zinc-400" : side.diff > 0 ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"
-            )}>
-              ({side.diff > 0 ? "+" : ""}{fmtN(side.diff)})
-            </span>
-          )}
-        </div>
-        <div className="flex flex-wrap items-baseline gap-x-2 pl-[18px]">
-          <span className="text-[10px] tabular-nums text-zinc-500">
-            system {breakupStr(itemCs, appSide.cases, appSide.loose)}
-          </span>
-          {othersForG.map((x, idx) => {
-            const delta = myPcs !== null ? x.s.pcs - myPcs : null;
-            const isDone = doneByUser.get(x.o.user_id)?.done;
-            return (
-              <span key={idx} className={cn(
-                "text-[10px] tabular-nums",
-                delta !== null && delta !== 0 ? "text-rose-600/90 dark:text-rose-400/90 font-medium" : "text-cyan-600/80 dark:text-cyan-400/80"
-              )}>
-                {x.name.split(" ")[0]}{isDone ? "✓" : ""} {fmtN(x.s.pcs)}
-                {delta !== null && delta !== 0 && <span> ({delta > 0 ? "+" : ""}{fmtN(delta)})</span>}
-              </span>
-            );
-          })}
-        </div>
-      </div>
-    );
-  };
-  return (
-    <div className="space-y-1.5">
-      {row("A")}
-      {row("B")}
-    </div>
-  );
-}
-
 // ─── ExprInput ───────────────────────────────────────────────────────────
 function ExprInput({
-  value, placeholder, onChange, onBlur, tone, ariaLabel, compact = false, stepper = false, disabled = false,
+  value, placeholder = "—", onChange, onBlur, tone, ariaLabel, compact = false, stepper = false, disabled = false,
 }: {
   value: string;
-  placeholder: string;
+  placeholder?: string;          // defaults to "—" — NEVER pass a system value here
   onChange: (v: string) => void;
   onBlur?: () => void;
   tone: "neutral" | "amber" | "rose";
@@ -1926,27 +1939,27 @@ function ExprInput({
   const parsed = parseExpr(value);
   const showsTotal = value.includes("+") && parsed !== null;
   const cls = cn(
-    "w-full tabular-nums text-center text-sm border rounded-md focus:outline-none focus:ring-1",
-    compact ? "px-1 py-0.5 text-[12px]" : "px-1.5 py-1",
+    "w-full tabular-nums text-center border rounded-md focus:outline-none focus:ring-2 transition-colors",
+    compact ? "min-h-9 text-[13px] px-1.5" : "min-h-11 text-base font-semibold px-2.5",
     disabled
-      ? "bg-zinc-100 dark:bg-zinc-800/60 text-zinc-500 dark:text-zinc-400 cursor-not-allowed"
-      : "bg-white dark:bg-zinc-900",
-    tone === "amber" && "border-amber-500/50 focus:ring-amber-500/40 focus:border-amber-500",
-    tone === "rose" && "border-rose-500/60 focus:ring-rose-500/40 focus:border-rose-500",
-    tone === "neutral" && "border-zinc-200 dark:border-zinc-800 focus:ring-cyan-500/40 focus:border-cyan-500"
+      ? "bg-zinc-100 dark:bg-zinc-800/60 text-zinc-400 dark:text-zinc-500 cursor-not-allowed border-zinc-200 dark:border-zinc-800"
+      : "bg-white dark:bg-zinc-900 placeholder:text-zinc-300 dark:placeholder:text-zinc-600 placeholder:font-normal",
+    !disabled && tone === "amber" && "border-amber-500/60 focus:ring-amber-500/30 focus:border-amber-500",
+    !disabled && tone === "rose" && "border-rose-500/70 focus:ring-rose-500/30 focus:border-rose-500",
+    !disabled && tone === "neutral" && "border-zinc-200 dark:border-zinc-700 focus:ring-violet-500/40 focus:border-violet-500"
   );
   const field = (
-    <div className="relative flex-1">
+    <div className="flex-1 flex flex-col gap-0.5 min-w-0">
       <input type="text" inputMode="numeric" value={value} placeholder={placeholder}
         onChange={(e) => onChange(e.target.value)}
         onBlur={onBlur}
         disabled={disabled}
         className={cls} aria-label={ariaLabel} />
-      {showsTotal && (
-        <span className="pointer-events-none absolute -bottom-3.5 left-1/2 -translate-x-1/2 text-[9px] text-zinc-500 tabular-nums whitespace-nowrap">
-          = {fmtN(parsed!)}
-        </span>
-      )}
+      {/* Reserved caption slot for the running-total sum — fixed height so it
+          can never clip or shift the row (the old absolute overlay did both). */}
+      <span className="min-h-[12px] text-center text-[10px] leading-none text-zinc-500 tabular-nums">
+        {showsTotal ? `= ${fmtN(parsed!)}` : ""}
+      </span>
     </div>
   );
   if (!stepper) return field;
@@ -1954,7 +1967,8 @@ function ExprInput({
   // Stepper: −/+ adjust the running total by one without needing a "+" key
   // (mobile numeric keyboards have none). Collapses any expression to its sum
   // and writes back a plain integer; onBlur flushes the save immediately so a
-  // tap survives the tab being backgrounded.
+  // tap survives the tab being backgrounded. tabIndex={-1} keeps box-to-box
+  // typing flow (intentional — not a focus target).
   const bump = (delta: number) => {
     if (disabled) return;
     const next = Math.max(0, (parseExpr(value) ?? 0) + delta);
@@ -1963,14 +1977,14 @@ function ExprInput({
   };
   const atZero = (parseExpr(value) ?? 0) <= 0;
   const stepBtn =
-    "flex-shrink-0 w-8 rounded-md border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-100 text-lg leading-none font-medium select-none active:bg-zinc-200 dark:active:bg-zinc-700 disabled:opacity-40 flex items-center justify-center";
+    "flex-shrink-0 min-w-11 min-h-11 rounded-lg border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-100 select-none active:scale-95 active:bg-zinc-200 dark:active:bg-zinc-700 hover:border-violet-400 disabled:opacity-40 disabled:active:scale-100 flex items-center justify-center transition";
   return (
-    <div className="flex items-stretch gap-1">
+    <div className="flex items-start gap-1.5">
       <button type="button" tabIndex={-1} onClick={() => bump(-1)} disabled={atZero || disabled}
-        className={stepBtn} aria-label={`Decrease ${ariaLabel}`}>−</button>
+        className={stepBtn} aria-label={`Decrease ${ariaLabel}`}><Minus className="w-4 h-4" /></button>
       {field}
       <button type="button" tabIndex={-1} onClick={() => bump(1)} disabled={disabled}
-        className={stepBtn} aria-label={`Increase ${ariaLabel}`}>+</button>
+        className={stepBtn} aria-label={`Increase ${ariaLabel}`}><Plus className="w-4 h-4" /></button>
     </div>
   );
 }
@@ -1980,24 +1994,9 @@ function MobileCards({
   items, appStock, drafts, lastRecon, currentUserId, frozen,
   computeDiff, setField, commitRow, resetMyRow, errorsByItem,
   otherUsersByItem, conflictByItem, doneByUser,
-}: {
-  items: (Item & { categoryName: string | null })[];
-  appStock: Map<string, { A: AppStock; B: AppStock }>;
-  drafts: Map<DraftKey, DBDraft>;
-  lastRecon: Map<string, LastReconciled>;
-  currentUserId: string;
-  frozen: boolean;
-  computeDiff: (i: Item, app: { A: AppStock; B: AppStock }, d: DBDraft) => RowDiffType;
-  setField: (uid: string, iid: string, f: Field, v: string) => void;
-  commitRow: (uid: string, iid: string) => void;
-  resetMyRow: (itemId: string) => void;
-  errorsByItem: Map<string, string[]>;
-  otherUsersByItem: (itemId: string) => DBDraft[];
-  conflictByItem: (itemId: string) => ItemConflictType | null;
-  doneByUser: DoneMap;
-}) {
+}: MyViewProps) {
   return (
-    <div className="md:hidden space-y-2">
+    <div className="space-y-3">
       {items.map(i => {
         const app = appStock.get(i.id);
         if (!app) return null;
@@ -2007,95 +2006,71 @@ function MobileCards({
         const conflict = conflictByItem(i.id);
         const last = lastRecon.get(i.id);
         const errs = errorsByItem.get(i.id);
-        const tint = rd.invalid || conflict?.any
-          ? "border-rose-500/40"
-          : rd.hasAnyChange
-            ? "border-amber-500/40"
-            : others.length > 0
-              ? "border-cyan-500/40"
-              : "border-zinc-200 dark:border-zinc-800";
+        const itemCs = i.case_size || 0;
+        const rail = statusRail(rd, conflict, others.length, frozen);
         return (
-          <div key={i.id} className={cn("bg-white dark:bg-zinc-900 border rounded-xl p-3 shadow-sm", tint)}>
-            <div className="flex items-start justify-between gap-2 mb-2">
+          <div key={i.id} className={cn("bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 border-l-4 rounded-2xl p-4 shadow-sm", rail)}>
+            {/* Header */}
+            <div className="flex items-start justify-between gap-2 mb-3">
               <div className="min-w-0 flex-1">
-                <div className="flex items-center gap-2 mb-0.5">
+                <div className="flex items-center gap-2 mb-0.5 flex-wrap">
                   {i.brand && (
                     <span className="bg-cyan-500/15 text-cyan-600 dark:text-cyan-300 px-1.5 py-0.5 rounded text-[10px] uppercase tracking-wider font-medium flex-shrink-0">
                       {i.brand}
                     </span>
                   )}
-                  <span className="text-sm font-semibold truncate">{i.model}</span>
+                  <span className="text-base font-semibold truncate">{i.model}</span>
+                  {frozen && <DoneBadge />}
                 </div>
-                <div className="text-[11px] text-zinc-500 truncate">
+                <div className="text-xs text-zinc-500 truncate">
                   {[i.size, i.colour, i.categoryName].filter(Boolean).join(" · ")}
                 </div>
                 <RowMeta last={last} others={others} conflict={conflict} doneByUser={doneByUser} />
               </div>
               {rd.hasAnyChange && !frozen && (
-                <button onClick={() => resetMyRow(i.id)} className="text-zinc-400 hover:text-rose-500 p-1.5 -mr-1.5" aria-label="Reset row">
-                  <RotateCcw className="w-3.5 h-3.5" />
+                <button onClick={() => resetMyRow(i.id)} className="text-zinc-400 hover:text-rose-500 p-2 -mr-2 -mt-1" aria-label="Reset this item">
+                  <RotateCcw className="w-4 h-4" />
                 </button>
               )}
             </div>
 
-            <div className="grid grid-cols-[auto_1fr] gap-2 items-center mb-3">
-              <label className="text-[11px] text-zinc-500 uppercase tracking-wider">Case size</label>
-              <ExprInput
-                value={my.case_size_raw}
-                placeholder={String(rd.csOld)}
-                onChange={(v) => setField(currentUserId, i.id, "case_size", v)}
-                onBlur={() => commitRow(currentUserId, i.id)}
-                disabled={frozen}
-                tone={rd.caseSizeChanged ? "amber" : (!rd.caseSizeValid ? "rose" : "neutral")}
-                ariaLabel={`Case size for ${i.model}`}
-              />
+            {/* Case-size strip — system value sits BESIDE the box, never inside it */}
+            <div className="grid grid-cols-[1fr_auto] items-center gap-2 mb-3 rounded-lg bg-zinc-50/70 dark:bg-zinc-800/40 px-3 py-2">
+              <div className="flex items-center gap-2 min-w-0">
+                <span className="text-[10px] uppercase tracking-wider text-zinc-500">Case size</span>
+                <SysChip>{rd.csOld}</SysChip>
+              </div>
+              <div className="w-[148px]">
+                <ExprInput
+                  value={my.case_size_raw}
+                  onChange={(v) => setField(currentUserId, i.id, "case_size", v)}
+                  onBlur={() => commitRow(currentUserId, i.id)}
+                  disabled={frozen}
+                  stepper
+                  tone={rd.caseSizeChanged ? "amber" : (!rd.caseSizeValid ? "rose" : "neutral")}
+                  ariaLabel={`Case size for ${i.model}`}
+                />
+              </div>
             </div>
 
-            <div className="grid grid-cols-2 gap-3">
-              <GodownBlock
-                label="Godown A"
-                appCases={app.A.cases} appLoose={app.A.loose}
-                d_cases={my.a_cases_raw} d_loose={my.a_loose_raw}
-                side={rd.A}
-                touched={rd.A.userTouched || rd.caseSizeChanged}
-                csNew={rd.csNew} csOld={rd.csOld}
-                frozen={frozen}
-                others={others.map(o => ({ o, name: displayUser(o).split(" ")[0], side: draftSide(o, "A", i.case_size || 0) }))
-                  .filter(x => x.side.touched)
-                  .map(x => ({
-                    name: x.name, pcs: x.side.pcs,
-                    delta: (rd.A.userTouched && rd.A.valid) ? x.side.pcs - rd.A.physPieces : null,
-                    done: !!doneByUser.get(x.o.user_id)?.done,
-                  }))}
-                onCases={(v) => setField(currentUserId, i.id, "a_cases", v)}
-                onLoose={(v) => setField(currentUserId, i.id, "a_loose", v)}
+            {/* Two full-width godown panels stacked (steppers need the width) */}
+            <div className="space-y-3">
+              <GodownPanel g="A" appSide={app.A} side={rd.A} csOld={rd.csOld} csNew={rd.csNew}
+                cRaw={my.a_cases_raw} lRaw={my.a_loose_raw}
+                onCases={(v) => setField(currentUserId, i.id, "a_cases", v)} onLoose={(v) => setField(currentUserId, i.id, "a_loose", v)}
                 onBlur={() => commitRow(currentUserId, i.id)}
-                modelHint={`${i.model} A`}
-              />
-              <GodownBlock
-                label="Godown B"
-                appCases={app.B.cases} appLoose={app.B.loose}
-                d_cases={my.b_cases_raw} d_loose={my.b_loose_raw}
-                side={rd.B}
-                touched={rd.B.userTouched || rd.caseSizeChanged}
-                csNew={rd.csNew} csOld={rd.csOld}
-                frozen={frozen}
-                others={others.map(o => ({ o, name: displayUser(o).split(" ")[0], side: draftSide(o, "B", i.case_size || 0) }))
-                  .filter(x => x.side.touched)
-                  .map(x => ({
-                    name: x.name, pcs: x.side.pcs,
-                    delta: (rd.B.userTouched && rd.B.valid) ? x.side.pcs - rd.B.physPieces : null,
-                    done: !!doneByUser.get(x.o.user_id)?.done,
-                  }))}
-                onCases={(v) => setField(currentUserId, i.id, "b_cases", v)}
-                onLoose={(v) => setField(currentUserId, i.id, "b_loose", v)}
+                stepper compact={false} frozen={frozen}
+                peers={buildPeers(others, "A", itemCs, rd.A, doneByUser)} ariaPrefix={i.model} />
+              <GodownPanel g="B" appSide={app.B} side={rd.B} csOld={rd.csOld} csNew={rd.csNew}
+                cRaw={my.b_cases_raw} lRaw={my.b_loose_raw}
+                onCases={(v) => setField(currentUserId, i.id, "b_cases", v)} onLoose={(v) => setField(currentUserId, i.id, "b_loose", v)}
                 onBlur={() => commitRow(currentUserId, i.id)}
-                modelHint={`${i.model} B`}
-              />
+                stepper compact={false} frozen={frozen}
+                peers={buildPeers(others, "B", itemCs, rd.B, doneByUser)} ariaPrefix={i.model} />
             </div>
 
             {errs && errs.length > 0 && (
-              <div className="mt-2 text-[11px] text-rose-700 dark:text-rose-300 flex items-start gap-1.5">
+              <div className="mt-3 text-[11px] text-rose-700 dark:text-rose-300 flex items-start gap-1.5">
                 <AlertCircle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
                 <div>{errs.join(" · ")}</div>
               </div>
@@ -2103,88 +2078,6 @@ function MobileCards({
           </div>
         );
       })}
-    </div>
-  );
-}
-
-function GodownBlock({
-  label, appCases, appLoose, d_cases, d_loose, side, touched,
-  csNew, csOld, others, frozen,
-  onCases, onLoose, onBlur, modelHint,
-}: {
-  label: string;
-  appCases: number; appLoose: number;
-  d_cases: string; d_loose: string;
-  side: RowDiffType["A"];
-  touched: boolean;
-  csNew: number; csOld: number;
-  others: { name: string; pcs: number; delta: number | null; done: boolean }[];
-  frozen: boolean;
-  onCases: (v: string) => void; onLoose: (v: string) => void;
-  onBlur: () => void;
-  modelHint: string;
-}) {
-  return (
-    <div className="bg-zinc-50 dark:bg-zinc-800/40 rounded-lg p-2">
-      <div className="mb-2">
-        <span className="text-[11px] font-semibold text-zinc-600 dark:text-zinc-300 uppercase tracking-wider">{label}</span>
-      </div>
-      <div className="space-y-2">
-        {/* Label stacked ABOVE the input so the −/+ steppers get the full block
-            width on narrow phones (a side-by-side label would squeeze the
-            field to a few px in the 2-up card). */}
-        <div>
-          <span className="block text-[10px] text-zinc-500 mb-0.5">Cases</span>
-          <ExprInput value={d_cases} placeholder="—" onChange={onCases} onBlur={onBlur} stepper disabled={frozen}
-            tone={touched ? (side.valid ? "amber" : "rose") : "neutral"} ariaLabel={`${modelHint} cases`} />
-        </div>
-        <div>
-          <span className="block text-[10px] text-zinc-500 mb-0.5">Loose</span>
-          <ExprInput value={d_loose} placeholder="—" onChange={onLoose} onBlur={onBlur} stepper disabled={frozen}
-            tone={touched ? (side.valid ? "amber" : "rose") : "neutral"} ariaLabel={`${modelHint} loose`} />
-        </div>
-      </div>
-
-      {/* System vs counted, with the difference — so the counter always sees
-          what the system thinks is here and what they're entering. */}
-      <div className="mt-2 pt-2 border-t border-zinc-200/70 dark:border-zinc-700/50 space-y-0.5">
-        <div className="flex items-baseline justify-between gap-2">
-          <span className="text-[10px] uppercase tracking-wide text-zinc-500">In system</span>
-          <span className="text-[11px] tabular-nums text-zinc-600 dark:text-zinc-300">{breakupStr(csOld, appCases, appLoose)}</span>
-        </div>
-        <div className="flex items-baseline justify-between gap-2">
-          <span className="text-[10px] uppercase tracking-wide text-zinc-500">You count</span>
-          {touched && side.valid ? (
-            <span className="text-[11px] tabular-nums font-medium text-zinc-800 dark:text-zinc-100">{breakupStr(csNew, side.physCases, side.physLoose)}</span>
-          ) : (
-            <span className="text-[11px] text-zinc-400">not counted</span>
-          )}
-        </div>
-        {touched && side.valid && (
-          <div className="flex items-baseline justify-between gap-2">
-            <span className="text-[10px] uppercase tracking-wide text-zinc-500">Diff</span>
-            <span className={cn(
-              "text-[11px] tabular-nums font-semibold",
-              side.diff === 0 ? "text-zinc-400" : side.diff > 0 ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"
-            )}>
-              {side.diff > 0 ? "+" : ""}{fmtN(side.diff)} pcs
-            </span>
-          </div>
-        )}
-        {/* Other counters' totals for THIS godown, with the delta vs your count
-            so you can spot and recheck a disagreement before the reviewer. */}
-        {others.map((o, idx) => (
-          <div key={idx} className={cn(
-            "flex items-baseline justify-between gap-2",
-            o.delta !== null && o.delta !== 0 ? "text-rose-600/90 dark:text-rose-400/90 font-medium" : "text-cyan-600/80 dark:text-cyan-400/80"
-          )}>
-            <span className="text-[10px] truncate">{o.name}{o.done ? " ✓" : ""}</span>
-            <span className="text-[10px] tabular-nums flex-shrink-0">
-              {fmtN(o.pcs)} pcs{o.delta !== null && o.delta !== 0 ? ` (${o.delta > 0 ? "+" : ""}${fmtN(o.delta)})` : ""}
-            </span>
-          </div>
-        ))}
-      </div>
     </div>
   );
 }
@@ -2226,47 +2119,48 @@ function ReviewerView({
         const applying = applyingItemId === i.id;
         const conflict = nonEmpty.length > 0 ? computeItemConflict(i, nonEmpty) : null;
         const ready = nonEmpty.length > 0 && !conflict?.any;
-        const tint = conflict?.any
-          ? "border-rose-500/40"
-          : nonEmpty.length > 0
-            ? "border-emerald-500/40"
-            : "border-zinc-200 dark:border-zinc-800";
+        const rail = conflict?.any ? "border-l-rose-500" : ready ? "border-l-emerald-500" : "border-l-zinc-200 dark:border-l-zinc-800";
+        const cs = i.case_size || 0;
         const last = lastRecon.get(i.id);
         const errs = errorsByItem.get(i.id);
         return (
-          <div key={i.id} className={cn("bg-white dark:bg-zinc-900 border rounded-lg overflow-hidden", tint)}>
-            <div className="px-3 py-2 bg-zinc-50 dark:bg-zinc-900/50 flex items-center gap-3">
-              <div className="flex items-center gap-2 min-w-0 flex-1">
-                {i.brand && (
-                  <span className="bg-cyan-500/15 text-cyan-600 dark:text-cyan-300 px-1.5 py-0.5 rounded text-[10px] uppercase tracking-wider font-medium flex-shrink-0">
-                    {i.brand}
-                  </span>
-                )}
-                <div className="min-w-0">
-                  <div className="text-sm font-medium truncate">{i.model}</div>
-                  <div className="text-[11px] text-zinc-500 truncate">
-                    {[i.size, i.colour, i.categoryName].filter(Boolean).join(" · ")}
+          <div key={i.id} className={cn("bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 border-l-4 rounded-lg overflow-hidden", rail)}>
+            {/* Verdict header — system reference lives in labelled chips, never inside a box */}
+            <div className="px-3 py-2.5 bg-zinc-50 dark:bg-zinc-900/50">
+              <div className="flex items-start gap-2">
+                <div className="flex items-center gap-2 min-w-0 flex-1">
+                  {i.brand && (
+                    <span className="bg-cyan-500/15 text-cyan-600 dark:text-cyan-300 px-1.5 py-0.5 rounded text-[10px] uppercase tracking-wider font-medium flex-shrink-0">
+                      {i.brand}
+                    </span>
+                  )}
+                  <div className="min-w-0">
+                    <div className="text-sm font-medium truncate">{i.model}</div>
+                    <div className="text-[11px] text-zinc-500 truncate">
+                      {[i.size, i.colour, i.categoryName].filter(Boolean).join(" · ")}
+                    </div>
                   </div>
                 </div>
+                {conflict?.any ? (
+                  <span className="inline-flex items-center gap-1 bg-rose-500/15 text-rose-700 dark:text-rose-300 px-2 py-0.5 rounded text-[10px] uppercase tracking-wider font-medium flex-shrink-0">
+                    <AlertTriangle className="w-3 h-3" /> Conflict
+                  </span>
+                ) : ready ? (
+                  <span className="inline-flex items-center gap-1 bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 px-2 py-0.5 rounded text-[10px] uppercase tracking-wider font-medium flex-shrink-0">
+                    <CheckCheck className="w-3 h-3" /> Ready
+                  </span>
+                ) : null}
               </div>
-              <div className="text-right text-[10px] text-zinc-500 tabular-nums">
-                <div className="font-medium text-zinc-600 dark:text-zinc-300">System · cs {i.case_size || 0}</div>
-                <div>A {fmtN(app.A.cases)}c {fmtN(app.A.loose)}L · B {fmtN(app.B.cases)}c {fmtN(app.B.loose)}L</div>
-                {last && <div className="hidden sm:block">Last: {timeAgo(last.at)}{last.userName ? ` by ${last.userName}` : ""}</div>}
+              <div className="mt-2 flex flex-wrap items-center gap-1.5">
+                <span className="text-[9px] uppercase tracking-wider text-zinc-400 font-semibold">In system</span>
+                <SysChip label="A" className="text-cyan-700 dark:text-cyan-300">{breakupStr(cs, app.A.cases, app.A.loose)}</SysChip>
+                <SysChip label="B" className="text-violet-700 dark:text-violet-300">{breakupStr(cs, app.B.cases, app.B.loose)}</SysChip>
+                <SysChip label="CS">{cs}</SysChip>
+                {last && <span className="text-[10px] text-zinc-400 ml-auto">Last: {timeAgo(last.at)}{last.userName ? ` by ${last.userName}` : ""}</span>}
               </div>
-              {conflict?.any ? (
-                <span className="bg-rose-500/15 text-rose-700 dark:text-rose-300 px-2 py-0.5 rounded text-[10px] uppercase tracking-wider font-medium flex-shrink-0">
-                  Conflict
-                </span>
-              ) : ready ? (
-                <span className="bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 px-2 py-0.5 rounded text-[10px] uppercase tracking-wider font-medium flex-shrink-0">
-                  Ready
-                </span>
-              ) : null}
             </div>
 
-            {/* Plain-language reason so the reviewer resolves fast without
-                decoding the cells. */}
+            {/* Plain-language reason so the reviewer resolves fast without decoding cells */}
             {conflict?.any && conflict.reason && (
               <div className="px-3 py-1.5 bg-rose-500/5 border-t border-rose-500/15 text-[11px] text-rose-700 dark:text-rose-300 flex items-start gap-1.5 tabular-nums">
                 <AlertTriangle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
@@ -2275,7 +2169,7 @@ function ReviewerView({
             )}
 
             {rows.length === 0 ? (
-              <div className="px-3 py-2 text-[11px] text-zinc-500 italic">No counts yet — add one for a counter below, or open My count.</div>
+              <div className="px-3 py-3 text-[11px] text-zinc-500 italic">No counts yet — add one for a counter below, or open My count.</div>
             ) : (
               <div className="divide-y divide-zinc-200/60 dark:divide-zinc-800/60">
                 {rows.map(d => (
@@ -2299,15 +2193,15 @@ function ReviewerView({
               </div>
             )}
 
-            {/* Add a count on behalf of a counter who hasn't entered one. */}
+            {/* Add a count on behalf of a counter who hasn't entered one */}
             {canAdd.length > 0 && (
-              <div className="px-3 py-2 border-t border-zinc-200/60 dark:border-zinc-800/60 flex items-center gap-2 flex-wrap">
-                <UserPlus className="w-3.5 h-3.5 text-zinc-400 flex-shrink-0" />
-                <span className="text-[11px] text-zinc-500">Add a count for</span>
+              <div className="px-3 py-2.5 border-t border-zinc-200/60 dark:border-zinc-800/60 flex items-center gap-2 flex-wrap">
+                <UserPlus className="w-4 h-4 text-zinc-400 flex-shrink-0" />
+                <span className="text-[11px] text-zinc-500">Enter a count for someone who didn't count:</span>
                 <select
                   value=""
                   onChange={(e) => { if (e.target.value) onAddCounter(i.id, e.target.value); }}
-                  className="bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-md px-2 py-1 text-[12px] focus:outline-none focus:border-cyan-500"
+                  className="min-h-9 bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-md px-2 py-1 text-[13px] focus:outline-none focus:ring-2 focus:ring-violet-500/40 focus:border-violet-500"
                   aria-label={`Add a count for ${i.model}`}
                 >
                   <option value="">Select counter…</option>
@@ -2325,6 +2219,50 @@ function ReviewerView({
           </div>
         );
       })}
+    </div>
+  );
+}
+
+// One godown block inside a reviewer counter row (A or B).
+function ReviewerGodown({
+  g, side, csNew, cRaw, lRaw, conflictCell, onCases, onLoose, onBlur, ariaPrefix,
+}: {
+  g: Godown;
+  side: RowDiffType["A"];
+  csNew: number;
+  cRaw: string; lRaw: string;
+  conflictCell: boolean;
+  onCases: (v: string) => void; onLoose: (v: string) => void; onBlur: () => void;
+  ariaPrefix: string;
+}) {
+  const touched = side.userTouched;
+  const rail = g === "A" ? "border-l-cyan-500/70" : "border-l-violet-500/70";
+  const head = g === "A" ? "text-cyan-700 dark:text-cyan-300" : "text-violet-700 dark:text-violet-300";
+  const tone: "neutral" | "amber" | "rose" = conflictCell ? "rose" : touched ? (side.valid ? "amber" : "rose") : "neutral";
+  return (
+    <div className={cn("rounded-lg border-l-4 bg-zinc-50/60 dark:bg-zinc-800/30 p-2", rail, conflictCell && "ring-1 ring-rose-500/40")}>
+      <div className="flex items-center justify-between gap-1 mb-1.5">
+        <span className={cn("text-[10px] font-semibold uppercase tracking-wider", conflictCell ? "text-rose-600 dark:text-rose-400" : head)}>Godown {g}</span>
+        <SysChip label="SYS">{fmtN(side.appPieces)} pcs</SysChip>
+      </div>
+      <div className="grid grid-cols-2 gap-1.5">
+        <div>
+          <span className="block text-[9px] uppercase tracking-wide text-zinc-500 mb-0.5">Cases</span>
+          <ExprInput value={cRaw} onChange={onCases} onBlur={onBlur} compact tone={tone} ariaLabel={`${ariaPrefix} godown ${g} cases`} />
+        </div>
+        <div>
+          <span className="block text-[9px] uppercase tracking-wide text-zinc-500 mb-0.5">Loose</span>
+          <ExprInput value={lRaw} onChange={onLoose} onBlur={onBlur} compact tone={tone} ariaLabel={`${ariaPrefix} godown ${g} loose`} />
+        </div>
+      </div>
+      <div className="mt-1.5">
+        <LedgerRow
+          label="Counted"
+          tone="you"
+          value={touched && side.valid ? `${fmtN(side.physPieces)} pcs` : <span className="italic text-zinc-400">not counted</span>}
+          trailing={touched && side.valid ? <DiffPill diff={side.diff} /> : undefined}
+        />
+      </div>
     </div>
   );
 }
@@ -2348,86 +2286,53 @@ function ReviewerUserRow({
 }) {
   const rd = computeDiff(i, app, d);
   const name = displayUser(d);
-  // Per-godown computed total: what THIS counter says is in A and in B,
-  // each next to the system figure + the difference, shown separately so the
-  // reviewer reads A and B at a glance without re-doing the case math.
-  const sideTotal = (g: Godown) => {
-    const s = g === "A" ? rd.A : rd.B;
-    if (!s.userTouched) {
-      return (
-        <span className="text-zinc-400">
-          {g}: <span className="italic">—</span> <span className="text-zinc-400/80">(sys {fmtN(s.appPieces)})</span>
-        </span>
-      );
-    }
-    return (
-      <span className="text-zinc-600 dark:text-zinc-300">
-        {g}: <span className="font-medium tabular-nums text-zinc-800 dark:text-zinc-100">{fmtN(s.physPieces)}</span>{" "}
-        <span className="text-zinc-400">
-          (sys {fmtN(s.appPieces)}
-          {s.valid && <span className={cn(s.diff === 0 ? "" : s.diff > 0 ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400")}>{`, ${s.diff > 0 ? "+" : ""}${fmtN(s.diff)}`}</span>})
-        </span>
-      </span>
-    );
-  };
+  const csTone: "neutral" | "amber" | "rose" = conflict?.case_size ? "rose" : tonefor(d.case_size_raw, rd.caseSizeValid, rd.caseSizeChanged);
   return (
-    <div className={cn("px-3 py-2 grid grid-cols-[140px_1fr_24px] sm:grid-cols-[160px_1fr_28px] gap-2 items-start", isMe && "bg-cyan-500/5")}>
-      <div className="min-w-0">
-        <div className="flex items-center gap-1.5">
-          <UserCircle2 className="w-3.5 h-3.5 text-zinc-500 flex-shrink-0" />
-          <span className="text-[12px] font-medium truncate">{name}{isMe && <span className="text-zinc-400 ml-1">(you)</span>}</span>
-          {userDone && (
-            <span className="inline-flex items-center gap-0.5 px-1 rounded bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 text-[9px] uppercase tracking-wide font-medium flex-shrink-0">
-              <Lock className="w-2.5 h-2.5" /> done
-            </span>
-          )}
+    <div className={cn("p-3", isMe && "bg-cyan-500/5")}>
+      {/* Who + clear */}
+      <div className="flex items-center justify-between gap-2 mb-2">
+        <div className="flex items-center gap-1.5 min-w-0 flex-wrap">
+          <UserCircle2 className="w-4 h-4 text-zinc-500 flex-shrink-0" />
+          <span className="text-[13px] font-medium truncate">{name}{isMe && <span className="text-zinc-400 ml-1">(you)</span>}</span>
+          {userDone && <DoneBadge />}
+          <span className="text-[10px] text-zinc-500">{d.user_role || "—"}{d.updated_at ? ` · ${timeAgo(d.updated_at)}` : ""}</span>
         </div>
-        <div className="text-[10px] text-zinc-500 truncate">
-          {d.user_role || "—"}{d.updated_at ? ` · ${timeAgo(d.updated_at)}` : ""}
+        <button onClick={onClear} disabled={applying} className="text-zinc-400 hover:text-rose-500 p-2 -m-1 flex-shrink-0 disabled:opacity-40" title={`Clear ${name}'s count`} aria-label={`Clear ${name}'s count`}>
+          <RotateCcw className="w-4 h-4" />
+        </button>
+      </div>
+
+      {/* Case size — system beside the box */}
+      <div className="flex items-center gap-2 mb-2">
+        <span className="text-[10px] uppercase tracking-wide text-zinc-500">Case size</span>
+        <SysChip>{i.case_size || 0}</SysChip>
+        <div className="w-[120px]">
+          <ExprInput value={d.case_size_raw} onChange={(v) => onChange("case_size", v)} onBlur={onBlur} compact
+            tone={csTone} ariaLabel={`Case size by ${name}`} />
         </div>
       </div>
 
-      <div className="min-w-0">
-        <div className="grid grid-cols-5 gap-1.5">
-          <ReviewerCell label="Case sz" value={d.case_size_raw} placeholder={String(i.case_size || 0)}
-            onChange={(v) => onChange("case_size", v)} onBlur={onBlur} conflict={!!conflict?.case_size}
-            tone={tonefor(d.case_size_raw, rd.caseSizeValid, rd.caseSizeChanged)} ariaLabel={`Case size by ${name}`} />
-          <ReviewerCell label="A c" value={d.a_cases_raw} placeholder={String(app.A.cases)}
-            onChange={(v) => onChange("a_cases", v)} onBlur={onBlur} conflict={!!conflict?.a_cases}
-            tone={tonefor(d.a_cases_raw, rd.A.valid, rd.A.userTouched)} ariaLabel={`A cases by ${name}`} />
-          <ReviewerCell label="A L" value={d.a_loose_raw} placeholder={String(app.A.loose)}
-            onChange={(v) => onChange("a_loose", v)} onBlur={onBlur} conflict={!!conflict?.a_loose}
-            tone={tonefor(d.a_loose_raw, rd.A.valid, rd.A.userTouched)} ariaLabel={`A loose by ${name}`} />
-          <ReviewerCell label="B c" value={d.b_cases_raw} placeholder={String(app.B.cases)}
-            onChange={(v) => onChange("b_cases", v)} onBlur={onBlur} conflict={!!conflict?.b_cases}
-            tone={tonefor(d.b_cases_raw, rd.B.valid, rd.B.userTouched)} ariaLabel={`B cases by ${name}`} />
-          <ReviewerCell label="B L" value={d.b_loose_raw} placeholder={String(app.B.loose)}
-            onChange={(v) => onChange("b_loose", v)} onBlur={onBlur} conflict={!!conflict?.b_loose}
-            tone={tonefor(d.b_loose_raw, rd.B.valid, rd.B.userTouched)} ariaLabel={`B loose by ${name}`} />
-        </div>
-        <div className="mt-1.5 flex flex-wrap items-center gap-x-4 gap-y-1 text-[10px] tabular-nums">
-          {sideTotal("A")}
-          {sideTotal("B")}
-          {/* Apply just this item to stock using THIS counter's numbers — the
-              admin's per-item, pick-the-value adjustment. */}
-          {canApply && (
-            <button
-              type="button"
-              onClick={onApply}
-              disabled={applying}
-              className="ml-auto inline-flex items-center gap-1 rounded-md px-2 py-1 text-[11px] font-medium border border-emerald-500/50 text-emerald-700 dark:text-emerald-300 hover:bg-emerald-500/10 disabled:opacity-50"
-              title={`Apply ${name}'s count to stock for this item`}
-            >
-              {applying ? <Loader2 className="w-3 h-3 animate-spin" /> : <CheckCircle2 className="w-3 h-3" />}
-              Apply this count
-            </button>
-          )}
-        </div>
+      {/* Godown A + B */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+        <ReviewerGodown g="A" side={rd.A} csNew={rd.csNew} cRaw={d.a_cases_raw} lRaw={d.a_loose_raw}
+          conflictCell={!!conflict?.a} onCases={(v) => onChange("a_cases", v)} onLoose={(v) => onChange("a_loose", v)} onBlur={onBlur} ariaPrefix={`${name}`} />
+        <ReviewerGodown g="B" side={rd.B} csNew={rd.csNew} cRaw={d.b_cases_raw} lRaw={d.b_loose_raw}
+          conflictCell={!!conflict?.b} onCases={(v) => onChange("b_cases", v)} onLoose={(v) => onChange("b_loose", v)} onBlur={onBlur} ariaPrefix={`${name}`} />
       </div>
 
-      <button onClick={onClear} disabled={applying} className="text-zinc-400 hover:text-rose-500 p-1 self-center disabled:opacity-40" title={`Clear ${name}'s draft`} aria-label={`Clear ${name}'s draft`}>
-        <RotateCcw className="w-3.5 h-3.5" />
-      </button>
+      {/* Apply just this item to stock using THIS counter's numbers */}
+      {canApply && (
+        <button
+          type="button"
+          onClick={onApply}
+          disabled={applying}
+          className="mt-2 w-full min-h-11 inline-flex items-center justify-center gap-1.5 rounded-lg border border-emerald-500/50 text-emerald-700 dark:text-emerald-300 hover:bg-emerald-500/10 text-sm font-medium disabled:opacity-50 transition-colors"
+          title={`Apply ${name}'s count to stock for this item`}
+        >
+          {applying ? <Loader2 className="w-4 h-4 animate-spin" /> : <CheckCircle2 className="w-4 h-4" />}
+          Apply {name.split(" ")[0]}&apos;s count to stock
+        </button>
+      )}
     </div>
   );
 }
@@ -2437,27 +2342,6 @@ function tonefor(raw: string, valid: boolean, touched: boolean): "neutral" | "am
   if (!valid) return "rose";
   if (touched) return "amber";
   return "neutral";
-}
-
-function ReviewerCell({
-  label, value, placeholder, onChange, onBlur, conflict, tone, ariaLabel,
-}: {
-  label: string;
-  value: string;
-  placeholder: string;
-  onChange: (v: string) => void;
-  onBlur: () => void;
-  conflict: boolean;
-  tone: "neutral" | "amber" | "rose";
-  ariaLabel: string;
-}) {
-  const effectiveTone = conflict ? "rose" : tone;
-  return (
-    <div className="flex flex-col items-center gap-0.5">
-      <span className={cn("text-[9px] uppercase tracking-wider font-medium", conflict ? "text-rose-500" : "text-zinc-500")}>{label}</span>
-      <ExprInput value={value} placeholder={placeholder} onChange={onChange} onBlur={onBlur} tone={effectiveTone} ariaLabel={ariaLabel} compact />
-    </div>
-  );
 }
 
 // ─── hint card ───────────────────────────────────────────────────────────

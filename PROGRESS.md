@@ -230,6 +230,55 @@ If you must touch one of these files: **read first, edit surgically, never repla
 
 ## 11. Changelog (latest first — add new entries at the top)
 
+### 2026-06-09 — Reconciliation: full My-count + Reviewer revamp (design-system rebuild + bug kills)
+
+Complete presentation rebuild of `/reconciliation` (client-only, no SQL) guided by a multi-agent design
+panel + adversarial bug audit. **The owner's hard ask:** no system number shown as a faint placeholder
+INSIDE any input — every system figure now sits BESIDE the box as a labelled chip.
+
+Design system (new shared primitives, one grammar everywhere):
+- `SysChip` (labelled quiet system reference, never an input), `DiffPill` (the single saturated
+  signal — emerald surplus / rose shortage / "In balance"), `LedgerRow` (System→You→Diff atom),
+  `DoneBadge` (labelled, replaces bare ✓), `PeerLine` (cross-staff delta with over/under/match words),
+  `GodownPanel` (the A/B count block reused on every surface), `useMediaQuery`.
+- `ExprInput` reworked: **default "—" placeholder** (callers can no longer pass a system value),
+  violet focus ring, **44px Lucide −/+ steppers**, fixed running-total caption slot (no more clipping/
+  shift), `compact` for dense desktop/reviewer.
+- A = cyan rail/tag, B = violet rail/tag (always paired with the literal "A"/"B" — colour-blind safe).
+  Status rail (border-l-4): amber=you edited · cyan=peers · rose=conflict/invalid · emerald=frozen.
+
+My count: vertical card with status rail, case-size strip (SysChip beside the box), two full-width
+GodownPanels (In system / You count / DiffPill / "loose: 0 — none counted" cue / peer deltas). Desktop =
+one table Item | Case size | Godown A | Godown B | reset (mini-ledger cells); **renders ONE of
+desktop/mobile via useMediaQuery** (was mounting both).
+
+Reviewer: verdict card with a SysChip reference group (A cyan · B violet · CS) + Ready/Conflict pill +
+reason bar; per-counter **sub-cards** (killed the cramped 5-across grid) with A/B godown blocks
+(rose-ringed on conflict), each showing "Counted N + DiffPill"; full-width **Apply this count**;
+Add-a-count picker. DoneBadge throughout.
+
+Bug fixes from the audit (all real):
+- **HIGH** bulk commit `agreedRaw` mixed raw fields across counters → could commit a number nobody
+  entered. Now commits each godown WHOLE from one counter who entered it (per-godown representative).
+- **HIGH** mid-commit draft wipe: delete now scoped to `.in("user_id", userIdsToWipe)` so a counter
+  typing during a long commit isn't silently wiped.
+- **HIGH** case-size change re-stamped untouched godowns + showed a phantom diff. Decoupled: a
+  case-size-only change updates `items.case_size` and writes ONLY touched godowns; the diff now compares
+  both sides under the NEW case size (matches what `apply_reconciliation` commits). Applied to both
+  `makeAdjustments` and `commitOne`.
+- **MED** autosave clock-skew clobber: replaced the client-timestamp race guard with a `dirtyRef`
+  in-flight set (set on keystroke, cleared on confirmed server ack) — the poll never overwrites a row
+  being edited (yours, an admin-edited staffer's, or an admin-added row mid-entry).
+- a11y: 44px tap targets, toast `role=status`/`aria-live`, DoneBadge labels, "needs fixing" relabel +
+  per-item invalid count.
+- Kept (deliberate, per the owner's earlier spec): the "done counter who left an item blank = found
+  none → conflict" rule. The audit flagged it as a false-conflict risk, but it's the requested
+  everyone-counts-everything behaviour.
+
+`tsc` + `next build` clean (`/reconciliation` 18.5 kB). No DB change — still on the 2026-06-09 migration.
+
+---
+
 ### 2026-06-09 — Reconciliation: blank-field fix + staff conflicts filter + reviewer add/apply
 
 Three follow-ups after the multi-counter rework landed (all client-only, `app/reconciliation/page.tsx`):
