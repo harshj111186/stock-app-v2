@@ -798,8 +798,8 @@ export default function ReconciliationPage() {
           if (drs.length === 0) return false;
         }
       }
-      // Reviewer "conflicts only" — collapse to items needing a decision.
-      if (conflictsOnly && mode === "reviewer") {
+      // "Conflicts only" — collapse to flagged items (My count + Reviewer).
+      if (conflictsOnly) {
         const drs = draftsByItem.get(i.id) || [];
         if (!computeItemConflict(i, drs).any) return false;
       }
@@ -1077,7 +1077,7 @@ export default function ReconciliationPage() {
         {!loaded ? (
           <SkeletonBody />
         ) : filtered.length === 0 ? (
-          <EmptyState clearFilters={() => { setQ(""); setBrand(""); setCat(""); setShowOnlyChanged(false); }} />
+          <EmptyState clearFilters={() => { setQ(""); setBrand(""); setCat(""); setShowOnlyChanged(false); setConflictsOnly(false); }} />
         ) : mode === "my" ? (
           <MyView
             items={filtered}
@@ -1310,29 +1310,29 @@ function Toolbar({
           </div>
         )}
 
-        {/* Reviewer: jump straight to the items that need a decision. */}
-        {isAdmin && mode === "reviewer" && (
-          <button
-            type="button"
-            onClick={() => setConflictsOnly(!conflictsOnly)}
-            className={cn(
-              "inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm border transition-colors",
-              conflictsOnly
-                ? "bg-rose-500/15 border-rose-500/50 text-rose-700 dark:text-rose-300"
-                : conflictCount > 0
-                  ? "bg-white dark:bg-zinc-900 border-rose-300/60 dark:border-rose-500/30 text-rose-600 dark:text-rose-300 hover:border-rose-400"
-                  : "bg-white dark:bg-zinc-900 border-zinc-200 dark:border-zinc-800 text-zinc-500 hover:border-zinc-300 dark:hover:border-zinc-700"
-            )}
-            aria-pressed={conflictsOnly}
-            title="Show only items with a conflict"
-          >
-            <AlertTriangle className="w-3.5 h-3.5" />
-            {conflictsOnly ? "Conflicts only" : "Conflicts"}
-            {conflictCount > 0 && (
-              <span className="ml-0.5 px-1.5 rounded-full bg-rose-500 text-white text-[10px] font-semibold tabular-nums">{conflictCount}</span>
-            )}
-          </button>
-        )}
+        {/* Jump straight to the items that need a decision/recheck. Available
+            in both My count (so a counter can spot where they disagree with a
+            teammate) and Reviewer. */}
+        <button
+          type="button"
+          onClick={() => setConflictsOnly(!conflictsOnly)}
+          className={cn(
+            "inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm border transition-colors",
+            conflictsOnly
+              ? "bg-rose-500/15 border-rose-500/50 text-rose-700 dark:text-rose-300"
+              : conflictCount > 0
+                ? "bg-white dark:bg-zinc-900 border-rose-300/60 dark:border-rose-500/30 text-rose-600 dark:text-rose-300 hover:border-rose-400"
+                : "bg-white dark:bg-zinc-900 border-zinc-200 dark:border-zinc-800 text-zinc-500 hover:border-zinc-300 dark:hover:border-zinc-700"
+          )}
+          aria-pressed={conflictsOnly}
+          title={mode === "my" ? "Show only items where a count disagrees" : "Show only items with a conflict"}
+        >
+          <AlertTriangle className="w-3.5 h-3.5" />
+          {conflictsOnly ? "Conflicts only" : "Conflicts"}
+          {conflictCount > 0 && (
+            <span className="ml-0.5 px-1.5 rounded-full bg-rose-500 text-white text-[10px] font-semibold tabular-nums">{conflictCount}</span>
+          )}
+        </button>
 
         {/* My count: freeze/unfreeze my entries. Marking done turns any item I
             leave blank but a teammate filled into a flagged conflict. */}
