@@ -551,9 +551,17 @@ export default function ReconciliationPage() {
       .select("id, updated_at")
       .single();
     if (error) {
-      // Don't toast if component already unmounted — but useState setters
-      // are no-ops post-unmount, so calling showToast is safe.
-      showToast("bad", `Save failed: ${error.message}`);
+      // CRITICAL: the row is still dirty (protected from the poll). If we just
+      // returned, dirtyRef would stay set with NO pending save → the poll would
+      // skip this key forever (never re-sync, never drop after a commit). So
+      // re-arm a backoff retry, which keeps the local value protected AND keeps
+      // trying until the save lands (self-heals on reconnect / token refresh).
+      // Skip the retry only if the row was deleted in the meantime.
+      showToast("bad", `Couldn't save — retrying… (${error.message})`);
+      if (draftsRef.current.has(k) && dirtyRef.current.has(k) && !saveTimers.current.has(k)) {
+        const t = window.setTimeout(() => { saveTimers.current.delete(k); void persistDraft(userId, itemId); }, 3000);
+        saveTimers.current.set(k, t);
+      }
       return;
     }
     if (data) {
@@ -568,7 +576,14 @@ export default function ReconciliationPage() {
       // server updated_at + clear dirty when the row still matches what we sent.
       next.set(k, unchanged ? { ...cur, id: data.id, updated_at: data.updated_at } : { ...cur, id: data.id });
       writeDrafts(next);
-      if (unchanged) dirtyRef.current.delete(k);
+      if (unchanged) {
+        dirtyRef.current.delete(k);
+      } else if (!saveTimers.current.has(k)) {
+        // Row changed mid-flight but somehow no save is queued — re-arm one so
+        // the still-dirty key can't get stuck (keeps the dirty⇔pending invariant).
+        const t = window.setTimeout(() => { saveTimers.current.delete(k); void persistDraft(userId, itemId); }, 200);
+        saveTimers.current.set(k, t);
+      }
     }
   }, [writeDrafts]);
 
@@ -2028,7 +2043,7 @@ function MobileCards({
                 <RowMeta last={last} others={others} conflict={conflict} doneByUser={doneByUser} />
               </div>
               {rd.hasAnyChange && !frozen && (
-                <button onClick={() => resetMyRow(i.id)} className="text-zinc-400 hover:text-rose-500 p-2 -mr-2 -mt-1" aria-label="Reset this item">
+                <button onClick={() => resetMyRow(i.id)} className="text-zinc-400 hover:text-rose-500 min-w-11 min-h-11 -mr-2 -mt-1 inline-flex items-center justify-center flex-shrink-0" aria-label="Reset this item">
                   <RotateCcw className="w-4 h-4" />
                 </button>
               )}
@@ -2201,7 +2216,7 @@ function ReviewerView({
                 <select
                   value=""
                   onChange={(e) => { if (e.target.value) onAddCounter(i.id, e.target.value); }}
-                  className="min-h-9 bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-md px-2 py-1 text-[13px] focus:outline-none focus:ring-2 focus:ring-violet-500/40 focus:border-violet-500"
+                  className="min-h-11 bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-md px-2 py-1 text-[13px] focus:outline-none focus:ring-2 focus:ring-violet-500/40 focus:border-violet-500"
                   aria-label={`Add a count for ${i.model}`}
                 >
                   <option value="">Select counter…</option>
@@ -2297,7 +2312,7 @@ function ReviewerUserRow({
           {userDone && <DoneBadge />}
           <span className="text-[10px] text-zinc-500">{d.user_role || "—"}{d.updated_at ? ` · ${timeAgo(d.updated_at)}` : ""}</span>
         </div>
-        <button onClick={onClear} disabled={applying} className="text-zinc-400 hover:text-rose-500 p-2 -m-1 flex-shrink-0 disabled:opacity-40" title={`Clear ${name}'s count`} aria-label={`Clear ${name}'s count`}>
+        <button onClick={onClear} disabled={applying} className="text-zinc-400 hover:text-rose-500 min-w-11 min-h-11 -m-1 inline-flex items-center justify-center flex-shrink-0 disabled:opacity-40" title={`Clear ${name}'s count`} aria-label={`Clear ${name}'s count`}>
           <RotateCcw className="w-4 h-4" />
         </button>
       </div>
