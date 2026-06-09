@@ -3,7 +3,7 @@ import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "rea
 import {
   Printer, ClipboardCheck, CheckCircle2, AlertCircle,
   RotateCcw, Loader2, Filter, Eye, EyeOff, Users, ShieldCheck,
-  UserCircle2, Clock, Lock, LockOpen, CheckCheck, AlertTriangle,
+  UserCircle2, Clock, Lock, LockOpen, CheckCheck, AlertTriangle, UserPlus,
 } from "lucide-react";
 import { Shell } from "@/components/shell";
 import { sb, type Item } from "@/lib/supabase";
@@ -164,6 +164,12 @@ export default function ReconciliationPage() {
 
   const itemById = useMemo(() => new Map(items.map(i => [i.id, i])), [items]);
   const myDone = profile?.id ? (doneByUser.get(profile.id)?.done ?? false) : false;
+  // Selectable counters (active admin/staff) — used by the reviewer's
+  // "add a count for …" picker.
+  const [people, setPeople] = useState<{ id: string; name: string; role: string }[]>([]);
+  const peopleListRef = useRef<{ id: string; name: string; role: string }[]>([]);
+  // Which item is mid per-item apply (disables that card's apply buttons).
+  const [applyingItemId, setApplyingItemId] = useState<string | null>(null);
 
   // UI mode
   const [mode, setMode] = useState<"my" | "reviewer">("my");
@@ -213,7 +219,7 @@ export default function ReconciliationPage() {
         .like("reason", "Reconciliation%")
         .order("created_at", { ascending: false })
         .limit(2000),
-      c.from("user_profiles").select("id, name, email"),
+      c.from("user_profiles").select("id, name, email, role, active"),
       c.from("reconciliation_done").select("user_id, done, done_at"),
     ]);
 
@@ -234,6 +240,12 @@ export default function ReconciliationPage() {
     peopleRef.current = new Map(
       (profiles || []).map((p: any) => [p.id, (p.name?.trim() || p.email?.split("@")[0] || "Counter") as string])
     );
+    const counters = (profiles || [])
+      .filter((p: any) => p.active && (p.role === "admin" || p.role === "staff"))
+      .map((p: any) => ({ id: p.id, name: (p.name?.trim() || p.email?.split("@")[0] || "Counter") as string, role: p.role as string }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+    peopleListRef.current = counters;
+    setPeople(counters);
 
     const doneMap = new Map<string, { done: boolean; at: string | null; name: string | null }>();
     (doneRows || []).forEach((r: any) => {
@@ -300,9 +312,11 @@ export default function ReconciliationPage() {
     const prev = draftsRef.current;
     const next = new Map(prev);
 
-    // 1) Other users' rows — server is the source of truth.
+    // 1) Other users' rows — server is the source of truth, EXCEPT a row the
+    //    admin just added for someone (id "local-…") that hasn't persisted yet
+    //    (it persists the moment a value is typed into it).
     for (const [k, local] of [...prev]) {
-      if (local.user_id !== myId && !serverByKey.has(k)) next.delete(k);
+      if (local.user_id !== myId && !serverByKey.has(k) && !local.id.startsWith("local-")) next.delete(k);
     }
     for (const [k, server] of serverByKey) {
       if (server.user_id !== myId) next.set(k, server);
@@ -371,7 +385,7 @@ export default function ReconciliationPage() {
     // Pause polling during a commit — makeAdjustments mutates godown_stock one
     // row at a time, and a mid-commit refreshAppStock would flicker the diff
     // column as rows land. The post-commit load() is the authoritative refresh.
-    if (!loaded || processing) return;
+    if (!loaded || processing || applyingItemId) return;
     const onVis = () => { if (document.visibilityState === "visible") { void refreshDrafts(); void refreshAppStock(); void refreshDone(); } };
     document.addEventListener("visibilitychange", onVis);
     // Admin actively reviewing — refresh fast (3s) so staff typing shows up
@@ -581,6 +595,24 @@ export default function ReconciliationPage() {
     }
     showToast(next ? "ok" : "info", next ? "Count marked done — your entries are frozen." : "Resumed — your entries are editable again.");
   }, [profile?.id, myDone, doneSaving, flushAllPendingSaves]);
+
+  // Reviewer: add an editable (empty) row for a counter who has no draft yet,
+  // so the admin can enter a count on their behalf. It's a local "local-add-…"
+  // row (protected from the poll); it persists the moment a value is typed.
+  const addCounterDraft = useCallback((itemId: string, userId: string) => {
+    const k = dkey(userId, itemId);
+    if (draftsRef.current.has(k)) return; // already has a row
+    const p = peopleListRef.current.find(x => x.id === userId);
+    const row: DBDraft = {
+      ...makeEmptyDraft(userId, itemId),
+      id: `local-add-${k}`,
+      user_name: p?.name ?? null,
+      user_role: p?.role ?? null,
+    };
+    const m = new Map(draftsRef.current);
+    m.set(k, row);
+    writeDrafts(m);
+  }, [writeDrafts]);
 
   // Unmount cleanup — fire every pending save BEFORE the route transition
   // tears React state down. persistDraft reads from the ref, so the actual
@@ -1030,6 +1062,57 @@ export default function ReconciliationPage() {
     } catch { /* non-fatal: a stale flag self-resolves when the counter resumes */ }
   };
 
+  // ─── per-item apply (admin picks a counter's value and commits just that
+  //     one item to stock) ──────────────────────────────────────────────────
+  // Mirrors makeAdjustments' per-job logic but for ONE item using ONE chosen
+  // draft — so the admin can accept a specific counter's count (overriding a
+  // conflict / a count nobody else entered). Writes godown_stock + logs an
+  // Adjustment via apply_reconciliation, then clears that item's drafts.
+  const commitOne = async (item: Item, source: DBDraft) => {
+    if (!canCommit) { showToast("bad", "Only admins can apply reconciliation."); return; }
+    if (applyingItemId || processing) return;
+    const app = appStock.get(item.id);
+    if (!app) return;
+    const rd = computeDiff(item, app, source);
+    if (rd.invalid) { showToast("bad", "Fix the invalid entry before applying."); return; }
+    if (!rd.hasAnyChange) { showToast("info", "That count matches the system — nothing to apply."); return; }
+
+    setApplyingItemId(item.id);
+    const date = TODAY();
+    const newErrors: typeof errors = [];
+    let failed = false;
+
+    if (rd.caseSizeChanged) {
+      const { error } = await sb().from("items").update({ case_size: rd.csNew }).eq("id", item.id);
+      if (error) { newErrors.push({ itemId: item.id, message: `Case size update failed: ${error.message}` }); failed = true; }
+    }
+    if (!failed) {
+      for (const g of ["A", "B"] as Godown[]) {
+        const sideRd = g === "A" ? rd.A : rd.B;
+        if (!(sideRd.userTouched || rd.caseSizeChanged)) continue; // only write what was counted
+        const { error } = await sb().rpc("apply_reconciliation", {
+          p_item_id: item.id,
+          p_godown: g,
+          p_target_cases: sideRd.physCases,
+          p_target_loose: sideRd.physLoose,
+          p_reason: `Reconciliation ${date}`,
+        });
+        if (error) { newErrors.push({ itemId: item.id, godown: g, message: error.message }); failed = true; }
+      }
+    }
+    if (!failed) {
+      const { error: delErr } = await sb().from("reconciliation_drafts").delete().eq("item_id", item.id);
+      if (delErr) newErrors.push({ itemId: item.id, message: `Draft cleanup failed: ${delErr.message}` });
+    }
+
+    setErrors(newErrors);
+    setApplyingItemId(null);
+    const label = `${item.brand ? item.brand + " · " : ""}${item.model}`;
+    if (!failed) showToast("ok", `Applied ${label} — ${displayUser(source)}'s count saved to stock.`);
+    else showToast("bad", `Couldn't apply ${label}. See the error on the card.`);
+    await load();
+  };
+
   // ─── render ────────────────────────────────────────────────────────────
   return (
     <Shell title="Reconciliation">
@@ -1123,6 +1206,10 @@ export default function ReconciliationPage() {
             deleteDraft={deleteDraft}
             currentUserId={profile?.id ?? ""}
             doneByUser={doneByUser}
+            people={people}
+            onAddCounter={addCounterDraft}
+            onApplyItem={commitOne}
+            applyingItemId={applyingItemId}
             errorsByItem={errorsByItem(errors)}
           />
         )}
@@ -2105,7 +2192,8 @@ function GodownBlock({
 // ─── ReviewerView (admin only) ───────────────────────────────────────────
 function ReviewerView({
   items, appStock, draftsByItem, lastRecon, computeDiff, computeItemConflict,
-  setField, commitRow, deleteDraft, currentUserId, doneByUser, errorsByItem,
+  setField, commitRow, deleteDraft, currentUserId, doneByUser,
+  people, onAddCounter, onApplyItem, applyingItemId, errorsByItem,
 }: {
   items: (Item & { categoryName: string | null })[];
   appStock: Map<string, { A: AppStock; B: AppStock }>;
@@ -2118,6 +2206,10 @@ function ReviewerView({
   deleteDraft: (uid: string, iid: string) => void;
   currentUserId: string;
   doneByUser: DoneMap;
+  people: { id: string; name: string; role: string }[];
+  onAddCounter: (itemId: string, userId: string) => void;
+  onApplyItem: (item: Item, source: DBDraft) => void;
+  applyingItemId: string | null;
   errorsByItem: Map<string, string[]>;
 }) {
   return (
@@ -2127,6 +2219,11 @@ function ReviewerView({
         if (!app) return null;
         const drs = draftsByItem.get(i.id) || [];
         const nonEmpty = drs.filter(d => !isDraftEmpty(d));
+        // Rows to render: real counts + any admin-added empty rows awaiting entry.
+        const rows = drs.filter(d => !isDraftEmpty(d) || d.id.startsWith("local-add-"));
+        const rowUserIds = new Set(rows.map(r => r.user_id));
+        const canAdd = people.filter(p => !rowUserIds.has(p.id));
+        const applying = applyingItemId === i.id;
         const conflict = nonEmpty.length > 0 ? computeItemConflict(i, nonEmpty) : null;
         const ready = nonEmpty.length > 0 && !conflict?.any;
         const tint = conflict?.any
@@ -2177,11 +2274,11 @@ function ReviewerView({
               </div>
             )}
 
-            {nonEmpty.length === 0 ? (
-              <div className="px-3 py-2 text-[11px] text-zinc-500 italic">No drafts yet — open My count to add yours.</div>
+            {rows.length === 0 ? (
+              <div className="px-3 py-2 text-[11px] text-zinc-500 italic">No counts yet — add one for a counter below, or open My count.</div>
             ) : (
               <div className="divide-y divide-zinc-200/60 dark:divide-zinc-800/60">
-                {drs.map(d => (
+                {rows.map(d => (
                   <ReviewerUserRow
                     key={d.user_id}
                     i={i}
@@ -2191,11 +2288,31 @@ function ReviewerView({
                     isMe={d.user_id === currentUserId}
                     userDone={!!doneByUser.get(d.user_id)?.done}
                     computeDiff={computeDiff}
+                    canApply={!isDraftEmpty(d)}
+                    applying={applying}
                     onChange={(field, value) => setField(d.user_id, i.id, field, value)}
                     onBlur={() => commitRow(d.user_id, i.id)}
+                    onApply={() => onApplyItem(i, d)}
                     onClear={() => deleteDraft(d.user_id, i.id)}
                   />
                 ))}
+              </div>
+            )}
+
+            {/* Add a count on behalf of a counter who hasn't entered one. */}
+            {canAdd.length > 0 && (
+              <div className="px-3 py-2 border-t border-zinc-200/60 dark:border-zinc-800/60 flex items-center gap-2 flex-wrap">
+                <UserPlus className="w-3.5 h-3.5 text-zinc-400 flex-shrink-0" />
+                <span className="text-[11px] text-zinc-500">Add a count for</span>
+                <select
+                  value=""
+                  onChange={(e) => { if (e.target.value) onAddCounter(i.id, e.target.value); }}
+                  className="bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-md px-2 py-1 text-[12px] focus:outline-none focus:border-cyan-500"
+                  aria-label={`Add a count for ${i.model}`}
+                >
+                  <option value="">Select counter…</option>
+                  {canAdd.map(p => <option key={p.id} value={p.id}>{p.name}{p.role === "admin" ? " (admin)" : ""}</option>)}
+                </select>
               </div>
             )}
 
@@ -2213,7 +2330,7 @@ function ReviewerView({
 }
 
 function ReviewerUserRow({
-  i, app, d, conflict, isMe, userDone, computeDiff, onChange, onBlur, onClear,
+  i, app, d, conflict, isMe, userDone, computeDiff, canApply, applying, onChange, onBlur, onApply, onClear,
 }: {
   i: Item;
   app: { A: AppStock; B: AppStock };
@@ -2222,8 +2339,11 @@ function ReviewerUserRow({
   isMe: boolean;
   userDone: boolean;
   computeDiff: (i: Item, app: { A: AppStock; B: AppStock }, d: DBDraft) => RowDiffType;
+  canApply: boolean;
+  applying: boolean;
   onChange: (field: Field, value: string) => void;
   onBlur: () => void;
+  onApply: () => void;
   onClear: () => void;
 }) {
   const rd = computeDiff(i, app, d);
@@ -2285,13 +2405,27 @@ function ReviewerUserRow({
             onChange={(v) => onChange("b_loose", v)} onBlur={onBlur} conflict={!!conflict?.b_loose}
             tone={tonefor(d.b_loose_raw, rd.B.valid, rd.B.userTouched)} ariaLabel={`B loose by ${name}`} />
         </div>
-        <div className="mt-1.5 flex flex-wrap gap-x-4 gap-y-0.5 text-[10px] tabular-nums">
+        <div className="mt-1.5 flex flex-wrap items-center gap-x-4 gap-y-1 text-[10px] tabular-nums">
           {sideTotal("A")}
           {sideTotal("B")}
+          {/* Apply just this item to stock using THIS counter's numbers — the
+              admin's per-item, pick-the-value adjustment. */}
+          {canApply && (
+            <button
+              type="button"
+              onClick={onApply}
+              disabled={applying}
+              className="ml-auto inline-flex items-center gap-1 rounded-md px-2 py-1 text-[11px] font-medium border border-emerald-500/50 text-emerald-700 dark:text-emerald-300 hover:bg-emerald-500/10 disabled:opacity-50"
+              title={`Apply ${name}'s count to stock for this item`}
+            >
+              {applying ? <Loader2 className="w-3 h-3 animate-spin" /> : <CheckCircle2 className="w-3 h-3" />}
+              Apply this count
+            </button>
+          )}
         </div>
       </div>
 
-      <button onClick={onClear} className="text-zinc-400 hover:text-rose-500 p-1 self-center" title={`Clear ${name}'s draft`} aria-label={`Clear ${name}'s draft`}>
+      <button onClick={onClear} disabled={applying} className="text-zinc-400 hover:text-rose-500 p-1 self-center disabled:opacity-40" title={`Clear ${name}'s draft`} aria-label={`Clear ${name}'s draft`}>
         <RotateCcw className="w-3.5 h-3.5" />
       </button>
     </div>
@@ -2354,8 +2488,13 @@ function HintCard({ isAdmin, mode }: { isAdmin: boolean; mode: "my" | "reviewer"
       {isAdmin && (
         <div>
           <strong>Reviewer mode</strong> shows every counter's draft per item with each one's A/B totals. Disagreements (or a “done” counter who missed an item others found) are flagged{" "}
-          <span className="inline-block px-1 bg-rose-500/15 text-rose-700 dark:text-rose-300 rounded text-[10px]">Conflict</span> with the reason spelled out and skipped from commit. Use <strong>Conflicts</strong> to see only those. Agreed items show{" "}
+          <span className="inline-block px-1 bg-rose-500/15 text-rose-700 dark:text-rose-300 rounded text-[10px]">Conflict</span> with the reason spelled out and skipped from the bulk commit. Use <strong>Conflicts</strong> to see only those. Agreed items show{" "}
           <span className="inline-block px-1 bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 rounded text-[10px]">Ready</span>. Edit anyone's row inline to resolve, or ask them to recount.
+        </div>
+      )}
+      {isAdmin && (
+        <div>
+          <strong>Add a count for</strong> at the bottom of each item lets you enter a count on behalf of a counter who didn't. And <strong>Apply this count</strong> on any row commits <em>just that item</em> to stock using that counter's numbers — your pick-the-value, item-by-item adjustment (overrides a conflict). <strong>Make adjustments</strong> still bulk-commits every agreed item at once.
         </div>
       )}
       <div>

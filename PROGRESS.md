@@ -230,6 +230,35 @@ If you must touch one of these files: **read first, edit surgically, never repla
 
 ## 11. Changelog (latest first — add new entries at the top)
 
+### 2026-06-09 — Reconciliation: blank-field fix + staff conflicts filter + reviewer add/apply
+
+Three follow-ups after the multi-counter rework landed (all client-only, `app/reconciliation/page.tsx`):
+
+1. **Bug fix — blank count field pulled the system value.** In `computeDiff`'s `side`, a godown you'd
+   started counting with one field filled and the sibling blank fell back to the **system** number
+   (`pc ?? appSide.cases`), silently inflating "You count" (e.g. cases=1, loose blank → `1×6 + 3 = 9`
+   using the system's 3 loose) and producing false deltas/conflicts + a wrong committed split. Now a
+   blank field on a **touched** godown = **0** (found none); only a wholly untouched godown falls back
+   to system (diff stays 0). Matches `draftSide` (other counters) + conflict detection, which already
+   used 0.
+2. **Conflicts filter for staff too.** The "Conflicts" toggle now shows in **My count** (not just
+   Reviewer) and the filter applies in both modes — a counter can jump to the items where they disagree
+   with a teammate and recheck. "Clear filters" resets it.
+3. **Reviewer: add a count for a no-show counter + per-item apply.**
+   - **Add a count for [counter]** picker at the bottom of each reviewer card → creates an editable
+     `local-add-…` row (protected from the poll; persists on first keystroke) so the admin can enter a
+     count for someone who didn't. Needs the `people` list (active admin/staff) now loaded in `load()`.
+   - **Apply this count** button on each counter row commits **just that item** to stock using that
+     counter's numbers (`commitOne` — mirrors the bulk job logic for one item/one draft, overrides
+     conflicts, writes godown_stock via `apply_reconciliation`, logs the Adjustment, clears the item's
+     drafts). The global **Make adjustments** still bulk-commits agreed items. Polling pauses during a
+     per-item apply. `refreshDrafts` now keeps other-users' `local-…` rows (so an admin-added row isn't
+     wiped mid-entry). No SQL change — still on the 2026-06-09 migration.
+
+`tsc` + `next build` clean (`/reconciliation` 18 kB).
+
+---
+
 ### 2026-06-09 — Reconciliation: multi-counter coordination (done/freeze, done-aware conflicts, rollover, deltas)
 
 Big reconciliation rework so several staff can independently count the same stock and the reviewer
