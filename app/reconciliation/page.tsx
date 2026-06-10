@@ -1021,9 +1021,11 @@ export default function ReconciliationPage() {
     const notDone = [...participants]
       .filter(uid => !doneByUser.get(uid)?.done)
       .map(uid => peopleRef.current.get(uid) || "a counter");
-    // Census default: ON when every counter has marked done (their blanks are
-    // final = full count), OFF while someone is still counting.
-    setCensusZero(notDone.length === 0);
+    // Census default: ON only when there ARE counters and every one of them
+    // has marked done (their blanks are final = full count). OFF while someone
+    // is still counting — and OFF with zero participants, so an idle click can
+    // never two-tap the whole inventory to zero; ticking it is then deliberate.
+    setCensusZero(participants.size > 0 && notDone.length === 0);
     setCommitConfirm({ counted, conflicted, uncountedItems, uncountedSides, notDone });
   };
 
@@ -1328,7 +1330,10 @@ export default function ReconciliationPage() {
           doneSaving={doneSaving}
           onPrint={() => window.print()}
           onCommit={openCommitConfirm}
-          canCommit={canCommit && stats.anyStaged > 0 && !processing}
+          // Enabled even with nothing staged: the confirm dialog is the real
+          // gate, and a census run ("zero what nobody found") is legitimate
+          // with zero drafts — e.g. zeroing leftovers after an earlier commit.
+          canCommit={canCommit && !processing}
           processing={processing}
           progress={progress}
         />
