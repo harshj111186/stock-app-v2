@@ -230,6 +230,34 @@ If you must touch one of these files: **read first, edit surgically, never repla
 
 ## 11. Changelog (latest first — add new entries at the top)
 
+### 2026-06-10 — Count log (permanent per-counter records) + note-column fix + CSV exports + recovery
+
+**The incident that drove it:** after the 2026-06-09 commit, 56 items still held stock with no way to
+tell "counted and matched" (zero delta → NO transaction logged) from "never counted". A confirmed bulk
+zero of all 56 (~2,040 pcs, via Management API with per-row logged Adjustments) was retracted minutes
+later ("many items matched") and **fully restored** from those logged rows (`Reversal of <id>` pairs,
+`reverses_id` set — visible in the log). Harsh then hand-corrected 19 items (~36 pcs) via Count
+correction; 3 were re-corrections of items already adjusted on 2026-06-09 (flagged, confirmed final).
+
+**So counts are now recorded permanently — `reconciliation_count_log`** (run
+`db/2026-06-10-count-log.sql`): every counter's raw entries + computed A/B pieces are snapshotted at
+commit time (bulk "Make adjustments" AND per-item "Apply this count") just before drafts are wiped.
+Denormalized (item + counter names survive renames/deletions), insert-only (active admins), readable by
+all signed-in users, immutable from the client. A "not counted" godown stays NULL — distinct from a
+counted 0. UI: **Count history** button (Reviewer toolbar, admin) → modal grouped by commit batch →
+per-item per-counter entries, with **Export CSV**. If the migration hasn't run, commits still work and
+just toast that the log wasn't saved.
+
+Also shipped earlier today (commits `987f68d`, `8763336`):
+- **Fix: audit text lives in `transactions.note`, not `reason`** — `process_transaction` maps its reason
+  param to `note`; the `reason` column is never written. The recon "Last reconciled" lookup (filtered on
+  `reason` — matched nothing since day one) and the transaction-log note column (displayed `reason` —
+  always blank) now read `note`. `Txn` type gains `note`.
+- **Transactions: Export CSV** — fetches fresh (up to 5000 rows, vs the 200-row on-screen log), applies
+  the current filter+search, UTF-8 BOM, full columns incl. note + actor + ids.
+
+---
+
 ### 2026-06-10 — Reconciliation: census commit ("full count → zero what nobody found") + confirm dialog
 
 **Make adjustments** previously only wrote items/godowns somebody actually typed into — an item with

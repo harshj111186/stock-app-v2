@@ -4,7 +4,7 @@ import {
   Printer, ClipboardCheck, CheckCircle2, AlertCircle,
   RotateCcw, Loader2, Filter, Eye, EyeOff, Users, ShieldCheck,
   UserCircle2, Clock, Lock, LockOpen, CheckCheck, AlertTriangle, UserPlus,
-  Minus, Plus,
+  Minus, Plus, History, Download, X,
 } from "lucide-react";
 import { Shell } from "@/components/shell";
 import { sb, type Item } from "@/lib/supabase";
@@ -1055,6 +1055,12 @@ export default function ReconciliationPage() {
     };
     const jobs: Job[] = [];
     const skipped: Array<{ itemId: string; label: string; reason: string }> = [];
+    const date = TODAY();
+    // Permanent per-counter record of every entry feeding this commit — written
+    // to reconciliation_count_log BEFORE drafts are wiped, so "who counted
+    // what" survives forever (matched counts leave no transaction, so without
+    // this they'd be indistinguishable from never-counted).
+    const logRows: Record<string, unknown>[] = [];
 
     // A census zero-side for a godown that still shows stock but nobody counted.
     const zeroSide = (app: { A: AppStock; B: AppStock }, cs: number, g: Godown): SideInfo | null => {
@@ -1143,6 +1149,23 @@ export default function ReconciliationPage() {
 
       if (!rd.hasAnyChange && sides.length === 0) continue;
 
+      // Snapshot every counter's entries on this item for the count log.
+      // Conflict-free ⇒ all entries agree, so each row is marked applied.
+      for (const d of nonEmpty) {
+        const sA = draftSide(d, "A", i.case_size || 0);
+        const sB = draftSide(d, "B", i.case_size || 0);
+        logRows.push({
+          commit_note: `Reconciliation ${date}`, commit_kind: "bulk", committed_by: profile?.id ?? null,
+          user_id: d.user_id, user_name: displayUser(d),
+          item_id: i.id, item_code: i.item_code, brand: i.brand, model: i.model, size: i.size, colour: i.colour,
+          case_size: i.case_size || 0,
+          case_size_raw: d.case_size_raw, a_cases_raw: d.a_cases_raw, a_loose_raw: d.a_loose_raw,
+          b_cases_raw: d.b_cases_raw, b_loose_raw: d.b_loose_raw,
+          a_pieces: sA.touched ? sA.pcs : null, b_pieces: sB.touched ? sB.pcs : null,
+          applied: true,
+        });
+      }
+
       jobs.push({
         itemId: i.id,
         label,
@@ -1164,12 +1187,19 @@ export default function ReconciliationPage() {
 
     setProcessing(true);
     setErrors([]);
+
+    // Write the count log FIRST (drafts still intact). One snapshot per commit
+    // attempt. Failure never blocks the stock commit — it just warns.
+    if (logRows.length > 0) {
+      const { error: logErr } = await sb().from("reconciliation_count_log").insert(logRows);
+      if (logErr) showToast("info", "Counts will commit, but the count log couldn't be saved — run db/2026-06-10-count-log.sql.");
+    }
+
     const totalSteps = jobs.reduce((n, j) => n + (j.caseSizeChanged ? 1 : 0) + j.sides.length + 1 /* delete drafts step */, 0);
     setProgress({ done: 0, total: totalSteps });
     let done = 0;
     const newErrors: typeof errors = [];
     const failedItems = new Set<string>();
-    const date = TODAY();
 
     for (const j of jobs) {
       if (j.caseSizeChanged) {
@@ -1273,6 +1303,28 @@ export default function ReconciliationPage() {
     const newErrors: typeof errors = [];
     let failed = false;
 
+    // Count log snapshot — every counter's entries on this item (the chosen
+    // source row marked applied), written before the drafts are wiped.
+    const snapDrafts = (draftsByItem.get(item.id) || []).filter(d => !isDraftEmpty(d));
+    if (snapDrafts.length > 0) {
+      const rows = snapDrafts.map(d => {
+        const sA = draftSide(d, "A", item.case_size || 0);
+        const sB = draftSide(d, "B", item.case_size || 0);
+        return {
+          commit_note: `Reconciliation ${date}`, commit_kind: "single", committed_by: profile?.id ?? null,
+          user_id: d.user_id, user_name: displayUser(d),
+          item_id: item.id, item_code: item.item_code, brand: item.brand, model: item.model, size: item.size, colour: item.colour,
+          case_size: item.case_size || 0,
+          case_size_raw: d.case_size_raw, a_cases_raw: d.a_cases_raw, a_loose_raw: d.a_loose_raw,
+          b_cases_raw: d.b_cases_raw, b_loose_raw: d.b_loose_raw,
+          a_pieces: sA.touched ? sA.pcs : null, b_pieces: sB.touched ? sB.pcs : null,
+          applied: d.user_id === source.user_id,
+        };
+      });
+      const { error: logErr } = await sb().from("reconciliation_count_log").insert(rows);
+      if (logErr) showToast("info", "Count will apply, but the count log couldn't be saved — run db/2026-06-10-count-log.sql.");
+    }
+
     if (rd.caseSizeChanged) {
       const { error } = await sb().from("items").update({ case_size: rd.csNew }).eq("id", item.id);
       if (error) { newErrors.push({ itemId: item.id, message: `Case size update failed: ${error.message}` }); failed = true; }
@@ -1304,6 +1356,69 @@ export default function ReconciliationPage() {
     await load();
   };
 
+  // ─── count history (admin) ───────────────────────────────────────────────
+  type CountLogRow = {
+    id: string; commit_note: string; commit_kind: string; created_at: string;
+    user_id: string; user_name: string | null;
+    item_id: string | null; item_code: string | null; brand: string | null;
+    model: string | null; size: string | null; colour: string | null;
+    case_size: number; case_size_raw: string;
+    a_cases_raw: string; a_loose_raw: string; b_cases_raw: string; b_loose_raw: string;
+    a_pieces: number | null; b_pieces: number | null; applied: boolean;
+  };
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [historyRows, setHistoryRows] = useState<CountLogRow[] | null>(null);
+  const openHistory = async () => {
+    setHistoryOpen(true);
+    setHistoryRows(null);
+    const { data, error } = await sb()
+      .from("reconciliation_count_log")
+      .select("*")
+      .order("created_at", { ascending: false })
+      .limit(1000);
+    if (error) {
+      showToast("bad", `Couldn't load the count log — has db/2026-06-10-count-log.sql been run? (${error.message})`);
+      setHistoryRows([]);
+      return;
+    }
+    setHistoryRows((data || []) as CountLogRow[]);
+  };
+  // One batch per commit (all rows of a commit share created_at + note).
+  const historyBatches = useMemo(() => {
+    if (!historyRows) return [];
+    const m = new Map<string, { key: string; note: string; at: string; kind: string; rows: CountLogRow[] }>();
+    for (const r of historyRows) {
+      const key = `${r.created_at}|${r.commit_note}|${r.commit_kind}`;
+      if (!m.has(key)) m.set(key, { key, note: r.commit_note, at: r.created_at, kind: r.commit_kind, rows: [] });
+      m.get(key)!.rows.push(r);
+    }
+    return [...m.values()];
+  }, [historyRows]);
+  const exportHistoryCsv = () => {
+    if (!historyRows || historyRows.length === 0) return;
+    const esc = (v: unknown) => {
+      const s = String(v ?? "");
+      return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+    };
+    const header = ["Committed at", "Commit", "Kind", "Counter", "Brand", "Model", "Size", "Colour", "Item code", "Case size", "Case size entry", "A cases entry", "A loose entry", "A pieces", "B cases entry", "B loose entry", "B pieces", "Applied"];
+    const lines = historyRows.map(r => [
+      r.created_at, r.commit_note, r.commit_kind, r.user_name || r.user_id,
+      r.brand || "", r.model || "", r.size || "", r.colour || "", r.item_code || "",
+      r.case_size, r.case_size_raw, r.a_cases_raw, r.a_loose_raw, r.a_pieces ?? "",
+      r.b_cases_raw, r.b_loose_raw, r.b_pieces ?? "", r.applied ? "yes" : "",
+    ].map(esc).join(","));
+    const csv = "﻿" + [header.map(esc).join(","), ...lines].join("\r\n");
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `count-log-${new Date().toISOString().slice(0, 10)}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  };
+
   // ─── render ────────────────────────────────────────────────────────────
   return (
     <Shell title="Reconciliation">
@@ -1331,6 +1446,7 @@ export default function ReconciliationPage() {
           onToggleDone={toggleDone}
           doneSaving={doneSaving}
           onPrint={() => window.print()}
+          onHistory={() => void openHistory()}
           onCommit={openCommitConfirm}
           // Enabled even with nothing staged: the confirm dialog is the real
           // gate, and a census run ("zero what nobody found") is legitimate
@@ -1409,6 +1525,92 @@ export default function ReconciliationPage() {
         )}
 
         <HintCard isAdmin={isAdmin} mode={mode} />
+
+        {/* Count history — the permanent per-counter record of past commits. */}
+        {historyOpen && (
+          <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center p-4 bg-black/40" role="dialog" aria-modal="true" aria-label="Count history">
+            <div className="w-full max-w-2xl max-h-[85vh] flex flex-col bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-2xl shadow-xl overflow-hidden">
+              <div className="flex items-center gap-2 px-4 sm:px-5 py-3 border-b border-zinc-200 dark:border-zinc-800">
+                <History className="w-4 h-4 text-violet-600 dark:text-violet-400 flex-shrink-0" />
+                <h2 className="text-base font-semibold flex-1 truncate">Count history</h2>
+                {historyRows && historyRows.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={exportHistoryCsv}
+                    className="inline-flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-xs border border-zinc-200 dark:border-zinc-700 text-zinc-600 dark:text-zinc-300 hover:border-zinc-300 dark:hover:border-zinc-600"
+                  >
+                    <Download className="w-3.5 h-3.5" /> Export CSV
+                  </button>
+                )}
+                <button type="button" onClick={() => setHistoryOpen(false)} className="min-w-11 min-h-11 -m-2 inline-flex items-center justify-center text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-200" aria-label="Close">
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+              <div className="overflow-y-auto p-3 sm:p-4 space-y-3">
+                {historyRows === null ? (
+                  <div className="py-10 text-center text-sm text-zinc-500"><Loader2 className="w-4 h-4 animate-spin inline mr-2" />Loading…</div>
+                ) : historyRows.length === 0 ? (
+                  <div className="py-10 text-center text-sm text-zinc-500 px-6">
+                    No counts logged yet. Every counter&apos;s entries are saved here automatically each time you run <strong>Make adjustments</strong> or <strong>Apply this count</strong> (requires <code className="px-1 bg-zinc-100 dark:bg-zinc-800 rounded">db/2026-06-10-count-log.sql</code>).
+                  </div>
+                ) : (
+                  historyBatches.map(b => {
+                    const itemKeys = new Set(b.rows.map(r => r.item_id || r.item_code || ""));
+                    const counters = new Set(b.rows.map(r => r.user_id));
+                    const byItem = new Map<string, CountLogRow[]>();
+                    for (const r of b.rows) {
+                      const k = r.item_id || r.item_code || "?";
+                      if (!byItem.has(k)) byItem.set(k, []);
+                      byItem.get(k)!.push(r);
+                    }
+                    return (
+                      <div key={b.key} className="border border-zinc-200 dark:border-zinc-800 rounded-xl overflow-hidden">
+                        <div className="px-3 py-2 bg-zinc-50 dark:bg-zinc-900/50 flex flex-wrap items-center gap-x-3 gap-y-1">
+                          <span className="text-[13px] font-medium">{b.note}</span>
+                          <span className={cn(
+                            "text-[9px] uppercase tracking-wider px-1.5 py-0.5 rounded font-medium",
+                            b.kind === "bulk" ? "bg-cyan-500/15 text-cyan-700 dark:text-cyan-300" : "bg-violet-500/15 text-violet-700 dark:text-violet-300"
+                          )}>
+                            {b.kind === "bulk" ? "Make adjustments" : "Apply one"}
+                          </span>
+                          <span className="text-[11px] text-zinc-500">{new Date(b.at).toLocaleString("en-IN", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" })}</span>
+                          <span className="ml-auto text-[11px] text-zinc-500 tabular-nums">{itemKeys.size} item{itemKeys.size === 1 ? "" : "s"} · {counters.size} counter{counters.size === 1 ? "" : "s"}</span>
+                        </div>
+                        <div className="divide-y divide-zinc-200/60 dark:divide-zinc-800/60">
+                          {[...byItem.values()].map((rows, gi) => {
+                            const f = rows[0];
+                            return (
+                              <div key={gi} className="px-3 py-2">
+                                <div className="text-[12px] font-medium truncate">
+                                  {[f.brand, f.model, f.size, f.colour].filter(Boolean).join(" · ")}
+                                  <span className="text-zinc-400 font-normal"> · cs {f.case_size}</span>
+                                </div>
+                                <div className="mt-1 space-y-0.5">
+                                  {rows.map(r => (
+                                    <div key={r.id} className="flex flex-wrap items-baseline gap-x-3 gap-y-0.5 text-[11px] tabular-nums">
+                                      <span className="w-28 truncate text-zinc-700 dark:text-zinc-200">{r.user_name || "—"}</span>
+                                      <span className={cn(r.a_pieces === null && "text-zinc-400")}>
+                                        A {r.a_pieces === null ? "not counted" : `${fmtN(r.a_pieces)} pcs (${r.a_cases_raw || "0"}c + ${r.a_loose_raw || "0"}L)`}
+                                      </span>
+                                      <span className={cn(r.b_pieces === null && "text-zinc-400")}>
+                                        B {r.b_pieces === null ? "not counted" : `${fmtN(r.b_pieces)} pcs (${r.b_cases_raw || "0"}c + ${r.b_loose_raw || "0"}L)`}
+                                      </span>
+                                      {r.case_size_raw.trim() !== "" && <span className="text-amber-600 dark:text-amber-400">cs→{r.case_size_raw}</span>}
+                                    </div>
+                                  ))}
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    );
+                  })
+                )}
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* Pre-commit confirmation — nothing writes until Commit is tapped. */}
         {commitConfirm && (
@@ -1587,7 +1789,7 @@ function Toolbar({
   brands, cats, shownCount,
   mode, setMode, isAdmin, usersWithDrafts,
   myDone, onToggleDone, doneSaving,
-  onPrint, onCommit, canCommit, processing, progress,
+  onPrint, onHistory, onCommit, canCommit, processing, progress,
 }: {
   q: string; setQ: (s: string) => void;
   brand: string; setBrand: (s: string) => void;
@@ -1599,7 +1801,7 @@ function Toolbar({
   mode: "my" | "reviewer"; setMode: (m: "my" | "reviewer") => void;
   isAdmin: boolean; usersWithDrafts: number;
   myDone: boolean; onToggleDone: () => void; doneSaving: boolean;
-  onPrint: () => void; onCommit: () => void;
+  onPrint: () => void; onHistory: () => void; onCommit: () => void;
   canCommit: boolean; processing: boolean;
   progress: { done: number; total: number };
 }) {
@@ -1742,6 +1944,17 @@ function Toolbar({
         >
           <Printer className="w-3.5 h-3.5" /> Print PDF
         </button>
+
+        {isAdmin && (
+          <button
+            type="button"
+            onClick={onHistory}
+            className="inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 text-zinc-700 dark:text-zinc-200 hover:border-zinc-300 dark:hover:border-zinc-700"
+            title="Every counter's saved entries from past commits"
+          >
+            <History className="w-3.5 h-3.5" /> Count history
+          </button>
+        )}
 
         <div className="flex-1 min-w-0" />
 
