@@ -363,8 +363,16 @@ settings stops disclosing the Supabase project ref, sidebar hides Categories fro
 aligned, unicode-aware search (Devanagari model names were unsearchable).
 
 **Files:** every page in `app/`, most of `components/`, `lib/{supabase,utils,categories,demo,demo-data}.ts`,
-NEW `lib/hooks.ts` + `components/confirm-dialog.tsx`, `db/2026-06-10-hardening-fixes.sql` (run it),
+NEW `lib/hooks.ts` + `components/confirm-dialog.tsx`, `db/2026-06-10-hardening-fixes.sql`,
 `supabase/functions/master-login/index.ts` (CORS — redeploy optional, throttle works without it).
+
+**APPLIED LIVE 2026-06-10:** `db/2026-06-10-hardening-fixes.sql` was applied to the Stock Manager
+project (`zvycuhldwfxpipcaeotc`) via the **Supabase Management API** + the account PAT (Nexvia Books
+vault) — Harsh authorised direct DB access this session. Pre-checks: 0 duplicate `reverses_id`
+(index built clean), 1 process_transaction overload (clean drop→9-arg recreate), invoice_no+rate
+columns present (posting unaffected). Post-verify: all 6 objects present, `auth` can post / `anon`
+can't, drafts/done RLS staff-gated, `user_names` returns 6. `reconciliation_count_log` was already
+live. Future migrations can go the same Management-API route (see HANDOVER for the endpoint).
 
 ---
 

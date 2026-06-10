@@ -6,21 +6,30 @@
 
 ---
 
-## ⚠️ Status: TWO migrations to run, then fully activated
+## ✅ Status: all migrations applied — fully activated
 
-1. **`db/2026-06-10-count-log.sql`** (if not yet run) — creates `reconciliation_count_log`, the
-   permanent per-counter record behind the Reviewer's Count history modal. Commits work without it
-   (they just warn). Idempotent.
-2. **`db/2026-06-10-hardening-fixes.sql`** (NEW — run it soon, it closes real security holes):
-   role-gates `process_transaction`/`reverse_transaction` (any authenticated account could post
-   stock via raw RPC), server-side double-reverse guard + unique index, optional invoice/rate params
-   (the client auto-falls-back to the old 7-arg call until this runs), PIN `set_pin`/`change_pin`
-   lockout hardening, peer-admin/self guards on admin RPCs, master-login brute-force throttle,
-   viewer-proof reconciliation drafts/done RLS, `user_names` view (staff see colleague names in the
-   log), friendly category-collision errors, `price_history.discounts`. Idempotent.
+Both 2026-06-10 migrations are **applied and live-verified** on the Stock Manager Supabase project
+(`zvycuhldwfxpipcaeotc`, ap-south-1):
 
-Optional: redeploy `supabase/functions/master-login` (CORS now origin-locked) — the brute-force
-throttle lives in SQL and works without the redeploy.
+1. **`db/2026-06-10-count-log.sql`** — `reconciliation_count_log` exists (confirmed live).
+2. **`db/2026-06-10-hardening-fixes.sql`** — applied 2026-06-10 via the Supabase **Management API**
+   + the account PAT (in the Nexvia Books vault — the PAT spans all 3 of Harsh's projects). Verified:
+   `process_transaction` is now the single 9-arg version (role-gated, invoice/rate columns confirmed
+   present so posting is unaffected), `transactions_reverses_id_uq` index built (0 duplicate
+   `reverses_id` in 589 live rows), `master_login_attempts` throttle table, `user_names` view (6
+   users), `price_history.discounts`, staff/admin-gated drafts/done RLS. `auth` can call
+   process_transaction, `anon` cannot.
+
+**One optional follow-up (NOT done — not SQL):** redeploy `supabase/functions/master-login` for the
+origin-locked CORS (`supabase functions deploy master-login` or dashboard paste). The brute-force
+throttle already works without it (it lives in the `master_login_resolve` SQL function).
+
+> **How the SQL got applied:** Harsh authorised direct Management-API access. The PAT lives in
+> `Projects/nexvia/nexvia-books/credentials-vault.md` (gitignored) and is account-level — it lists
+> & queries all 3 projects (Stock Manager, tally-data-bridge, rye-staff-collection). Run SQL via
+> `POST https://api.supabase.com/v1/projects/zvycuhldwfxpipcaeotc/database/query` with
+> `{"query":"..."}`. Future migrations CAN be applied this way too (still drop the `.sql` in `db/`
+> for the record).
 
 The 2026-06-09 coordination migration **has been run** (live-confirmed). Every earlier `db/*.sql`
 (through `2026-06-02-category-redo.sql`) has been run; both Edge Functions are deployed.
