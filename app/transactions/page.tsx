@@ -3,7 +3,7 @@ import { Fragment, useEffect, useMemo, useState } from "react";
 import {
   ArrowDownToLine, ArrowUpFromLine, ArrowLeftRight, Wrench, Undo2,
   Search, RotateCcw, Loader2, CheckCircle2, AlertCircle,
-  ArrowDown, ArrowUp, Plus, Play, Trash2, X, ListChecks, Boxes,
+  ArrowDown, ArrowUp, Plus, Play, Trash2, X, ListChecks, Boxes, Download,
 } from "lucide-react";
 import { Shell } from "@/components/shell";
 import { useAuth } from "@/app/providers";
@@ -597,6 +597,64 @@ export default function TransactionsPage() {
     return list;
   }, [txns, logFilter, logQuery, itemById]);
 
+  // ── Export the log as CSV ─────────────────────────────────────────────
+  // Fetches fresh (up to 5000 rows — the on-screen log only holds the last
+  // 200), applies the current action filter + search, and downloads a file
+  // that Excel/Sheets open cleanly. Lets the owner share the full audit
+  // trail without screenshots or copy-paste.
+  const [exporting, setExporting] = useState(false);
+  const exportCsv = async () => {
+    if (exporting) return;
+    setExporting(true);
+    try {
+      const { data, error } = await sb()
+        .from("transactions")
+        .select("*")
+        .order("created_at", { ascending: false })
+        .limit(5000);
+      if (error) throw error;
+      let rows = (data || []) as Txn[];
+      if (logFilter) rows = rows.filter((t) => t.action === logFilter);
+      if (logQuery) {
+        rows = rows.filter((t) => {
+          const it = itemById.get(t.item_id);
+          const hay = `${it?.model || ""} ${it?.size || ""} ${it?.colour || ""} ${it?.brand || ""} ${t.invoice_no || ""} ${t.note || t.reason || ""}`;
+          return matchesQuery(hay, logQuery);
+        });
+      }
+      const esc = (v: unknown) => {
+        const s = String(v ?? "");
+        return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+      };
+      const header = ["Txn date", "Logged at", "Action", "Reversal", "Brand", "Model", "Size", "Colour", "Item code", "Godown", "Direction", "Qty", "Note", "Invoice", "By", "Txn id", "Reverses id"];
+      const lines = rows.map((t) => {
+        const it = itemById.get(t.item_id);
+        return [
+          (t.txn_date || "").slice(0, 10), t.created_at, t.action, t.reverses_id ? "yes" : "",
+          it?.brand || "", it?.model || "", it?.size || "", it?.colour || "", it?.item_code || "",
+          godownLabel(t), t.direction === 1 ? "in" : "out", t.qty,
+          t.note || t.reason || "", t.invoice_no || "", nameOf(t.created_by), t.id, t.reverses_id || "",
+        ].map(esc).join(",");
+      });
+      // BOM so Excel detects UTF-8 (brand/colour names can carry non-ASCII).
+      const csv = "﻿" + [header.map(esc).join(","), ...lines].join("\r\n");
+      const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `transactions-log-${new Date().toISOString().slice(0, 10)}.csv`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      showToast("ok", `Exported ${rows.length} transaction${rows.length === 1 ? "" : "s"}.`);
+    } catch (e: any) {
+      showToast("bad", `Export failed: ${e?.message || e}`);
+    } finally {
+      setExporting(false);
+    }
+  };
+
   const queueCount = queue.length;
   const errorMap = useMemo(() => {
     const m = new Map<string, string>();
@@ -1126,6 +1184,16 @@ export default function TransactionsPage() {
             placeholder="Search log…"
             className="flex-1 sm:flex-none sm:w-56"
           />
+          <button
+            type="button"
+            onClick={() => void exportCsv()}
+            disabled={exporting || !loaded}
+            className="inline-flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300 hover:border-zinc-300 dark:hover:border-zinc-600 disabled:opacity-50"
+            title="Download the log (current filters applied) as a CSV file"
+          >
+            {exporting ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Download className="w-3.5 h-3.5" />}
+            Export CSV
+          </button>
         </div>
 
         {/* Desktop / tablet table */}
