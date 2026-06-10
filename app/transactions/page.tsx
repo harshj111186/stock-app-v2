@@ -590,7 +590,7 @@ export default function TransactionsPage() {
     if (logQuery) {
       list = list.filter((t) => {
         const it = itemById.get(t.item_id);
-        const hay = `${it?.model || ""} ${it?.size || ""} ${it?.colour || ""} ${it?.brand || ""} ${t.invoice_no || ""} ${t.reason || ""}`;
+        const hay = `${it?.model || ""} ${it?.size || ""} ${it?.colour || ""} ${it?.brand || ""} ${t.invoice_no || ""} ${t.note || t.reason || ""}`;
         return matchesQuery(hay, logQuery);
       });
     }
@@ -1172,7 +1172,7 @@ export default function TransactionsPage() {
                       <span>{fmtN(t.qty)}</span>
                     </span>
                   </td>
-                  <td className="px-3 py-2.5 text-xs text-zinc-500 truncate max-w-[260px]">{t.reason || t.invoice_no || t.status || ""}</td>
+                  <td className="px-3 py-2.5 text-xs text-zinc-500 truncate max-w-[260px]">{t.note || t.reason || t.invoice_no || t.status || ""}</td>
                   <td className="px-3 py-2.5 text-xs text-zinc-600 dark:text-zinc-300">{nameOf(t.created_by)}</td>
                   <td className="px-5 py-2.5 text-right">
                     {canWrite && !isReversal && !alreadyReversed ? (
@@ -1208,7 +1208,7 @@ export default function TransactionsPage() {
               const isReversal = !!t.reverses_id;
               const alreadyReversed = txns.some((x) => x.reverses_id === t.id);
               const showDirHint = t.action === "Adjustment" || t.action === "Return" || t.action === "Transfer";
-              const note = t.reason || t.invoice_no || t.status || "";
+              const note = t.note || t.reason || t.invoice_no || t.status || "";
               return (
                 <li key={t.id} className="px-4 py-3">
                   <div className="flex items-center justify-between gap-2 mb-1">

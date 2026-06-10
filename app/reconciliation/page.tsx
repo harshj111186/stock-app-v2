@@ -302,8 +302,10 @@ export default function ReconciliationPage() {
       c.from("reconciliation_drafts_with_user").select("*"),
       // Latest reconciliation per item — pull plenty and dedupe client-side.
       c.from("transactions")
-        .select("item_id, created_at, created_by, reason")
-        .like("reason", "Reconciliation%")
+        // The audit text lives in `note` (process_transaction maps its reason
+        // param to the note column) — the `reason` column is never written.
+        .select("item_id, created_at, created_by, note")
+        .like("note", "Reconciliation%")
         .order("created_at", { ascending: false })
         .limit(2000),
       c.from("user_profiles").select("id, name, email, role, active"),

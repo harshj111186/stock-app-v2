@@ -89,7 +89,10 @@ export type Txn = {
   reverses_id: string | null;
   party_id: string | null;
   invoice_no: string | null;
+  // Vestigial — never written. process_transaction stores its reason param in
+  // `note`; read that instead.
   reason: string | null;
+  note: string | null;
   rate: number | null;
   created_by: string | null;
   created_at: string;
