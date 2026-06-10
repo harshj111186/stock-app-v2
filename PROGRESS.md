@@ -230,6 +230,25 @@ If you must touch one of these files: **read first, edit surgically, never repla
 
 ## 11. Changelog (latest first — add new entries at the top)
 
+### 2026-06-10 — Reconciliation: census commit ("full count → zero what nobody found") + confirm dialog
+
+**Make adjustments** previously only wrote items/godowns somebody actually typed into — an item with
+5 pcs in system that NO counter entered (because none exists physically) was skipped and stayed at 5.
+Now the commit can be a true census: after committing every agreed count, items (and godowns) with **no
+entries from anyone** but stock still in the system are **set to 0** via the same `apply_reconciliation`
+path (server-authoritative, logs an Adjustment with reason `Reconciliation <date> — not counted, set to
+0` for the audit trail). Already-zero uncounted items are skipped (no wasted RPCs); conflicted/invalid
+items are never zeroed.
+
+Safety: the button now opens a **confirm dialog** first (nothing writes silently): shows N items with an
+agreed count, M skipped conflicts, and a prominent checkbox — *“Full count — zero the stock nobody
+found”* with the exact uncounted item/side counts. The checkbox defaults **ON when every participating
+counter has marked done** (their blanks are final) and **OFF otherwise**, with an amber note naming who
+hasn't marked done. Untick = old partial-count behaviour. Per-item **Apply this count** is unchanged
+(only that counter's touched godowns). `tsc` + build clean (`/reconciliation` 19.9 kB). No SQL.
+
+---
+
 ### 2026-06-09 — Reconciliation: case size pre-filled with the system value
 
 Case size (which rarely changes) is now PRE-FILLED into its input as a real, editable value (the

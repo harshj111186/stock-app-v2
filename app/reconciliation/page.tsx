@@ -269,6 +269,12 @@ export default function ReconciliationPage() {
   // Commit + toast state
   const [processing, setProcessing] = useState(false);
   const [progress, setProgress] = useState<{ done: number; total: number }>({ done: 0, total: 0 });
+  // Pre-commit confirmation (Make adjustments) — shows what will move and the
+  // census option ("full count → zero what nobody found") before anything writes.
+  const [commitConfirm, setCommitConfirm] = useState<null | {
+    counted: number; conflicted: number; uncountedItems: number; uncountedSides: number; notDone: string[];
+  }>(null);
+  const [censusZero, setCensusZero] = useState(true);
   const [errors, setErrors] = useState<Array<{ itemId: string; godown?: Godown; message: string }>>([]);
   const [toast, setToast] = useState<{ kind: "ok" | "bad" | "info"; text: string } | null>(null);
   const toastTimer = useRef<number | null>(null);
@@ -985,14 +991,55 @@ export default function ReconciliationPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [stats.conflicts, mode, loaded]);
 
+  // Pre-commit summary for the confirm dialog: how many items have an agreed
+  // count, how many are blocked by conflicts, how much UNCOUNTED stock would
+  // be zeroed by a census commit, and which counters haven't marked done.
+  const openCommitConfirm = () => {
+    if (!canCommit || processing) return;
+    let counted = 0, conflicted = 0, uncountedItems = 0, uncountedSides = 0;
+    const participants = new Set<string>();
+    for (const i of items) {
+      const app = appStock.get(i.id);
+      if (!app) continue;
+      const drs = draftsByItem.get(i.id) || [];
+      const nonEmpty = drs.filter(d => !isDraftEmpty(d));
+      nonEmpty.forEach(d => participants.add(d.user_id));
+      const hasStock = (g: Godown) => app[g].cases !== 0 || app[g].loose !== 0;
+      if (nonEmpty.length === 0) {
+        if (hasStock("A") || hasStock("B")) uncountedItems++;
+        continue;
+      }
+      if (computeItemConflict(i, nonEmpty).any) { conflicted++; continue; }
+      counted++;
+      const touchedG = (g: Godown) => nonEmpty.some(d =>
+        (g === "A" ? d.a_cases_raw : d.b_cases_raw).trim() !== "" ||
+        (g === "A" ? d.a_loose_raw : d.b_loose_raw).trim() !== "");
+      for (const g of ["A", "B"] as Godown[]) {
+        if (!touchedG(g) && hasStock(g)) uncountedSides++;
+      }
+    }
+    const notDone = [...participants]
+      .filter(uid => !doneByUser.get(uid)?.done)
+      .map(uid => peopleRef.current.get(uid) || "a counter");
+    // Census default: ON when every counter has marked done (their blanks are
+    // final = full count), OFF while someone is still counting.
+    setCensusZero(notDone.length === 0);
+    setCommitConfirm({ counted, conflicted, uncountedItems, uncountedSides, notDone });
+  };
+
   // ─── commit (admin only) ───────────────────────────────────────────────
-  const makeAdjustments = async () => {
+  // zeroUncounted = "this was a FULL count": after committing every agreed
+  // count, any item (or godown) that NO counter entered but that still shows
+  // stock in the system is set to 0 — the count is the truth, so stock nobody
+  // found doesn't exist. Confirmed via the pre-commit dialog (never silent),
+  // so a partial count can simply untick it and only counted items move.
+  const makeAdjustments = async (zeroUncounted: boolean) => {
     if (!canCommit) { showToast("bad", "Only admins can commit reconciliation."); return; }
     if (processing) return;
 
     // Collect committable items: at least one user has a non-empty draft
     // AND no conflict across users AND all entered values are valid.
-    type SideInfo = { godown: Godown; diff: number; physCases: number; physLoose: number; needsWrite: boolean };
+    type SideInfo = { godown: Godown; diff: number; physCases: number; physLoose: number; needsWrite: boolean; uncounted?: boolean };
     type Job = {
       itemId: string;
       label: string;
@@ -1000,18 +1047,36 @@ export default function ReconciliationPage() {
       caseSizeChanged: boolean;
       sides: SideInfo[];
       userIdsToWipe: string[];
+      zeroedItem?: boolean; // census job: nobody counted this item, zeroing it
     };
     const jobs: Job[] = [];
     const skipped: Array<{ itemId: string; label: string; reason: string }> = [];
+
+    // A census zero-side for a godown that still shows stock but nobody counted.
+    const zeroSide = (app: { A: AppStock; B: AppStock }, cs: number, g: Godown): SideInfo | null => {
+      const s = app[g];
+      if (s.cases === 0 && s.loose === 0) return null; // already 0 — nothing to do
+      return { godown: g, diff: -pieces(cs, s.cases, s.loose), physCases: 0, physLoose: 0, needsWrite: true, uncounted: true };
+    };
 
     for (const i of items) {
       const app = appStock.get(i.id);
       if (!app) continue;
       const drs = draftsByItem.get(i.id) || [];
       const nonEmpty = drs.filter(d => !isDraftEmpty(d));
-      if (nonEmpty.length === 0) continue;
-
       const label = `${i.brand ? i.brand + " · " : ""}${i.model}${i.size ? " " + i.size : ""}`;
+
+      // Nobody counted this item. In census mode, stock nobody found goes to 0.
+      if (nonEmpty.length === 0) {
+        if (!zeroUncounted) continue;
+        const sides = (["A", "B"] as Godown[])
+          .map(g => zeroSide(app, i.case_size || 0, g))
+          .filter((s): s is SideInfo => s !== null);
+        if (sides.length === 0) continue; // already 0/0 everywhere
+        jobs.push({ itemId: i.id, label, caseSizeNew: i.case_size || 0, caseSizeChanged: false, sides, userIdsToWipe: [], zeroedItem: true });
+        continue;
+      }
+
       const conflict = computeItemConflict(i, nonEmpty);
       if (conflict.any) {
         skipped.push({ itemId: i.id, label, reason: "conflict between users" });
@@ -1046,9 +1111,8 @@ export default function ReconciliationPage() {
         skipped.push({ itemId: i.id, label, reason: "invalid input — fix before committing" });
         continue;
       }
-      if (!rd.hasAnyChange) continue;
 
-      // Only write a godown that was actually counted. A case-size-only change
+      // Write every godown that was actually counted. A case-size-only change
       // updates items.case_size (below) WITHOUT re-stamping untouched godowns —
       // physical cases/loose don't change, only how pieces are computed.
       const sides: SideInfo[] = (["A", "B"] as Godown[]).map(g => {
@@ -1061,6 +1125,19 @@ export default function ReconciliationPage() {
           needsWrite: side.userTouched,
         };
       }).filter(s => s.needsWrite);
+
+      // Census: a godown NOBODY counted on this item but that still shows
+      // stock goes to 0 too — same "the count is the truth" rule.
+      if (zeroUncounted) {
+        for (const g of ["A", "B"] as Godown[]) {
+          const side = g === "A" ? rd.A : rd.B;
+          if (side.userTouched) continue;
+          const z = zeroSide(app, rd.csNew, g);
+          if (z) sides.push(z);
+        }
+      }
+
+      if (!rd.hasAnyChange && sides.length === 0) continue;
 
       jobs.push({
         itemId: i.id,
@@ -1113,7 +1190,9 @@ export default function ReconciliationPage() {
           p_godown:       s.godown,
           p_target_cases: s.physCases,
           p_target_loose: s.physLoose,
-          p_reason:       `Reconciliation ${date}`,
+          // Distinct reason for census zeroes so the audit log shows WHY a
+          // godown went to 0 (still matches the "Reconciliation%" last-recon filter).
+          p_reason:       s.uncounted ? `Reconciliation ${date} — not counted, set to 0` : `Reconciliation ${date}`,
         });
         if (error) {
           newErrors.push({ itemId: j.itemId, godown: s.godown, message: error.message });
@@ -1144,10 +1223,12 @@ export default function ReconciliationPage() {
     setErrors(newErrors);
 
     const succeeded = jobs.length - failedItems.size;
+    const zeroed = jobs.filter(j => j.zeroedItem && !failedItems.has(j.itemId)).length;
+    const zeroedNote = zeroed > 0 ? ` (${zeroed} uncounted set to 0)` : "";
     if (failedItems.size === 0 && skipped.length === 0) {
-      showToast("ok", `Committed ${succeeded} item${succeeded === 1 ? "" : "s"}.`);
+      showToast("ok", `Committed ${succeeded} item${succeeded === 1 ? "" : "s"}${zeroedNote}.`);
     } else if (failedItems.size === 0) {
-      showToast("info", `Committed ${succeeded}. ${skipped.length} item${skipped.length === 1 ? "" : "s"} skipped (conflicts/invalid).`);
+      showToast("info", `Committed ${succeeded}${zeroedNote}. ${skipped.length} item${skipped.length === 1 ? "" : "s"} skipped (conflicts/invalid).`);
     } else {
       showToast("bad", `Committed ${succeeded}, ${failedItems.size} failed.`);
     }
@@ -1246,7 +1327,7 @@ export default function ReconciliationPage() {
           onToggleDone={toggleDone}
           doneSaving={doneSaving}
           onPrint={() => window.print()}
-          onCommit={makeAdjustments}
+          onCommit={openCommitConfirm}
           canCommit={canCommit && stats.anyStaged > 0 && !processing}
           processing={processing}
           progress={progress}
@@ -1321,6 +1402,87 @@ export default function ReconciliationPage() {
         )}
 
         <HintCard isAdmin={isAdmin} mode={mode} />
+
+        {/* Pre-commit confirmation — nothing writes until Commit is tapped. */}
+        {commitConfirm && (
+          <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center p-4 bg-black/40" role="dialog" aria-modal="true" aria-label="Confirm make adjustments">
+            <div className="w-full max-w-md bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-2xl shadow-xl p-5 space-y-4">
+              <div className="flex items-center gap-2">
+                <CheckCircle2 className="w-5 h-5 text-cyan-600 dark:text-cyan-400" />
+                <h2 className="text-base font-semibold">Make adjustments?</h2>
+              </div>
+
+              <div className="space-y-1.5 text-sm text-zinc-600 dark:text-zinc-300 tabular-nums">
+                <div className="flex justify-between gap-3">
+                  <span>Items with an agreed count → set to that count</span>
+                  <span className="font-semibold text-zinc-900 dark:text-zinc-100">{fmtN(commitConfirm.counted)}</span>
+                </div>
+                {commitConfirm.conflicted > 0 && (
+                  <div className="flex justify-between gap-3 text-rose-600 dark:text-rose-400">
+                    <span>Skipped — conflicts still to resolve</span>
+                    <span className="font-semibold">{fmtN(commitConfirm.conflicted)}</span>
+                  </div>
+                )}
+              </div>
+
+              {(commitConfirm.uncountedItems > 0 || commitConfirm.uncountedSides > 0) && (
+                <label className={cn(
+                  "flex items-start gap-3 rounded-xl border p-3 cursor-pointer transition-colors",
+                  censusZero
+                    ? "border-violet-500/50 bg-violet-500/5"
+                    : "border-zinc-200 dark:border-zinc-700"
+                )}>
+                  <input
+                    type="checkbox"
+                    checked={censusZero}
+                    onChange={(e) => setCensusZero(e.target.checked)}
+                    className="mt-0.5 w-5 h-5 accent-violet-600 flex-shrink-0"
+                  />
+                  <span className="min-w-0">
+                    <span className="block text-sm font-medium text-zinc-800 dark:text-zinc-100">
+                      Full count — zero the stock nobody found
+                    </span>
+                    <span className="block text-xs text-zinc-500 mt-0.5 tabular-nums">
+                      {commitConfirm.uncountedItems > 0 && <>{fmtN(commitConfirm.uncountedItems)} item{commitConfirm.uncountedItems === 1 ? "" : "s"} no one counted</>}
+                      {commitConfirm.uncountedItems > 0 && commitConfirm.uncountedSides > 0 && " + "}
+                      {commitConfirm.uncountedSides > 0 && <>{fmtN(commitConfirm.uncountedSides)} uncounted godown side{commitConfirm.uncountedSides === 1 ? "" : "s"}</>}
+                      {" "}still show stock in the system — ticking this sets them to <strong>0</strong>. Untick for a partial count.
+                    </span>
+                  </span>
+                </label>
+              )}
+
+              {commitConfirm.notDone.length > 0 && (
+                <div className="flex items-start gap-2 rounded-lg bg-amber-500/10 border border-amber-500/30 px-3 py-2 text-xs text-amber-800 dark:text-amber-300">
+                  <AlertTriangle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
+                  <span>{commitConfirm.notDone.join(", ")} {commitConfirm.notDone.length === 1 ? "hasn't" : "haven't"} marked their count done yet — their blanks may not be final.</span>
+                </div>
+              )}
+
+              <div className="flex gap-2 pt-1">
+                <button
+                  type="button"
+                  onClick={() => setCommitConfirm(null)}
+                  className="flex-1 min-h-11 rounded-lg border border-zinc-200 dark:border-zinc-700 text-sm font-medium text-zinc-700 dark:text-zinc-200 hover:bg-zinc-50 dark:hover:bg-zinc-800"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const census = censusZero && (commitConfirm.uncountedItems > 0 || commitConfirm.uncountedSides > 0);
+                    setCommitConfirm(null);
+                    void makeAdjustments(census);
+                  }}
+                  className="flex-1 min-h-11 rounded-lg bg-cyan-500 hover:bg-cyan-400 text-white text-sm font-medium inline-flex items-center justify-center gap-1.5"
+                >
+                  <CheckCircle2 className="w-4 h-4" />
+                  {censusZero && (commitConfirm.uncountedItems > 0 || commitConfirm.uncountedSides > 0) ? "Commit + zero uncounted" : "Commit"}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
 
         {toast && (
           <div
@@ -2414,7 +2576,7 @@ function HintCard({ isAdmin, mode }: { isAdmin: boolean; mode: "my" | "reviewer"
       )}
       {isAdmin && (
         <div>
-          <strong>Add a count for</strong> at the bottom of each item lets you enter a count on behalf of a counter who didn't. And <strong>Apply this count</strong> on any row commits <em>just that item</em> to stock using that counter's numbers — your pick-the-value, item-by-item adjustment (overrides a conflict). <strong>Make adjustments</strong> still bulk-commits every agreed item at once.
+          <strong>Add a count for</strong> at the bottom of each item lets you enter a count on behalf of a counter who didn't. And <strong>Apply this count</strong> on any row commits <em>just that item</em> to stock using that counter's numbers — your pick-the-value, item-by-item adjustment (overrides a conflict). <strong>Make adjustments</strong> bulk-commits every agreed item; its confirm box also offers <strong>“Full count — zero the stock nobody found”</strong> so after a complete stock-take the system matches the count exactly (untick it for a partial count).
         </div>
       )}
       <div>
