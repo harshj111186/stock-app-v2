@@ -47,7 +47,24 @@ export function buildCategoryTree(rows: CatRow[], includeArchived = false): CatN
       });
   };
 
-  return build(null, 0, [], new Set());
+  const roots = build(null, 0, [], new Set());
+
+  // Rows caught in a true parent-id cycle (A→B→…→A) are reachable from no
+  // root, so the walk above never visits them — they'd silently vanish,
+  // breaking the "rows never vanish" contract. Surface each cycle once as a
+  // root; the seen-guard inside build() stops the loop from recursing forever.
+  const visited = new Set<string>();
+  const mark = (ns: CatNode[]) => { for (const n of ns) { visited.add(n.id); mark(n.children); } };
+  mark(roots);
+  for (const r of visible.slice().sort(sortFn)) {
+    if (visited.has(r.id)) continue;
+    const path = [r.name];
+    const node: CatNode = { ...r, depth: 0, path, children: build(r.id, 1, path, new Set([r.id])) };
+    mark([node]);
+    roots.push(node);
+  }
+
+  return roots;
 }
 
 // Pre-order flatten — handy for indented <select> options and search.

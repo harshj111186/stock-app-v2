@@ -230,6 +230,144 @@ If you must touch one of these files: **read first, edit surgically, never repla
 
 ## 11. Changelog (latest first — add new entries at the top)
 
+### 2026-06-10 (later) — FULL-APP "GOD MODE" AUDIT: ~70 findings fixed + security hardening + design convergence
+
+**What happened:** a 7-subsystem adversarial audit (reconciliation, transactions, items/godowns,
+pricing/categories, dashboard/reports, auth/users/infra, design consistency) followed by a fix pass
+across every page. **One new migration to run: `db/2026-06-10-hardening-fixes.sql`** (idempotent —
+details below). Everything else is client code, live after deploy.
+
+**THE BIG ONE — the silent 1,000-row cap.** Supabase/PostgREST clamps EVERY select to 1,000 rows no
+matter what `.limit()` asks for. Several pages believed they were fetching 2,000–20,000 rows; they
+were getting the first 1,000 and silently computing on the rest being absent: dead-stock branded
+older items "never sold", ABC ranked revenue over an arbitrary subset (its fetch had NO order),
+sales-register totals understated past 1,000 rows, the dashboard txn pull was capped, the recon
+"Last reconciled" lookup was capped, the transactions CSV export was capped. Fix: new
+`fetchAllRows()` helper in `lib/supabase.ts` paginates with `.range()` + stable `.order()`; applied
+to every query that can grow (dashboard, all 3 reports, recon, txn export, items/godown loads). The
+"hit limit" banners now key off real truncation.
+
+**SECURITY (server, in the new migration — run it):**
+- `process_transaction` / `reverse_transaction` had NO role gate (SECURITY DEFINER bypasses the
+  table RLS): any authenticated account — viewer, pending, deactivated — could post stock via a raw
+  RPC call. Now: active admin/staff only (`_is_active_staff_or_admin` helper); anon EXECUTE revoked.
+- `reverse_transaction` could reverse the SAME txn twice from a stale tab/second device (the only
+  guard was client-side over a 200-row window) → server-side exists-check + partial unique index on
+  `reverses_id` makes a double physically impossible. Transfer reversal also tagged `reverses_id`
+  via a "latest Transfer" heuristic that could tag a concurrent user's row — now uses the returned id.
+- `process_transaction` gains optional `p_invoice_no` / `p_rate` params — invoice + rate were being
+  flattened into the note string while their real columns stayed NULL forever (the CSV's Invoice
+  column was permanently blank). Old 7-arg calls (incl. apply_reconciliation's internal call) work
+  unchanged; the client auto-falls-back to the 7-arg call until the migration runs.
+- `set_pin` let anyone holding a live session OVERWRITE the existing PIN (and clear the lockout)
+  without knowing the old one — exactly the actor PINs exist to stop. Now creation-only;
+  `change_pin` now honours + feeds the 5-miss/15-min lockout (it was an unthrottled oracle).
+- `master_login_resolve` was brute-forceable (unlimited tries) → per-email throttle (5 fails/15
+  min) + global circuit breaker (30 fails/15 min), attempts table, works WITHOUT redeploying the
+  Edge Function. The function file also gets origin-locked CORS (redeploy optional).
+- Admin RPCs under-enforced the UI's rules: a regular admin could deactivate/reject/rename/PIN-reset
+  ANOTHER admin or deactivate themselves via direct API → server now matches the UI (peer-admin +
+  self guards).
+- Reconciliation drafts/done RLS allowed VIEWERS to write counts and flip "done" (a viewer marking
+  done turned every counted item into a false conflict) → writes now require active admin/staff;
+  the UI renders read-only for viewers with an explanatory banner.
+- New `user_names` view (id+name+email, owner-rights): staff/viewer couldn't resolve colleague
+  names (user_profiles RLS is self-or-admin), so the txn log's "By" column showed "—" for everyone
+  else. Client reads the view with graceful fallback pre-migration.
+- Category rename/move/restore raised raw "duplicate key" errors on name collisions → friendly
+  pre-checks. `price_history` gains a `discounts` column (the stacked breakdown was being lost; the
+  app now writes history rows on every pricing save — it never actually did before).
+
+**CORRECTNESS:**
+- ABC class-boundary bug: classification tested the row's own cumulative INCLUDING itself, so the
+  item crossing the 80% cut was demoted (one item = 85% of revenue → class "B", zero A items).
+  Now classifies on the cumulative BEFORE the row.
+- Low stock had THREE definitions (dashboard reorder-sum, items flat ≤2 in four copies, godown
+  per-godown) → ONE rule in `lib/utils` (`lowThresholdCombined` / `lowThresholdGodown` /
+  `stockStatus`): combined ≤ max(reorderA+reorderB, 2), per-godown ≤ max(reorder_X, 2). The
+  dashboard KPI count now matches the list it links to.
+- Items page "out of stock" still counted never-stocked SKUs (the old dashboard bug survived
+  there) → now requires a stock row, matching the dashboard KPI.
+- Customer returns (Return, direction +1) were never netted: "units sold", top movers, the 14-day
+  trend, sales-register and ABC revenue all overstated demand for returned goods → netted
+  everywhere, labelled "net of returns". Sales register also gains Rate/Value columns + a Billed
+  value KPI (`transactions.rate` was captured but never displayed anywhere).
+- GST-null fallback was 18% on the dashboard but 0% in ABC → shared `DEFAULT_GST` (18%) everywhere;
+  `netRate()` guards legacy percent-valued discounts (the documented `asFraction` defence had
+  vanished from the code).
+- Dead-stock/dashboard disagreed on the exactly-90-days boundary → aligned (≥ threshold = dead).
+- IST dates: `toISOString()` stamped YESTERDAY's date between 00:00–05:30 IST on the txn form
+  default, recon commit notes, census reasons and CSV filenames → new `todayISO()` (local-time).
+- Transaction queue could DOUBLE-POST: processed rows resurrected when the post-loop bulk delete
+  failed, and two devices holding the same rows could each process them. Now each row is CLAIMED by
+  deleting it BEFORE posting (delete = cross-device lock; 0 rows deleted ⇒ another device took it),
+  restored on RPC failure. In-memory fallback rows (insert failed) are flagged `local`, survive
+  reloads, and never poison server deletes. Add-to-queue double-tap guarded; hidden form fields no
+  longer leak across action switches (a Sale's customer/rate riding into a Transfer's note); date
+  required; same-godown Transfer auto-flips; reason slugs now log as human labels.
+- Reconciliation: count-log rows were inserted `applied: true` BEFORE any stock RPC ran (an
+  immutable log asserting counts landed that may have failed) → order is now RPCs → log with
+  truthful per-item applied flags → draft wipe (a crash can no longer destroy an uncommitted,
+  unlogged count). The "log table missing" warning was being clobbered by the success toast 2s
+  later → folded into the final toast. Census no longer zeroes items whose only entry was a
+  case-size correction (the counter clearly handled the item). The pre-commit dialog now counts
+  invalid entries (they showed as "counted" then silently skipped) and states census ignores
+  filters. Drafts on archived items are purged on load (they survived every commit and would
+  resurface if the item was unarchived). Apply-one now resets stale done-flags like the bulk path,
+  pauses the poll correctly (missing effect dep), and the per-row clear/reset buttons got styled
+  confirm dialogs. "Last reconciled" paginates. SYS chips re-base when a case size is edited (the
+  three numbers on screen now reconcile). persistDraft retries with exponential backoff instead of
+  a 3-second toast loop. Mode persists per session. Print sheet prints item codes + a PARTIAL
+  banner when filters are active. Viewer read-only. Cases input disabled on case-size-0 items
+  ("no case size — count loose").
+- Pricing: staff had a full edit UI whose saves all fail (RLS is admin-only) → admin-only UI.
+  Clearing the LP and clicking away SAVED ₹0 over the real price (silent coercion; >100% discounts
+  clamped to 100 = ₹0 taxable) → hard validation, never persists a coerced value. Save failures
+  surfaced only as a 14px icon → toast + tooltip + auto-clear. "Only unpriced" no longer ejects the
+  row mid-edit after the first blur. Mouse-wheel can't corrupt focused number inputs anymore
+  (wheel → blur, also on the txn form). Full-path category filter (same-named siblings merged).
+  item_code shown. One layout rendered per breakpoint + React.memo rows (was ~1,500 live inputs).
+  Mobile FilterSheet. price_history now actually written (with the stacked breakdown).
+- Items/godowns: load errors no longer render as an empty catalogue (banner + retry); corrupt
+  persisted depth can't blank the tree; the category filter is subtree-aware ("Fans" now includes
+  "Fans › Ceiling › …"); brand/category dropdowns exclude archived-only values and gain
+  "(No brand)"/"(No category)"; bulk-move selection prunes to visible items; archiving an item with
+  stock warns with the unit count; the item form's category picker can't mount empty anymore and
+  shows an archived category labelled instead of blank; fractional GST rates survive the modal
+  round-trip; deep-link params apply once.
+- Demo mode: reconciliation drafts vanished within ~12s (the mock upsert acked with the wrong row);
+  audit log showed "Invalid Date" rows (stale shape); edge-function actions toasted false errors;
+  the demo flag was sticky localStorage (a real user who ever opened ?demo=1 stayed trapped in mock
+  mode — now per-tab sessionStorage). Mock client now supports .like/.range, in-memory
+  drafts/done/count-log/user_names, nested demo categories, notes + direction on demo txns.
+- `db/diagnostics-reconciliation-integrity.sql`: the double-applied check filtered on the dead
+  `reason` column (always 0 rows — could never fire) → reads `note`.
+
+**DESIGN CONVERGENCE (one app, one grammar):** all 13 `window.confirm`/`prompt()` call sites
+replaced with a shared styled `useConfirm()` dialog (`components/confirm-dialog.tsx` — promise
+API, danger variant, input variant for the password/name prompts; Users page no longer collects a
+NEW PASSWORD through a cleartext browser prompt). Toasts standardised (canonical position above
+the mobile tab bar — they rendered BEHIND it on Transactions/Users — z-above modals, aria-live,
+4s, timer-cancelling). Action-badge colours unified dashboard↔transactions (Adjustment=sky,
+Return=rose; raw violet collided with the brand violet). Export CSV buttons → one tertiary style;
+primary buttons → px-3.5 py-2; emerald reserved for the queue's preflight-green; Users Approve →
+brand. Table headers (py-2.5 + border-b), row hovers, brand chips, modal overlays/radii/animations
+(EditStock ≠ ItemForm fixed), shimmer loading states replacing "Loading…" text, KPI numbers wear
+font-display everywhere, dashboard error banner + Retry, charts re-skin live on theme toggle +
+en-IN tooltips, reports print correctly (toolbars hidden, desktop table forced at print width —
+it used to print the mobile cards), sticky toolbars on items/godown/recon, status chips replace
+the items Status select on desktop, slim colour strip halves item-card height, carton/loose split
+shown on items surfaces (project rule), Escape closes every modal, icon-only buttons labelled,
+settings stops disclosing the Supabase project ref, sidebar hides Categories from non-admins
+(it dead-ended at the admin wall), More page shows "super admin", pin-gate/login border weights
+aligned, unicode-aware search (Devanagari model names were unsearchable).
+
+**Files:** every page in `app/`, most of `components/`, `lib/{supabase,utils,categories,demo,demo-data}.ts`,
+NEW `lib/hooks.ts` + `components/confirm-dialog.tsx`, `db/2026-06-10-hardening-fixes.sql` (run it),
+`supabase/functions/master-login/index.ts` (CORS — redeploy optional, throttle works without it).
+
+---
+
 ### 2026-06-10 — Count log (permanent per-counter records) + note-column fix + CSV exports + recovery
 
 **The incident that drove it:** after the 2026-06-09 commit, 56 items still held stock with no way to

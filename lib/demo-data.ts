@@ -17,13 +17,18 @@ function tsAgo(n: number, hour = 11): string {
 }
 
 // ── Categories ─────────────────────────────────────────────────────────────
-export const CATEGORIES = [
-  { id: "cat-wires", name: "Wires & Cables", parent_id: null, archived: false, sort: 1 },
-  { id: "cat-switches", name: "Switches & Plates", parent_id: null, archived: false, sort: 2 },
-  { id: "cat-mcb", name: "MCBs & Distribution", parent_id: null, archived: false, sort: 3 },
-  { id: "cat-light", name: "LED Lighting", parent_id: null, archived: false, sort: 4 },
-  { id: "cat-fans", name: "Fans", parent_id: null, archived: false, sort: 5 },
-  { id: "cat-sockets", name: "Sockets & Plugs", parent_id: null, archived: false, sort: 6 },
+// Shape mirrors public.categories (parent_id + sort_order, see lib/categories).
+// The Fans branch nests two levels deep so the unlimited-depth tree demos.
+export const CATEGORIES: { id: string; name: string; parent_id: string | null; archived: boolean; sort_order: number }[] = [
+  { id: "cat-wires", name: "Wires & Cables", parent_id: null, archived: false, sort_order: 1 },
+  { id: "cat-switches", name: "Switches & Plates", parent_id: null, archived: false, sort_order: 2 },
+  { id: "cat-mcb", name: "MCBs & Distribution", parent_id: null, archived: false, sort_order: 3 },
+  { id: "cat-light", name: "LED Lighting", parent_id: null, archived: false, sort_order: 4 },
+  { id: "cat-fans", name: "Fans", parent_id: null, archived: false, sort_order: 5 },
+  { id: "cat-fans-ceiling", name: "Ceiling", parent_id: "cat-fans", archived: false, sort_order: 1 },
+  { id: "cat-fans-ceiling-bldc", name: "BLDC", parent_id: "cat-fans-ceiling", archived: false, sort_order: 1 },
+  { id: "cat-fans-exhaust", name: "Exhaust", parent_id: "cat-fans", archived: false, sort_order: 2 },
+  { id: "cat-sockets", name: "Sockets & Plugs", parent_id: null, archived: false, sort_order: 6 },
 ];
 
 // ── Items (24, four per category) ────────────────────────────────────────────
@@ -106,15 +111,21 @@ export const PRICING = ITEMS.map((it) => ({
   effective_from: tsAgo(60),
 }));
 
-// ── Transactions over the last ~28 days (sales + purchases) ──────────────────
+// ── Transactions over the last ~28 days (sales + purchases + returns) ────────
 const ACTIONS = ["Sale", "Sale", "Sale", "Purchase", "Sale", "Transfer", "Sale", "Adjustment"] as const;
 export const TRANSACTIONS = Array.from({ length: 46 }).map((_, k) => {
   const it = ITEMS[(k * 7) % ITEMS.length];
-  const action = ACTIONS[k % ACTIONS.length];
+  // A couple of customer returns (direction +1) so the reports' netting demos.
+  const action: (typeof ACTIONS)[number] | "Return" =
+    k === 10 || k === 26 ? "Return" : ACTIONS[k % ACTIONS.length];
   const day = (k * 3) % 28;             // spread across 28 days
   const godown = (k % 2 === 0 ? "A" : "B") as "A" | "B";
-  const qty = 2 + ((k * 11) % 40);
-  const dir: 1 | -1 = action === "Purchase" ? 1 : -1;
+  const qty = action === "Return" ? 1 + (k % 3) : 2 + ((k * 11) % 40);
+  // Direction follows the action: stock IN (+1) for Purchase and customer
+  // Return, OUT (−1) for Sale / Transfer-out; Adjustments swing both ways.
+  const dir: 1 | -1 =
+    action === "Purchase" || action === "Return" ? 1 :
+    action === "Adjustment" ? (k % 16 === 7 ? 1 : -1) : -1;
   return {
     id: `txn-${String(k + 1).padStart(3, "0")}`,
     item_id: it.id,
@@ -127,7 +138,12 @@ export const TRANSACTIONS = Array.from({ length: 46 }).map((_, k) => {
     reverses_id: null as string | null,
     party_id: null as string | null,
     invoice_no: action === "Sale" ? `INV/${2026}/${1200 + k}` : action === "Purchase" ? `PO/${800 + k}` : null,
-    reason: action === "Adjustment" ? "Cycle count correction" : null,
+    // `reason` is vestigial in the real schema — process_transaction writes its
+    // reason into `note`. Adjustment rows carry "Reconciliation <date>" notes so
+    // the reconciliation page's "Last reconciled" line (note LIKE
+    // 'Reconciliation%') demos correctly.
+    reason: null as string | null,
+    note: action === "Adjustment" ? `Reconciliation ${isoDate(daysAgo(day))}` : null,
     rate: null as number | null,
     created_by: "demo-user",
     created_at: tsAgo(day, 9 + (k % 9)),
@@ -142,21 +158,21 @@ export const USER_PROFILES = [
 ];
 
 // ── Audit log (a few representative entries) ─────────────────────────────────
+// Shape mirrors public.audit_log exactly as app/audit/page.tsx reads it:
+// { id, user_id, occurred_at, table_name, row_id, operation }. user_id values
+// match USER_PROFILES ids so the page resolves display names.
 export const AUDIT_LOG = TRANSACTIONS.slice(0, 12).map((t, i) => ({
-  id: `aud-${i}`,
-  actor: i % 2 ? "Counter Staff" : "Demo Admin",
-  action: t.action === "Sale" ? "process_transaction" : t.action === "Purchase" ? "process_transaction" : "update_item",
-  entity: "transactions",
-  entity_id: t.id,
-  detail: `${t.action} · ${t.qty} units · Godown ${t.godown}`,
-  created_at: t.created_at,
+  id: i + 1,
+  user_id: i % 2 ? "demo-staff" : "demo-user",
+  occurred_at: t.created_at,
+  table_name: t.action === "Adjustment" ? "godown_stock" : "transactions",
+  row_id: t.id,
+  operation: (i === 11 ? "DELETE" : t.action === "Adjustment" ? "UPDATE" : "INSERT") as "INSERT" | "UPDATE" | "DELETE",
 }));
 
-export const RECONCILIATION_DRAFTS = [
-  { id: "rec-1", name: "Diwali stock count — Godown A", godown: "A", status: "open", created_by: "demo-user", created_at: tsAgo(4), lines: [] },
-];
-
-// Map a table name → its mock rows.
+// Map a table name → its mock rows. Reconciliation drafts/done/count-log and
+// the transaction queue are NOT seeded here — lib/demo.ts answers those from
+// per-tab in-memory stores so demo writes round-trip.
 export const DEMO_TABLES: Record<string, any[]> = {
   items: ITEMS,
   godown_stock: STOCK,
@@ -165,5 +181,4 @@ export const DEMO_TABLES: Record<string, any[]> = {
   categories: CATEGORIES,
   user_profiles: USER_PROFILES,
   audit_log: AUDIT_LOG,
-  reconciliation_drafts: RECONCILIATION_DRAFTS,
 };

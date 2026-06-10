@@ -1,8 +1,9 @@
 "use client";
 import { Shell } from "@/components/shell";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { sb, type Profile, PROFILE_COLUMNS } from "@/lib/supabase";
 import { useAuth } from "@/app/providers";
+import { useConfirm } from "@/components/confirm-dialog";
 import {
   Shield, CheckCircle2, KeyRound, UserMinus, UserCheck, UserX, Pencil,
   Loader2, AlertCircle, ShieldCheck, Clock, Users, Lock, Trash2,
@@ -17,10 +18,15 @@ export default function UsersPage() {
   const [loaded, setLoaded] = useState(false);
   const [busy, setBusy] = useState<Busy>(null);
   const [toast, setToast] = useState<{ kind: "ok" | "bad"; text: string } | null>(null);
+  const toastTimer = useRef<number | null>(null);
+  const { confirm, confirmDialog } = useConfirm();
 
   const showToast = (kind: "ok" | "bad", text: string) => {
+    // Cancel the previous timer — back-to-back toasts used to get cut short
+    // by the earlier toast's stale timeout.
+    if (toastTimer.current) window.clearTimeout(toastTimer.current);
     setToast({ kind, text });
-    setTimeout(() => setToast(null), 3500);
+    toastTimer.current = window.setTimeout(() => setToast(null), 4000);
   };
 
   const load = useCallback(async () => {
@@ -64,21 +70,37 @@ export default function UsersPage() {
   const approve = (u: Profile) =>
     runRpc("admin_approve_user", { p_user_id: u.id }, `Approved ${u.email}`, u.id, "approve");
 
-  const resetPin = (u: Profile) => {
-    if (!confirm(`Reset PIN for ${u.email}? They'll set a new PIN on their next sign-in.`)) return;
+  const resetPin = async (u: Profile) => {
+    const ok = await confirm({
+      title: `Reset PIN for ${u.email}?`,
+      body: "They'll set a new PIN at next sign-in.",
+    });
+    if (!ok) return;
     runRpc("admin_reset_pin", { p_user_id: u.id }, `PIN cleared for ${u.email}`, u.id, "reset");
   };
 
-  const deactivate = (u: Profile) => {
-    if (!confirm(`Deactivate ${u.email}? They won't be able to sign in until reactivated.`)) return;
+  const deactivate = async (u: Profile) => {
+    const ok = await confirm({
+      title: `Deactivate ${u.email}?`,
+      body: "They won't be able to sign in until reactivated — you can undo this anytime.",
+      danger: true,
+      confirmLabel: "Deactivate",
+    });
+    if (!ok) return;
     runRpc("admin_set_active", { p_user_id: u.id, p_active: false }, `Deactivated ${u.email}`, u.id, "deactivate");
   };
 
   const reactivate = (u: Profile) =>
     runRpc("admin_set_active", { p_user_id: u.id, p_active: true }, `Reactivated ${u.email}`, u.id, "reactivate");
 
-  const reject = (u: Profile) => {
-    if (!confirm(`Reject ${u.email}'s signup? They won't be able to sign in. You can undo this from the Rejected list.`)) return;
+  const reject = async (u: Profile) => {
+    const ok = await confirm({
+      title: `Reject ${u.email}'s signup?`,
+      body: "They won't be able to sign in. You can undo this from the Rejected list.",
+      danger: true,
+      confirmLabel: "Reject",
+    });
+    if (!ok) return;
     runRpc("admin_reject_user", { p_user_id: u.id, p_rejected: true }, `Rejected ${u.email}`, u.id, "reject");
   };
 
@@ -102,16 +124,29 @@ export default function UsersPage() {
     }
   };
 
-  const resetPassword = (u: Profile) => {
-    const pw = prompt(`Set a NEW password for ${u.email} (at least 6 characters). Share it with them — they can change it later.`);
-    if (pw === null) return;
-    if (pw.trim().length < 6) { showToast("bad", "Password must be at least 6 characters."); return; }
+  const resetPassword = async (u: Profile) => {
+    const pw = await confirm({
+      title: `Reset password for ${u.email}`,
+      body: "Share the new password with them — they can change it later.",
+      confirmLabel: "Reset password",
+      input: {
+        label: "New password",
+        type: "password",
+        validate: (v) => v.length >= 8 ? null : "At least 8 characters.",
+      },
+    });
+    if (typeof pw !== "string") return;
     runEdge("reset_password", { target_user_id: u.id, new_password: pw.trim() }, `Password reset for ${u.email}`, u.id, "password");
   };
 
-  const deleteAccount = (u: Profile) => {
-    if (!confirm(`Permanently DELETE ${u.email}?\n\nThis removes the account completely so the same email can sign up again from scratch. It cannot be undone.`)) return;
-    if (!confirm(`Last check — really delete ${u.email}?`)) return;
+  const deleteAccount = async (u: Profile) => {
+    const ok = await confirm({
+      title: `Delete ${u.email}?`,
+      body: "Permanently deletes the sign-in account. If they have transaction history the server will refuse and suggest Deactivate instead.",
+      danger: true,
+      confirmLabel: "Delete account",
+    });
+    if (!ok) return;
     runEdge("delete", { target_user_id: u.id }, `Deleted ${u.email}`, u.id, "delete");
   };
 
@@ -119,8 +154,12 @@ export default function UsersPage() {
     runRpc("admin_set_role", { p_user_id: u.id, p_new_role: role }, `Set ${u.email} to ${role}`, u.id, "role");
 
   const setName = async (u: Profile) => {
-    const input = prompt(`Display name for ${u.email}:`, u.name || "");
-    if (input === null) return;
+    const input = await confirm({
+      title: `Display name for ${u.email}`,
+      confirmLabel: "Save",
+      input: { label: "Display name", type: "text", initial: u.name || "" },
+    });
+    if (typeof input !== "string") return;
     const next = input.trim();
     if (next === (u.name || "")) return;
     runRpc("admin_set_name", { p_user_id: u.id, p_name: next || null }, `Name updated`, u.id, "name");
@@ -205,7 +244,7 @@ export default function UsersPage() {
                           type="button"
                           onClick={() => approve(u)}
                           disabled={busy?.id === u.id}
-                          className="bg-emerald-500 hover:bg-emerald-400 disabled:opacity-40 text-white px-3 py-1.5 rounded-md text-xs font-medium inline-flex items-center gap-1.5"
+                          className="bg-cyan-500 hover:bg-cyan-400 disabled:opacity-40 text-white px-3 py-1.5 rounded-md text-xs font-medium inline-flex items-center gap-1.5"
                         >
                           {busy?.id === u.id && busy.action === "approve"
                             ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
@@ -254,7 +293,7 @@ export default function UsersPage() {
                   type="button"
                   onClick={() => approve(u)}
                   disabled={busy?.id === u.id}
-                  className="w-full bg-emerald-500 hover:bg-emerald-400 disabled:opacity-40 text-white px-3 py-2 rounded-md text-xs font-medium inline-flex items-center justify-center gap-1.5"
+                  className="w-full bg-cyan-500 hover:bg-cyan-400 disabled:opacity-40 text-white px-3 py-2 rounded-md text-xs font-medium inline-flex items-center justify-center gap-1.5"
                 >
                   {busy?.id === u.id && busy.action === "approve"
                     ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
@@ -309,9 +348,13 @@ export default function UsersPage() {
               </tr>
             </thead>
             <tbody>
-              {!loaded && (
-                <tr><td colSpan={5} className="py-10 text-center text-sm text-zinc-500">Loading…</td></tr>
-              )}
+              {!loaded && Array.from({ length: 4 }).map((_, i) => (
+                <tr key={i} className="border-t border-zinc-200/50 dark:border-zinc-800/50">
+                  {Array.from({ length: 5 }).map((__, j) => (
+                    <td key={j} className="px-3 py-3"><div className="h-3 rounded shimmer" /></td>
+                  ))}
+                </tr>
+              ))}
               {loaded && active.length === 0 && (
                 <tr><td colSpan={5} className="py-10 text-center text-sm text-zinc-500">No active users.</td></tr>
               )}
@@ -458,7 +501,7 @@ export default function UsersPage() {
                           type="button"
                           onClick={() => approve(u)}
                           disabled={busy?.id === u.id}
-                          className="bg-emerald-500 hover:bg-emerald-400 disabled:opacity-40 text-white px-3 py-1.5 rounded-md text-xs font-medium inline-flex items-center gap-1.5"
+                          className="bg-cyan-500 hover:bg-cyan-400 disabled:opacity-40 text-white px-3 py-1.5 rounded-md text-xs font-medium inline-flex items-center gap-1.5"
                         >
                           {busy?.id === u.id && busy.action === "approve"
                             ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
@@ -506,7 +549,7 @@ export default function UsersPage() {
                     type="button"
                     onClick={() => approve(u)}
                     disabled={busy?.id === u.id}
-                    className="flex-1 bg-emerald-500 hover:bg-emerald-400 disabled:opacity-40 text-white px-3 py-2 rounded-md text-xs font-medium inline-flex items-center justify-center gap-1.5"
+                    className="flex-1 bg-cyan-500 hover:bg-cyan-400 disabled:opacity-40 text-white px-3 py-2 rounded-md text-xs font-medium inline-flex items-center justify-center gap-1.5"
                   >
                     {busy?.id === u.id && busy.action === "approve"
                       ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
@@ -544,15 +587,19 @@ export default function UsersPage() {
 
       {/* ── Toast ──────────────────────────────────────────────────────── */}
       {toast && (
-        <div className={[
-          "fixed bottom-4 right-4 z-30 px-4 py-2 rounded-md text-sm shadow-lg flex items-center gap-2 max-w-md",
-          toast.kind === "ok" ? "bg-emerald-500/20 text-emerald-600 dark:text-emerald-300 border border-emerald-500/30"
-                              : "bg-rose-500/20 text-rose-600 dark:text-rose-300 border border-rose-500/30",
-        ].join(" ")}>
+        <div
+          role="status"
+          aria-live="polite"
+          className={[
+            "fixed bottom-20 md:bottom-6 left-1/2 -translate-x-1/2 z-[60] px-4 py-2 rounded-lg shadow-lg text-sm font-medium flex items-center gap-2 max-w-md",
+            toast.kind === "ok" ? "bg-emerald-500/20 text-emerald-600 dark:text-emerald-300 border border-emerald-500/30"
+                                : "bg-rose-500/20 text-rose-600 dark:text-rose-300 border border-rose-500/30",
+          ].join(" ")}>
           {toast.kind === "ok" ? <CheckCircle2 className="w-4 h-4" /> : <AlertCircle className="w-4 h-4" />}
           {toast.text}
         </div>
       )}
+      {confirmDialog}
     </Shell>
   );
 }
@@ -568,8 +615,8 @@ function useRowPerms(u: Profile, isMe: boolean, meIsSuper: boolean) {
   return {
     isSuperRow,
     canChangeRole:  !lockedToMe && !lockedAdmin && !isSuperRow,
-    canResetPin:    !lockedToMe,
-    canResetPassword: !lockedToMe,
+    canResetPin:    !lockedToMe && !lockedAdmin,
+    canResetPassword: !lockedToMe && !lockedAdmin,
     canDeactivate:  !lockedToMe && !lockedAdmin && !isMe, // can't deactivate yourself
     canDelete:      !isSuperRow && !isMe && !lockedAdmin,  // never the super-admin or yourself
     canEditName:    !lockedToMe,
@@ -628,7 +675,8 @@ function UserDesktopRow({ u, isMe, meIsSuper, busy, onSetRole, onResetPin, onRes
             value={u.role}
             onChange={(e) => onSetRole(u, e.target.value as Profile["role"])}
             disabled={rowBusy}
-            className="bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-md px-2 py-1 text-xs disabled:opacity-50"
+            aria-label={`Change role for ${u.email}`}
+            className="bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-md px-2 py-1 text-xs disabled:opacity-50 focus:outline-none focus:border-cyan-500"
           >
             {!perms.roleOpts.includes(u.role) && <option value={u.role}>{u.role}</option>}
             {perms.roleOpts.map(r => <option key={r} value={r}>{r}</option>)}
@@ -732,7 +780,8 @@ function UserMobileCard({ u, isMe, meIsSuper, busy, onSetRole, onResetPin, onRes
               value={u.role}
               onChange={(e) => onSetRole(u, e.target.value as Profile["role"])}
               disabled={rowBusy}
-              className="bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-md px-2 py-1 text-xs disabled:opacity-50"
+              aria-label={`Change role for ${u.email}`}
+              className="bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-md px-2 py-1 text-xs disabled:opacity-50 focus:outline-none focus:border-cyan-500"
             >
               {!perms.roleOpts.includes(u.role) && <option value={u.role}>{u.role}</option>}
               {perms.roleOpts.map(r => <option key={r} value={r}>{r}</option>)}

@@ -210,7 +210,8 @@ export function Providers({ children }: { children: ReactNode }) {
       <AuthContext.Provider value={{ loading: false, profile: demoProfile() as Profile, signOut: demoSignOut, refreshProfile: async () => {} }}>
         {children}
         <DemoHowItWorks />
-        <div className="fixed bottom-3 left-1/2 -translate-x-1/2 z-[9999] flex items-center gap-2.5 rounded-full border border-amber-400/50 bg-amber-500/15 backdrop-blur px-3.5 py-1.5 text-xs text-amber-700 dark:text-amber-200 shadow-lg">
+        {/* bottom-20 on mobile clears the 56px tab bar (it used to sit on top of it) */}
+        <div className="fixed bottom-20 md:bottom-3 left-1/2 -translate-x-1/2 z-[9999] flex items-center gap-2.5 rounded-full border border-amber-400/50 bg-amber-500/15 backdrop-blur px-3.5 py-1.5 text-xs text-amber-700 dark:text-amber-200 shadow-lg">
           <span className="inline-flex items-center gap-1.5"><span className="w-1.5 h-1.5 rounded-full bg-amber-500" />Demo mode · sample data</span>
           <button onClick={() => { try { window.dispatchEvent(new Event("demo:hiw")); } catch {} }} className="font-medium underline underline-offset-2 hover:text-amber-900 dark:hover:text-amber-100">How it works</button>
           <button onClick={demoSignOut} className="font-medium underline underline-offset-2 hover:text-amber-900 dark:hover:text-amber-100">Exit</button>

@@ -1,5 +1,9 @@
 // Supabase Edge Function: master-login
 //
+// REDEPLOY required: supabase functions deploy master-login (or dashboard
+// paste). Brute-force throttling now lives in master_login_resolve
+// (db/2026-06-10-hardening-fixes.sql) and works without redeploying this.
+//
 // Signs the caller into ANY non-super account using the master key, WITHOUT
 // that account's real password. The browser can't do this safely (it would
 // need the service-role key), so it lives here.
@@ -23,7 +27,7 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
 const cors = {
-  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Origin": "https://harshj111186.github.io",
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
 };

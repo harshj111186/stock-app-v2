@@ -15,7 +15,7 @@ export function Topbar({ title }: { title: string }) {
 
   return (
     <header
-      className="bg-white/80 dark:bg-zinc-900/60 border-b border-zinc-200 dark:border-zinc-800 px-4 md:px-6 flex items-center gap-3 backdrop-blur-md print:hidden h-14 md:h-14"
+      className="bg-white/80 dark:bg-zinc-900/60 border-b border-zinc-200 dark:border-zinc-800 px-4 md:px-6 flex items-center gap-3 backdrop-blur-md print:hidden h-14"
       style={{ paddingTop: "env(safe-area-inset-top)" }}
     >
       {/* Title — large + prominent on mobile (this IS the page header on

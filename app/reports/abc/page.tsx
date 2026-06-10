@@ -6,8 +6,8 @@ import {
 import dynamic from "next/dynamic";
 import { Shell } from "@/components/shell";
 import { ReportsSubnav } from "@/components/reports-subnav";
-import { sb, type Item, type Pricing, type Txn } from "@/lib/supabase";
-import { fmtN, fmtMoney } from "@/lib/utils";
+import { sb, fetchAllRows, type Item, type Pricing, type Txn } from "@/lib/supabase";
+import { fmtN, fmtMoney, csvSafe, DEFAULT_GST } from "@/lib/utils";
 
 // Recharts lives only in this report; lazy-load it so it stays off the route's
 // initial bundle.
@@ -77,15 +77,18 @@ const PRESETS: { v: Preset; l: string }[] = [
   { v: "custom", l: "Custom range" },
 ];
 
+// Append T00:00:00 so the YYYY-MM-DD string is parsed as local time, not UTC.
+// Slice to 10 chars first so a full timestamp input doesn't produce
+// "…T08:00:00T00:00:00" → Invalid Date.
 const fmtDateDisplay = (iso: string) => {
   if (!iso) return "";
-  return new Date(iso + "T00:00:00").toLocaleDateString("en-IN", {
+  return new Date(iso.slice(0, 10) + "T00:00:00").toLocaleDateString("en-IN", {
     day: "2-digit", month: "short", year: "numeric",
   });
 };
 
 // Defensive cap so a This-FY pull on a busy shop doesn't yank the universe.
-const LIMIT = 10000;
+const LIMIT = 20000;
 
 // Default ABC cuts. These are the classic 80/95 Pareto buckets — A drives
 // the first 80% of revenue, B the next 15% (80→95), C the trailing 5%.
@@ -99,13 +102,23 @@ type Row = {
   brand: string;
   category: string;
   itemLabel: string;
-  units: number;
+  units: number;      // active sales − active customer returns in range
   rate: number;       // per-unit selling rate (₹) at current pricing
   revenue: number;    // units × rate
   pctShare: number;   // revenue / totalRevenue × 100
   cumPct: number;     // cumulative pct, sorted by revenue desc
+  rank: number;       // GLOBAL revenue rank in the full sorted list (1-based)
   cls: "A" | "B" | "C";
   hasPricing: boolean;
+};
+
+// Raw fetch results, kept in state so classification/pricing can be derived
+// client-side (changing rate basis or the A/B cuts must NOT refetch).
+type RawData = {
+  unitsById: Map<string, number>;
+  itemMap: Map<string, Item>;
+  priceMap: Map<string, Pricing>;
+  catMap: Map<string, string>;
 };
 
 // Two ways to read "rate": exclude GST (most common for sales-contribution
@@ -114,44 +127,87 @@ type Row = {
 type RateBasis = "exGst" | "inclGst";
 
 export default function ABCAnalysisPage() {
-  const [preset, setPreset] = useState<Preset>("thisFY");
-  const [customFrom, setCustomFrom] = useState(fmtISO(indianFYStart(now())));
-  const [customTo, setCustomTo] = useState(fmtISO(now()));
-  const [aCut, setACut] = useState<number>(DEFAULT_A_CUT);
-  const [bCut, setBCut] = useState<number>(DEFAULT_B_CUT);
-  const [rateBasis, setRateBasis] = useState<RateBasis>("exGst");
+  // Persisted state restores LAZILY (not in a post-mount effect) so the first
+  // fetch already uses the saved range — no double fetch on mount.
+  const [preset, setPreset] = useState<Preset>(() => {
+    try {
+      if (typeof window === "undefined") return "thisFY";
+      return (localStorage.getItem("abc.preset") as Preset | null) ?? "thisFY";
+    } catch { return "thisFY"; }
+  });
+  const [customFrom, setCustomFrom] = useState<string>(() => {
+    try {
+      if (typeof window === "undefined") return fmtISO(indianFYStart(now()));
+      return localStorage.getItem("abc.customFrom") ?? fmtISO(indianFYStart(now()));
+    } catch { return fmtISO(indianFYStart(now())); }
+  });
+  const [customTo, setCustomTo] = useState<string>(() => {
+    try {
+      if (typeof window === "undefined") return fmtISO(now());
+      return localStorage.getItem("abc.customTo") ?? fmtISO(now());
+    } catch { return fmtISO(now()); }
+  });
+  const [aCut, setACut] = useState<number>(() => {
+    try {
+      if (typeof window === "undefined") return DEFAULT_A_CUT;
+      const a = Number(localStorage.getItem("abc.aCut"));
+      return Math.min(99, Math.max(1, a || DEFAULT_A_CUT));
+    } catch { return DEFAULT_A_CUT; }
+  });
+  const [bCut, setBCut] = useState<number>(() => {
+    try {
+      if (typeof window === "undefined") return DEFAULT_B_CUT;
+      const b = Number(localStorage.getItem("abc.bCut"));
+      const clamped = Math.min(100, Math.max(1, b || DEFAULT_B_CUT));
+      // Keep the pair valid even if localStorage holds a stale combination.
+      return clamped <= aCut ? Math.min(aCut + 1, 99) : clamped;
+    } catch { return DEFAULT_B_CUT; }
+  });
+  // The number inputs edit a free-typed draft; the real cuts only commit (and
+  // clamp) on blur — otherwise typing "8" on the way to "85" snaps around.
+  const [aCutDraft, setACutDraft] = useState<string>(() => String(aCut));
+  const [bCutDraft, setBCutDraft] = useState<string>(() => String(bCut));
+  const [rateBasis, setRateBasis] = useState<RateBasis>(() => {
+    try {
+      if (typeof window === "undefined") return "exGst";
+      const rb = localStorage.getItem("abc.rateBasis");
+      return rb === "exGst" || rb === "inclGst" ? rb : "exGst";
+    } catch { return "exGst"; }
+  });
   const [query, setQuery] = useState("");
   const [classFilter, setClassFilter] = useState<"all" | "A" | "B" | "C">("all");
   const [brandFilter, setBrandFilter] = useState("");
   const [categoryFilter, setCategoryFilter] = useState("");
+
+  const commitACut = () => {
+    const a = Math.min(99, Math.max(1, Number(aCutDraft) || DEFAULT_A_CUT));
+    setACut(a);
+    setACutDraft(String(a));
+    if (bCut <= a) {
+      const b = Math.min(a + 1, 99);
+      setBCut(b);
+      setBCutDraft(String(b));
+    }
+  };
+  const commitBCut = () => {
+    let b = Math.min(100, Math.max(1, Number(bCutDraft) || DEFAULT_B_CUT));
+    if (b <= aCut) b = Math.min(aCut + 1, 99);
+    setBCut(b);
+    setBCutDraft(String(b));
+  };
 
   const { from, to } = useMemo(
     () => rangeFor(preset, customFrom, customTo),
     [preset, customFrom, customTo]
   );
 
-  const [rows, setRows] = useState<Row[]>([]);
+  const [raw, setRaw] = useState<RawData | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [hitLimit, setHitLimit] = useState(false);
 
   // Persist filter state so a refresh keeps the user where they were.
-  useEffect(() => {
-    try {
-      const p = localStorage.getItem("abc.preset");
-      if (p) setPreset(p as Preset);
-      const f = localStorage.getItem("abc.customFrom");
-      if (f) setCustomFrom(f);
-      const t = localStorage.getItem("abc.customTo");
-      if (t) setCustomTo(t);
-      const a = localStorage.getItem("abc.aCut");
-      if (a) setACut(Number(a) || DEFAULT_A_CUT);
-      const b = localStorage.getItem("abc.bCut");
-      if (b) setBCut(Number(b) || DEFAULT_B_CUT);
-      const rb = localStorage.getItem("abc.rateBasis");
-      if (rb === "exGst" || rb === "inclGst") setRateBasis(rb);
-    } catch { /* ignore */ }
-  }, []);
+  // (Restore happens in the lazy initializers above.)
   useEffect(() => { try { localStorage.setItem("abc.preset", preset); } catch {} }, [preset]);
   useEffect(() => { try { localStorage.setItem("abc.customFrom", customFrom); } catch {} }, [customFrom]);
   useEffect(() => { try { localStorage.setItem("abc.customTo", customTo); } catch {} }, [customTo]);
@@ -159,7 +215,8 @@ export default function ABCAnalysisPage() {
   useEffect(() => { try { localStorage.setItem("abc.bCut", String(bCut)); } catch {} }, [bCut]);
   useEffect(() => { try { localStorage.setItem("abc.rateBasis", rateBasis); } catch {} }, [rateBasis]);
 
-  // ── Fetch on range / basis change ─────────────────────────────────────
+  // ── Fetch on range change ONLY — rate basis and the A/B cuts re-derive
+  //    client-side from the stored raws (see the `rows` memo below). ──────
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -169,140 +226,161 @@ export default function ABCAnalysisPage() {
       try {
         const c = sb();
 
-        // 1) All Sale rows in range. Direction is irrelevant — every Sale row
-        //    is a customer-outbound by definition; the SQL records qty as a
-        //    positive number with action='Sale'. Reversal handling kicks in
-        //    via the second query below.
-        const { data: sales, error: e1 } = await c
-          .from("transactions")
-          .select("id, item_id, qty, txn_date, reverses_id, action")
-          .eq("action", "Sale")
-          .gte("txn_date", from)
-          .lte("txn_date", to)
-          .limit(LIMIT);
-        if (e1) throw e1;
+        // 1) All Sale + Return rows in range, paged past PostgREST's silent
+        //    1,000-row clamp. Sale direction is irrelevant — every Sale row
+        //    is a customer-outbound by definition. Return rows with
+        //    direction +1 are customer returns and net AGAINST sold units.
+        const { rows: txns, error: e1, truncated } = await fetchAllRows<{
+          id: string; item_id: string; qty: number; txn_date: string;
+          reverses_id: string | null; action: Txn["action"]; direction: 1 | -1 | null;
+        }>(
+          (f, t) => c
+            .from("transactions")
+            .select("id, item_id, qty, txn_date, reverses_id, action, direction")
+            .in("action", ["Sale", "Return"])
+            .gte("txn_date", from)
+            .lte("txn_date", to)
+            .order("txn_date")
+            .order("id")
+            .range(f, t),
+          { maxRows: LIMIT }
+        );
+        if (e1) throw new Error(e1);
         if (cancelled) return;
-        if (sales && sales.length === LIMIT) setHitLimit(true);
+        setHitLimit(truncated);
 
-        const saleIds = (sales || []).map((s: any) => s.id as string);
+        const saleTxns = txns.filter(t => t.action === "Sale");
+        const returnTxns = txns.filter(t => t.action === "Return" && t.direction === 1);
 
-        // 2) Anything pointing back at these sales (reversals). Action /
+        // 2) Anything pointing back at these rows (reversals). Action /
         //    date unconstrained — a May sale reversed in July still needs
-        //    its May row dropped from totals.
-        let reversedIds = new Set<string>();
-        if (saleIds.length > 0) {
+        //    its May row dropped from totals. Chunked 200 ids at a time so
+        //    the .in() URL stays small and the result stays under the
+        //    1,000-row clamp.
+        const lookupIds = [...saleTxns, ...returnTxns].map(t => t.id);
+        const reversedIds = new Set<string>();
+        for (let i = 0; i < lookupIds.length; i += 200) {
           const { data: revs, error: e2 } = await c
             .from("transactions")
             .select("reverses_id")
-            .in("reverses_id", saleIds);
+            .in("reverses_id", lookupIds.slice(i, i + 200));
           if (e2) throw e2;
           if (cancelled) return;
-          reversedIds = new Set((revs || []).map((r: any) => r.reverses_id as string));
+          for (const r of (revs || []) as Array<{ reverses_id: string | null }>) {
+            if (r.reverses_id) reversedIds.add(r.reverses_id);
+          }
         }
 
-        // 3) Catalogue + pricing + categories. We need every item that sold
-        //    (for labels) — load the full catalogue so brand/category filters
-        //    work even on items with zero sales in the range.
-        const [{ data: items, error: e3 }, { data: pricing, error: e4 }, { data: cats, error: e5 }] =
-          await Promise.all([
-            c.from("items").select("*").eq("archived", false),
-            c.from("pricing").select("*"),
-            c.from("categories").select("id, name"),
-          ]);
-        if (e3) throw e3;
-        if (e4) throw e4;
-        if (e5) throw e5;
+        // 3) Catalogue + pricing + categories, all paged. Archived items are
+        //    INCLUDED — an archived item that sold in the range must keep its
+        //    revenue and label (flagged "(archived)" when building rows).
+        const [itemsRes, pricingRes, catsRes] = await Promise.all([
+          fetchAllRows<Item>((f, t) =>
+            c.from("items").select("*").order("id").range(f, t)),
+          fetchAllRows<Pricing>((f, t) =>
+            c.from("pricing").select("*").order("item_id").range(f, t)),
+          fetchAllRows<{ id: string; name: string }>((f, t) =>
+            c.from("categories").select("id, name").order("id").range(f, t)),
+        ]);
+        if (itemsRes.error) throw new Error(itemsRes.error);
+        if (pricingRes.error) throw new Error(pricingRes.error);
+        if (catsRes.error) throw new Error(catsRes.error);
         if (cancelled) return;
 
-        const itemMap = new Map<string, Item>(
-          (items || []).map((i: any) => [i.id as string, i as Item])
-        );
-        const priceMap = new Map<string, Pricing>(
-          (pricing || []).map((p: any) => [p.item_id as string, p as Pricing])
-        );
-        const catMap = new Map<string, string>(
-          (cats || []).map((c: any) => [c.id as string, c.name as string])
-        );
+        const itemMap = new Map<string, Item>(itemsRes.rows.map(i => [i.id, i]));
+        const priceMap = new Map<string, Pricing>(pricingRes.rows.map(p => [p.item_id, p]));
+        const catMap = new Map<string, string>(catsRes.rows.map(x => [x.id, x.name]));
 
-        // 4) Aggregate active sale qty per item_id.
+        // 4) Aggregate NET active units per item_id: active sales minus
+        //    active customer returns. Reversal pairs drop out of both sides.
         const unitsById = new Map<string, number>();
-        for (const s of (sales || []) as Array<{ id: string; item_id: string; qty: number; reverses_id: string | null }>) {
-          // Skip reversal rows (they ARE the inverse) and skip originals that
-          // were later reversed.
+        for (const s of saleTxns) {
           if (s.reverses_id) continue;
           if (reversedIds.has(s.id)) continue;
           unitsById.set(s.item_id, (unitsById.get(s.item_id) || 0) + s.qty);
         }
-
-        // 5) Build per-item revenue rows. Items that sold but have no pricing
-        //    record contribute 0 revenue but are still listed — flagged.
-        const built: Omit<Row, "pctShare" | "cumPct" | "cls">[] = [];
-        for (const [itemId, units] of unitsById) {
-          const item = itemMap.get(itemId);
-          const price = priceMap.get(itemId);
-          const hasPricing = !!price && (price.lp ?? 0) > 0;
-          const baseRate = hasPricing
-            ? price!.lp * (1 - (price!.discount || 0))
-            : 0;
-          const rate = rateBasis === "inclGst"
-            ? baseRate * (1 + (price?.gst_rate ?? 0))
-            : baseRate;
-          const revenue = units * rate;
-
-          const itemLabel = item
-            ? [item.brand, item.model, item.size, item.colour].filter(Boolean).join(" · ")
-            : "(unknown item)";
-          const categoryName = item?.category_id
-            ? (catMap.get(item.category_id) || item.category || "")
-            : (item?.category || "");
-
-          built.push({
-            itemId,
-            itemCode: item?.item_code || "—",
-            brand: item?.brand || "",
-            category: categoryName,
-            itemLabel,
-            units,
-            rate,
-            revenue,
-            hasPricing,
-          });
+        for (const r of returnTxns) {
+          if (r.reverses_id) continue;
+          if (reversedIds.has(r.id)) continue;
+          unitsById.set(r.item_id, (unitsById.get(r.item_id) || 0) - r.qty);
         }
 
-        // 6) Sort by revenue desc + compute cumulative % + classify A/B/C.
-        const totalRevenue = built.reduce((s, r) => s + r.revenue, 0);
-        built.sort((a, b) => b.revenue - a.revenue);
-
-        let running = 0;
-        const classified: Row[] = built.map((r) => {
-          running += r.revenue;
-          const pctShare = totalRevenue > 0 ? (r.revenue / totalRevenue) * 100 : 0;
-          const cumPct = totalRevenue > 0 ? (running / totalRevenue) * 100 : 0;
-          let cls: "A" | "B" | "C" = "C";
-          if (totalRevenue > 0) {
-            // A: rows whose CUMULATIVE share is within the A-cut.
-            // B: between A-cut and B-cut.
-            // C: beyond B-cut, and anything with zero revenue.
-            if (r.revenue === 0) cls = "C";
-            else if (cumPct <= aCut) cls = "A";
-            else if (cumPct <= bCut) cls = "B";
-            else cls = "C";
-          }
-          return { ...r, pctShare, cumPct, cls };
-        });
-
-        setRows(classified);
+        setRaw({ unitsById, itemMap, priceMap, catMap });
         setLoaded(true);
       } catch (e: any) {
         if (cancelled) return;
         console.error("[abc] load failed", e);
         setErr(e?.message || "Failed to load ABC analysis.");
-        setRows([]);
+        setRaw(null);
         setLoaded(true);
       }
     })();
     return () => { cancelled = true; };
-  }, [from, to, rateBasis, aCut, bCut]);
+  }, [from, to]);
+
+  // ── Derive priced + classified rows from the raws (no refetch when the
+  //    rate basis or cuts change). ────────────────────────────────────────
+  const rows = useMemo<Row[]>(() => {
+    if (!raw) return [];
+    const { unitsById, itemMap, priceMap, catMap } = raw;
+
+    // Per-item revenue rows. Items that sold but have no pricing record
+    // contribute 0 revenue but are still listed — flagged.
+    const built: Omit<Row, "pctShare" | "cumPct" | "rank" | "cls">[] = [];
+    for (const [itemId, units] of unitsById) {
+      const item = itemMap.get(itemId);
+      const price = priceMap.get(itemId);
+      const hasPricing = !!price && (price.lp ?? 0) > 0;
+      const baseRate = hasPricing
+        ? price!.lp * (1 - (price!.discount || 0))
+        : 0;
+      const rate = rateBasis === "inclGst"
+        ? baseRate * (1 + (price?.gst_rate ?? DEFAULT_GST))
+        : baseRate;
+      const revenue = units * rate;
+
+      const itemLabel = item
+        ? [item.brand, item.model, item.size, item.colour].filter(Boolean).join(" · ")
+          + (item.archived ? " (archived)" : "")
+        : "(unknown item)";
+      const categoryName = item?.category_id
+        ? (catMap.get(item.category_id) || item.category || "")
+        : (item?.category || "");
+
+      built.push({
+        itemId,
+        itemCode: item?.item_code || "—",
+        brand: item?.brand || "",
+        category: categoryName,
+        itemLabel,
+        units,
+        rate,
+        revenue,
+        hasPricing,
+      });
+    }
+
+    // Sort by revenue desc + compute cumulative % + classify A/B/C.
+    const totalRevenue = built.reduce((s, r) => s + r.revenue, 0);
+    built.sort((a, b) => b.revenue - a.revenue);
+
+    let running = 0;
+    return built.map((r, i) => {
+      const pctShare = totalRevenue > 0 ? (r.revenue / totalRevenue) * 100 : 0;
+      running += r.revenue;
+      const cumPct = totalRevenue > 0 ? (running / totalRevenue) * 100 : 0;
+      // Classify on the cumulative share BEFORE this row — testing the
+      // row's own inclusive cumulative demotes any item that merely crosses
+      // a cut (a single 85%-of-revenue item would rank "B" under an 80% A
+      // cut). Zero/negative-revenue rows stay pinned to C.
+      let cls: "A" | "B" | "C" = "C";
+      if (totalRevenue > 0 && r.revenue > 0) {
+        const before = cumPct - pctShare;
+        cls = before < aCut ? "A" : before < bCut ? "B" : "C";
+      }
+      return { ...r, pctShare, cumPct, rank: i + 1, cls };
+    });
+  }, [raw, rateBasis, aCut, bCut]);
 
   const brands = useMemo(() => {
     const s = new Set<string>();
@@ -361,14 +439,16 @@ export default function ABCAnalysisPage() {
       "Units sold", "Rate (₹)", "Revenue (₹)", "Share %", "Cumulative %",
     ];
     const lines = [header.join(",")];
-    visibleRows.forEach((r, idx) => {
+    visibleRows.forEach((r) => {
       lines.push([
-        String(idx + 1),
+        // Global revenue rank — NOT the filtered index, so "A only" exports
+        // still say which item is #7 overall.
+        String(r.rank),
         r.cls,
-        csvCell(r.itemCode),
-        csvCell(r.brand),
-        csvCell(r.category),
-        csvCell(r.itemLabel),
+        csvCell(csvSafe(r.itemCode)),
+        csvCell(csvSafe(r.brand)),
+        csvCell(csvSafe(r.category)),
+        csvCell(csvSafe(r.itemLabel)),
         String(r.units),
         String(Math.round(r.rate)),
         String(Math.round(r.revenue)),
@@ -393,7 +473,9 @@ export default function ABCAnalysisPage() {
 
   return (
     <Shell title="ABC analysis">
-      <ReportsSubnav />
+      <div className="print:hidden">
+        <ReportsSubnav />
+      </div>
       <div className="mb-6">
         <h1 className="text-xl sm:text-2xl font-semibold tracking-tight">ABC analysis</h1>
         <p className="text-sm text-zinc-500 mt-1 tabular-nums">
@@ -404,7 +486,7 @@ export default function ABCAnalysisPage() {
       </div>
 
       {/* Toolbar */}
-      <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg p-4 mb-6 flex flex-wrap items-center gap-3">
+      <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg p-4 mb-6 flex flex-wrap items-center gap-3 print:hidden">
         <Calendar className="w-4 h-4 text-zinc-500" />
         <select
           value={preset}
@@ -415,12 +497,19 @@ export default function ABCAnalysisPage() {
         </select>
 
         <div className="flex items-center gap-2 text-xs">
+          {/* Editing either bound while on a preset seeds BOTH custom dates
+              from the currently-displayed range first — otherwise the other
+              bound silently jumps to a stale custom value. */}
           <label className="text-zinc-500 flex items-center gap-1.5">
             From
             <input
               type="date"
               value={from}
-              onChange={(e) => { setCustomFrom(e.target.value); setPreset("custom"); }}
+              onChange={(e) => {
+                if (preset !== "custom") setCustomTo(to);
+                setCustomFrom(e.target.value);
+                setPreset("custom");
+              }}
               className="bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-md px-2 py-1 tnum"
             />
           </label>
@@ -429,10 +518,19 @@ export default function ABCAnalysisPage() {
             <input
               type="date"
               value={to}
-              onChange={(e) => { setCustomTo(e.target.value); setPreset("custom"); }}
+              onChange={(e) => {
+                if (preset !== "custom") setCustomFrom(from);
+                setCustomTo(e.target.value);
+                setPreset("custom");
+              }}
               className="bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-md px-2 py-1 tnum"
             />
           </label>
+          {from > to && (
+            <span className="text-amber-600 dark:text-amber-400">
+              From is after To — no rows match.
+            </span>
+          )}
         </div>
 
         <div className="flex items-center gap-1.5 text-xs text-zinc-500 ml-1">
@@ -440,15 +538,17 @@ export default function ABCAnalysisPage() {
           A ≤
           <input
             type="number" min={1} max={99}
-            value={aCut}
-            onChange={(e) => setACut(Math.min(99, Math.max(1, Number(e.target.value) || DEFAULT_A_CUT)))}
+            value={aCutDraft}
+            onChange={(e) => setACutDraft(e.target.value)}
+            onBlur={commitACut}
             className="w-14 bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-md px-2 py-1 tnum text-right"
           />
           % · B ≤
           <input
             type="number" min={1} max={100}
-            value={bCut}
-            onChange={(e) => setBCut(Math.min(100, Math.max(aCut + 1, Number(e.target.value) || DEFAULT_B_CUT)))}
+            value={bCutDraft}
+            onChange={(e) => setBCutDraft(e.target.value)}
+            onBlur={commitBCut}
             className="w-14 bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-md px-2 py-1 tnum text-right"
           />
           %
@@ -469,7 +569,7 @@ export default function ABCAnalysisPage() {
           type="button"
           onClick={exportCsv}
           disabled={visibleRows.length === 0 || !loaded}
-          className="bg-cyan-500 hover:bg-cyan-400 disabled:opacity-40 disabled:cursor-not-allowed text-white px-3 py-1.5 rounded-md text-xs font-medium flex items-center gap-1.5"
+          className="inline-flex items-center gap-1.5 text-xs px-2.5 py-1.5 rounded-md border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 text-zinc-600 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800 disabled:opacity-40 disabled:cursor-not-allowed"
         >
           <Download className="w-3.5 h-3.5" />
           Export CSV
@@ -485,12 +585,12 @@ export default function ABCAnalysisPage() {
       )}
       {hitLimit && (
         <div className="mb-4 text-xs text-amber-700 dark:text-amber-300 bg-amber-500/10 border border-amber-500/30 rounded-md p-2.5">
-          Showing the first {fmtN(LIMIT)} sale rows. Pick a shorter range for a complete picture.
+          Showing the first {fmtN(LIMIT)} sale/return rows. Pick a shorter range for a complete picture.
         </div>
       )}
 
       {/* KPI strip */}
-      <div className="grid grid-cols-2 md:grid-cols-5 gap-3 mb-6">
+      <div className="grid grid-cols-2 md:grid-cols-5 gap-3 mb-6 print:hidden">
         <Kpi
           icon={<IndianRupee className="w-3.5 h-3.5" />}
           label="Revenue"
@@ -501,7 +601,7 @@ export default function ABCAnalysisPage() {
           icon={<Layers className="w-3.5 h-3.5" />}
           label="Units sold"
           value={loaded ? fmtN(totals.totalUnits) : ""}
-          note="active only"
+          note="net of returns"
         />
         <ClassKpi
           cls="A"
@@ -532,7 +632,7 @@ export default function ABCAnalysisPage() {
       )}
 
       {/* Filters above table */}
-      <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg p-3 mb-3 flex flex-wrap items-center gap-3">
+      <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg p-3 mb-3 flex flex-wrap items-center gap-3 print:hidden">
         <div className="flex items-center gap-1.5 text-xs">
           <Search className="w-3.5 h-3.5 text-zinc-500" />
           <input
@@ -574,8 +674,9 @@ export default function ABCAnalysisPage() {
         </div>
       </div>
 
-      {/* Table — desktop */}
-      <div className="hidden md:block bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg overflow-hidden">
+      {/* Table — desktop (print:block: print widths sit below md, so without
+          it the table would never appear on paper) */}
+      <div className="hidden md:block print:block bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg overflow-hidden">
         <table className="w-full text-sm">
           <thead className="bg-zinc-50 dark:bg-zinc-900/50 border-b border-zinc-200 dark:border-zinc-800">
             <tr className="text-zinc-500 text-[11px] uppercase tracking-wider">
@@ -590,9 +691,13 @@ export default function ABCAnalysisPage() {
             </tr>
           </thead>
           <tbody>
-            {!loaded && (
-              <tr><td colSpan={8} className="py-10 text-center text-sm text-zinc-500">Loading…</td></tr>
-            )}
+            {!loaded && Array.from({ length: 6 }).map((_, i) => (
+              <tr key={i} className="border-t border-zinc-200/50 dark:border-zinc-800/50">
+                {Array.from({ length: 8 }).map((__, j) => (
+                  <td key={j} className="px-3 py-3"><div className="h-3 rounded shimmer" /></td>
+                ))}
+              </tr>
+            ))}
             {loaded && visibleRows.length === 0 && !err && (
               <tr>
                 <td colSpan={8} className="py-12 text-center text-sm text-zinc-500">
@@ -654,8 +759,12 @@ export default function ABCAnalysisPage() {
       </div>
 
       {/* Mobile cards */}
-      <div className="md:hidden bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-2xl overflow-hidden shadow-sm">
-        {!loaded && <div className="py-10 text-center text-sm text-zinc-500">Loading…</div>}
+      <div className="md:hidden print:hidden bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-2xl overflow-hidden shadow-sm">
+        {!loaded && (
+          <div className="p-4 space-y-3">
+            {Array.from({ length: 6 }).map((_, i) => <div key={i} className="h-3 rounded shimmer" />)}
+          </div>
+        )}
         {loaded && visibleRows.length === 0 && !err && (
           <div className="py-12 text-center text-sm text-zinc-500 px-4">
             {rows.length === 0 ? "No sales in this range." : "No items match the current filters."}
@@ -703,7 +812,8 @@ export default function ABCAnalysisPage() {
       </div>
 
       <div className="mt-4 text-[11px] text-zinc-500 leading-relaxed max-w-3xl">
-        <strong>How this works.</strong> For every Sale in the range (excluding reversed pairs), we multiply
+        <strong>How this works.</strong> For every Sale in the range (excluding reversed pairs, net of
+        customer returns), we multiply
         units × current effective rate (LP × (1 − discount){rateBasis === "inclGst" && " × (1 + GST)"}).
         Items are sorted by revenue descending, the cumulative share is computed, and each item is bucketed —
         first items up to {aCut}% cumulative revenue = <span className="text-emerald-600 dark:text-emerald-400 font-semibold">A</span>,
@@ -721,7 +831,7 @@ function Kpi({
   return (
     <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg p-4">
       <div className="flex items-center gap-2 text-xs text-zinc-500 mb-2">{icon} {label}</div>
-      <div className="text-2xl font-semibold tnum">
+      <div className="text-2xl font-semibold font-display tnum">
         {value || <span className="shimmer inline-block h-7 w-16 rounded" />}
       </div>
       <div className="text-[11px] text-zinc-500 mt-1">{note}</div>
@@ -745,7 +855,7 @@ function ClassKpi({
         } ${tone}`}>{cls}</span>
         Class {cls}
       </div>
-      <div className={`text-2xl font-semibold tnum ${tone}`}>
+      <div className={`text-2xl font-semibold font-display tnum ${tone}`}>
         {loaded ? fmtN(count) : <span className="shimmer inline-block h-7 w-16 rounded" />}
       </div>
       <div className="text-[11px] text-zinc-500 mt-1 tnum">

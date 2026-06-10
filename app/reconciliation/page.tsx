@@ -7,9 +7,11 @@ import {
   Minus, Plus, History, Download, X,
 } from "lucide-react";
 import { Shell } from "@/components/shell";
-import { sb, type Item } from "@/lib/supabase";
+import { sb, fetchAllRows, type Item } from "@/lib/supabase";
 import { useAuth } from "@/app/providers";
-import { fmtN, cn, matchesQuery } from "@/lib/utils";
+import { fmtN, cn, matchesQuery, todayISO } from "@/lib/utils";
+import { useEscape, useMediaQuery } from "@/lib/hooks";
+import { useConfirm } from "@/components/confirm-dialog";
 import { FilterSheet, SheetField, FilterButton } from "@/components/filter-sheet";
 import { SearchBox } from "@/components/search-box";
 
@@ -53,11 +55,6 @@ type DBDraft = {
   user_email: string | null;
   user_name: string | null;
   user_role: string | null;
-  // Owner's "I have finished my whole count" flag (joined from
-  // reconciliation_done). When true, this counter's entries are frozen and a
-  // BLANK on an item someone else filled counts as "found nothing" (= 0).
-  user_done?: boolean;
-  user_done_at?: string | null;
 };
 
 // Local mirror, keyed by `${user_id}::${item_id}` so writes can be
@@ -91,7 +88,9 @@ function parseExpr(raw: string): number | null {
   }
   return total;
 }
-const TODAY = () => new Date().toISOString().slice(0, 10);
+// Local-timezone date (todayISO) — toISOString() is UTC and stamped
+// yesterday's date on commits between 00:00 and 05:30 IST.
+const TODAY = () => todayISO();
 const pieces = (cs: number, cases: number, loose: number) =>
   cs > 0 ? cases * cs + loose : loose;
 
@@ -138,19 +137,8 @@ const displayUser = (d: DBDraft) =>
 // the count input is the only white/bordered element (shows "—" when empty) ·
 // the diff is the single saturated signal (emerald = surplus, rose = shortage).
 
-// SSR-safe media query so we mount EITHER the desktop table OR the mobile
-// cards — never both (halves the DOM/handlers on the heaviest screen).
-function useMediaQuery(query: string): boolean {
-  const [match, setMatch] = useState(false);
-  useEffect(() => {
-    const m = window.matchMedia(query);
-    const on = () => setMatch(m.matches);
-    on();
-    m.addEventListener("change", on);
-    return () => m.removeEventListener("change", on);
-  }, [query]);
-  return match;
-}
+// Media query now comes from lib/hooks — its LAZY initial read fixes the
+// one-frame flash where desktop mounted the full mobile card list first.
 
 // Labelled system-reference chip (quiet; never an input).
 function SysChip({ label = "SYS", children, className }: { label?: string; children: React.ReactNode; className?: string }) {
@@ -217,6 +205,10 @@ export default function ReconciliationPage() {
   const { profile } = useAuth();
   const isAdmin = profile?.role === "admin";
   const canCommit = isAdmin;
+  // Viewers are read-only app-wide; the drafts/done RLS (2026-06-10
+  // hardening) rejects their writes, so don't render write affordances.
+  const canCount = isAdmin || profile?.role === "staff";
+  const { confirm, confirmDialog } = useConfirm();
 
   const [items, setItems] = useState<Item[]>([]);
   const [appStock, setAppStock] = useState<Map<string, { A: AppStock; B: AppStock }>>(new Map());
@@ -252,10 +244,16 @@ export default function ReconciliationPage() {
   // Which item is mid per-item apply (disables that card's apply buttons).
   const [applyingItemId, setApplyingItemId] = useState<string | null>(null);
 
-  // UI mode
-  const [mode, setMode] = useState<"my" | "reviewer">("my");
+  // UI mode — persisted per session so the reviewer doesn't land back on
+  // "My count" on every visit mid-review-week.
+  const [mode, setMode] = useState<"my" | "reviewer">(() => {
+    try {
+      return sessionStorage.getItem("recon.mode") === "reviewer" ? "reviewer" : "my";
+    } catch { return "my"; }
+  });
   useEffect(() => {
     if (!isAdmin && mode === "reviewer") setMode("my");
+    try { sessionStorage.setItem("recon.mode", mode); } catch {}
   }, [isAdmin, mode]);
 
   // Filters
@@ -272,7 +270,7 @@ export default function ReconciliationPage() {
   // Pre-commit confirmation (Make adjustments) — shows what will move and the
   // census option ("full count → zero what nobody found") before anything writes.
   const [commitConfirm, setCommitConfirm] = useState<null | {
-    counted: number; conflicted: number; uncountedItems: number; uncountedSides: number; notDone: string[];
+    counted: number; conflicted: number; invalid: number; uncountedItems: number; uncountedSides: number; notDone: string[];
   }>(null);
   const [censusZero, setCensusZero] = useState(true);
   const [errors, setErrors] = useState<Array<{ itemId: string; godown?: Godown; message: string }>>([]);
@@ -300,14 +298,18 @@ export default function ReconciliationPage() {
       c.from("godown_stock").select("*"),
       c.from("categories").select("id, name"),
       c.from("reconciliation_drafts_with_user").select("*"),
-      // Latest reconciliation per item — pull plenty and dedupe client-side.
-      c.from("transactions")
-        // The audit text lives in `note` (process_transaction maps its reason
-        // param to the note column) — the `reason` column is never written.
-        .select("item_id, created_at, created_by, note")
-        .like("note", "Reconciliation%")
-        .order("created_at", { ascending: false })
-        .limit(2000),
+      // Latest reconciliation per item — paginated (PostgREST clamps any
+      // .limit() to 1,000 server-side) and deduped client-side.
+      fetchAllRows<{ item_id: string; created_at: string; created_by: string | null; note: string | null }>(
+        (from, to) => c.from("transactions")
+          // The audit text lives in `note` (process_transaction maps its reason
+          // param to the note column) — the `reason` column is never written.
+          .select("item_id, created_at, created_by, note")
+          .like("note", "Reconciliation%")
+          .order("created_at", { ascending: false }).order("id")
+          .range(from, to),
+        { maxRows: 5000 }
+      ).then(r => ({ data: r.rows })),
       c.from("user_profiles").select("id, name, email, role, active"),
       c.from("reconciliation_done").select("user_id, done, done_at"),
     ]);
@@ -321,8 +323,23 @@ export default function ReconciliationPage() {
       cur[s.godown as Godown] = { cases: s.cases ?? 0, loose: s.loose ?? 0, hasStockRow: true };
     });
 
+    // Purge drafts pointing at archived/deleted items — they're invisible on
+    // this page, survive every commit, and would resurface as stale "live"
+    // counts if the item is ever unarchived. Everyone cleans their own;
+    // admins clean all (RLS allows both).
+    const itemIds = new Set((rows || []).map((i: any) => i.id));
+    const orphans = (draftsData || []).filter((d: any) => !itemIds.has(d.item_id));
+    if (orphans.length > 0) {
+      const ids = (isAdmin ? orphans : orphans.filter((d: any) => d.user_id === profile?.id))
+        .map((d: any) => d.id);
+      if (ids.length > 0) void sb().from("reconciliation_drafts").delete().in("id", ids);
+    }
+
     const draftsMap = new Map<DraftKey, DBDraft>();
-    (draftsData || []).forEach((d: any) => draftsMap.set(dkey(d.user_id, d.item_id), d as DBDraft));
+    (draftsData || []).forEach((d: any) => {
+      if (!itemIds.has(d.item_id)) return; // orphan (being purged above)
+      draftsMap.set(dkey(d.user_id, d.item_id), d as DBDraft);
+    });
 
     const profileById = new Map<string, { name: string | null; email: string | null }>();
     (profiles || []).forEach((p: any) => profileById.set(p.id, { name: p.name ?? null, email: p.email ?? null }));
@@ -359,11 +376,20 @@ export default function ReconciliationPage() {
     setItems((rows || []) as Item[]);
     setAppStock(stockMap);
     setCatNameById(new Map((cats || []).map((c: any) => [c.id, c.name])));
+    // Same in-flight protection as refreshDrafts: a post-commit load() must
+    // not roll back a keystroke typed during the commit whose save hasn't
+    // acked yet (the pending persist would then re-save a stale snapshot).
+    {
+      const inFlight = (k: string) => saveTimers.current.has(k) || dirtyRef.current.has(k);
+      for (const [k, local] of draftsRef.current) {
+        if (inFlight(k) || local.id.startsWith("local-")) draftsMap.set(k, local);
+      }
+    }
     writeDrafts(draftsMap);
     setDoneByUser(doneMap);
     setLastRecon(lastMap);
     setLoaded(true);
-  }, [writeDrafts]);
+  }, [writeDrafts, isAdmin, profile?.id]);
 
   useEffect(() => { void load(); }, [load]);
 
@@ -373,6 +399,10 @@ export default function ReconciliationPage() {
   // up here so the polling refresh below can check whether a row is
   // mid-save and skip it.
   const saveTimers = useRef<Map<DraftKey, number>>(new Map());
+  // Consecutive failed saves per row — drives exponential retry backoff and
+  // keeps the "couldn't save" toast to ONE per failure streak instead of an
+  // endless 3-second loop.
+  const retryCounts = useRef<Map<DraftKey, number>>(new Map());
   // Keys with an unsaved local edit (set on keystroke, cleared once the server
   // ack confirms the row matches what we sent). The poll never overwrites a
   // key that is "in flight" — either a debounce timer is pending OR it's dirty.
@@ -466,7 +496,9 @@ export default function ReconciliationPage() {
       document.removeEventListener("visibilitychange", onVis);
       window.clearInterval(id);
     };
-  }, [loaded, processing, refreshDrafts, refreshAppStock, refreshDone, mode]);
+    // applyingItemId IS a dep: the guard above must re-evaluate when a
+    // per-item apply starts, or the existing interval keeps polling mid-apply.
+  }, [loaded, processing, applyingItemId, refreshDrafts, refreshAppStock, refreshDone, mode]);
 
   // Optimistic local mutation; the actual DB write happens debounced below.
   const setField = useCallback((userId: string, itemId: string, field: Field, value: string) => {
@@ -564,14 +596,19 @@ export default function ReconciliationPage() {
       // skip this key forever (never re-sync, never drop after a commit). So
       // re-arm a backoff retry, which keeps the local value protected AND keeps
       // trying until the save lands (self-heals on reconnect / token refresh).
-      // Skip the retry only if the row was deleted in the meantime.
-      showToast("bad", `Couldn't save — retrying… (${error.message})`);
+      // Exponential backoff (3s → 6s → 12s → … capped 30s); toast only once
+      // per failure streak so a permanent error doesn't nag every retry.
+      const attempts = retryCounts.current.get(k) ?? 0;
+      if (attempts === 0) showToast("bad", `Couldn't save — will keep retrying (${error.message})`);
+      retryCounts.current.set(k, attempts + 1);
       if (draftsRef.current.has(k) && dirtyRef.current.has(k) && !saveTimers.current.has(k)) {
-        const t = window.setTimeout(() => { saveTimers.current.delete(k); void persistDraft(userId, itemId); }, 3000);
+        const delay = Math.min(3000 * Math.pow(2, attempts), 30000);
+        const t = window.setTimeout(() => { saveTimers.current.delete(k); void persistDraft(userId, itemId); }, delay);
         saveTimers.current.set(k, t);
       }
       return;
     }
+    retryCounts.current.delete(k);
     if (data) {
       const cur = draftsRef.current.get(k);
       if (!cur) return;
@@ -682,6 +719,9 @@ export default function ReconciliationPage() {
     if (next) flushAllPendingSaves(); // capture any in-flight edit before freezing
     setDoneSaving(true);
     const nowIso = new Date().toISOString();
+    // Snapshot for an exact rollback — restamping `at` with the new time on
+    // failure used to lose the real done-at.
+    const prevEntry = doneByUser.get(uid);
     setDoneByUser(prev => {
       const m = new Map(prev);
       m.set(uid, { done: next, at: next ? nowIso : null, name: prev.get(uid)?.name ?? peopleRef.current.get(uid) ?? null });
@@ -693,8 +733,12 @@ export default function ReconciliationPage() {
     );
     setDoneSaving(false);
     if (error) {
-      // roll back the optimistic flip
-      setDoneByUser(prev => { const m = new Map(prev); m.set(uid, { done: !next, at: !next ? nowIso : null, name: prev.get(uid)?.name ?? null }); return m; });
+      // roll back the optimistic flip to the exact previous entry
+      setDoneByUser(prev => {
+        const m = new Map(prev);
+        if (prevEntry) m.set(uid, prevEntry); else m.delete(uid);
+        return m;
+      });
       showToast("bad", `Couldn't update done state: ${error.message}`);
       return;
     }
@@ -997,8 +1041,8 @@ export default function ReconciliationPage() {
   // count, how many are blocked by conflicts, how much UNCOUNTED stock would
   // be zeroed by a census commit, and which counters haven't marked done.
   const openCommitConfirm = () => {
-    if (!canCommit || processing) return;
-    let counted = 0, conflicted = 0, uncountedItems = 0, uncountedSides = 0;
+    if (!canCommit || processing || applyingItemId) return;
+    let counted = 0, conflicted = 0, invalid = 0, uncountedItems = 0, uncountedSides = 0;
     const participants = new Set<string>();
     for (const i of items) {
       const app = appStock.get(i.id);
@@ -1012,12 +1056,31 @@ export default function ReconciliationPage() {
         continue;
       }
       if (computeItemConflict(i, nonEmpty).any) { conflicted++; continue; }
-      counted++;
-      const touchedG = (g: Godown) => nonEmpty.some(d =>
+      // Classify with the SAME merged row the commit will build, so the
+      // dialog's numbers exactly match what makeAdjustments will do (an
+      // invalid-only entry used to show as "counted" and then silently skip).
+      const touchedBy = (d: DBDraft, g: Godown) =>
         (g === "A" ? d.a_cases_raw : d.b_cases_raw).trim() !== "" ||
-        (g === "A" ? d.a_loose_raw : d.b_loose_raw).trim() !== "");
-      for (const g of ["A", "B"] as Godown[]) {
-        if (!touchedG(g) && hasStock(g)) uncountedSides++;
+        (g === "A" ? d.a_loose_raw : d.b_loose_raw).trim() !== "";
+      const repA = nonEmpty.find(d => touchedBy(d, "A"));
+      const repB = nonEmpty.find(d => touchedBy(d, "B"));
+      const csRaw = nonEmpty.find(d => d.case_size_raw.trim() !== "")?.case_size_raw || "";
+      const merged: DBDraft = {
+        ...emptyDraft, item_id: i.id, case_size_raw: csRaw,
+        a_cases_raw: repA?.a_cases_raw ?? "", a_loose_raw: repA?.a_loose_raw ?? "",
+        b_cases_raw: repB?.b_cases_raw ?? "", b_loose_raw: repB?.b_loose_raw ?? "",
+      };
+      const rd = computeDiff(i, app, merged);
+      if (rd.invalid) { invalid++; continue; }
+      counted++;
+      // Census only zeroes an uncounted godown when the item had REAL
+      // quantities entered — a case-size-only correction means the counter
+      // handled the item, so its stock must not be zeroed as "not found".
+      if (rd.A.userTouched || rd.B.userTouched) {
+        for (const g of ["A", "B"] as Godown[]) {
+          const side = g === "A" ? rd.A : rd.B;
+          if (!side.userTouched && hasStock(g)) uncountedSides++;
+        }
       }
     }
     const notDone = [...participants]
@@ -1028,8 +1091,25 @@ export default function ReconciliationPage() {
     // is still counting — and OFF with zero participants, so an idle click can
     // never two-tap the whole inventory to zero; ticking it is then deliberate.
     setCensusZero(participants.size > 0 && notDone.length === 0);
-    setCommitConfirm({ counted, conflicted, uncountedItems, uncountedSides, notDone });
+    setCommitConfirm({ counted, conflicted, invalid, uncountedItems, uncountedSides, notDone });
   };
+
+  // Reset stale "done" flags: a counter whose drafts were all committed
+  // shouldn't carry a frozen/done state into the next stock-take cycle.
+  // Shared by BOTH commit paths (bulk used to do this; per-item didn't, so a
+  // counter fully committed via "Apply this count" stayed frozen).
+  const resetStaleDoneFlags = useCallback(async () => {
+    try {
+      const stillCounting = new Set<string>();
+      for (const [, d] of draftsRef.current) if (!isDraftEmpty(d)) stillCounting.add(d.user_id);
+      const toReset: string[] = [];
+      for (const [uid, info] of doneByUser) if (info.done && !stillCounting.has(uid)) toReset.push(uid);
+      if (toReset.length > 0) {
+        await sb().from("reconciliation_done").update({ done: false, done_at: null }).in("user_id", toReset);
+        await refreshDone();
+      }
+    } catch { /* non-fatal: a stale flag self-resolves when the counter resumes */ }
+  }, [doneByUser, refreshDone]);
 
   // ─── commit (admin only) ───────────────────────────────────────────────
   // zeroUncounted = "this was a FULL count": after committing every agreed
@@ -1039,7 +1119,7 @@ export default function ReconciliationPage() {
   // so a partial count can simply untick it and only counted items move.
   const makeAdjustments = async (zeroUncounted: boolean) => {
     if (!canCommit) { showToast("bad", "Only admins can commit reconciliation."); return; }
-    if (processing) return;
+    if (processing || applyingItemId) return;
 
     // Collect committable items: at least one user has a non-empty draft
     // AND no conflict across users AND all entered values are valid.
@@ -1056,11 +1136,11 @@ export default function ReconciliationPage() {
     const jobs: Job[] = [];
     const skipped: Array<{ itemId: string; label: string; reason: string }> = [];
     const date = TODAY();
-    // Permanent per-counter record of every entry feeding this commit — written
-    // to reconciliation_count_log BEFORE drafts are wiped, so "who counted
-    // what" survives forever (matched counts leave no transaction, so without
-    // this they'd be indistinguishable from never-counted).
-    const logRows: Record<string, unknown>[] = [];
+    // Permanent per-counter record of every entry feeding this commit. The
+    // entries are SNAPSHOTTED here (drafts still intact) but INSERTED after
+    // the stock RPCs run, so each row's `applied` flag is truthful — the log
+    // used to assert applied=true before any stock write happened.
+    const logRows: Array<Record<string, unknown> & { item_id: string }> = [];
 
     // A census zero-side for a godown that still shows stock but nobody counted.
     const zeroSide = (app: { A: AppStock; B: AppStock }, cs: number, g: Godown): SideInfo | null => {
@@ -1137,8 +1217,11 @@ export default function ReconciliationPage() {
       }).filter(s => s.needsWrite);
 
       // Census: a godown NOBODY counted on this item but that still shows
-      // stock goes to 0 too — same "the count is the truth" rule.
-      if (zeroUncounted) {
+      // stock goes to 0 too — same "the count is the truth" rule. EXCEPT
+      // when the draft is a case-size-only correction (no quantities): the
+      // counter clearly handled the item, so census must not zero stock they
+      // never claimed was missing.
+      if (zeroUncounted && (rd.A.userTouched || rd.B.userTouched)) {
         for (const g of ["A", "B"] as Godown[]) {
           const side = g === "A" ? rd.A : rd.B;
           if (side.userTouched) continue;
@@ -1188,13 +1271,9 @@ export default function ReconciliationPage() {
     setProcessing(true);
     setErrors([]);
 
-    // Write the count log FIRST (drafts still intact). One snapshot per commit
-    // attempt. Failure never blocks the stock commit — it just warns.
-    if (logRows.length > 0) {
-      const { error: logErr } = await sb().from("reconciliation_count_log").insert(logRows);
-      if (logErr) showToast("info", "Counts will commit, but the count log couldn't be saved — run db/2026-06-10-count-log.sql.");
-    }
-
+    // Phase order matters: 1) stock RPCs, 2) count log (truthful applied
+    // flags), 3) draft wipe. Drafts are wiped LAST so a crash mid-commit
+    // never destroys an uncommitted, unlogged count.
     const totalSteps = jobs.reduce((n, j) => n + (j.caseSizeChanged ? 1 : 0) + j.sides.length + 1 /* delete drafts step */, 0);
     setProgress({ done: 0, total: totalSteps });
     let done = 0;
@@ -1208,6 +1287,8 @@ export default function ReconciliationPage() {
         if (error) {
           newErrors.push({ itemId: j.itemId, message: `Case size update failed: ${error.message}` });
           failedItems.add(j.itemId);
+          // Tick the skipped steps so the bar still completes.
+          done += j.sides.length; setProgress({ done, total: totalSteps });
           continue;
         }
       }
@@ -1234,12 +1315,26 @@ export default function ReconciliationPage() {
         }
         done++; setProgress({ done, total: totalSteps });
       }
+    }
 
-      // Clear the drafts that fed this commit — scoped to exactly those
-      // counters (j.userIdsToWipe), NOT every draft on the item. A counter who
-      // started entering this item AFTER we snapshotted (e.g. during a long
-      // bulk commit) keeps their draft for the next cycle instead of it being
-      // silently wiped unapplied.
+    // Phase 2: count log — with TRUTHFUL applied flags (an item whose stock
+    // write failed is recorded applied=false; the counts themselves are still
+    // preserved). Failure never blocks the commit — it's folded into the
+    // final toast so the success toast can't clobber the warning.
+    let logFailed = false;
+    if (logRows.length > 0) {
+      const finalLog = logRows.map(r => (failedItems.has(r.item_id) ? { ...r, applied: false } : r));
+      const { error: logErr } = await sb().from("reconciliation_count_log").insert(finalLog);
+      if (logErr) logFailed = true;
+    }
+
+    // Phase 3: clear the drafts that fed this commit — scoped to exactly
+    // those counters (j.userIdsToWipe), NOT every draft on the item. A
+    // counter who started entering this item AFTER we snapshotted (e.g.
+    // during a long bulk commit) keeps their draft for the next cycle
+    // instead of it being silently wiped unapplied. Failed items keep ALL
+    // their drafts for retry.
+    for (const j of jobs) {
       if (!failedItems.has(j.itemId) && j.userIdsToWipe.length > 0) {
         const { error: delErr } = await sb()
           .from("reconciliation_drafts")
@@ -1259,28 +1354,17 @@ export default function ReconciliationPage() {
     const succeeded = jobs.length - failedItems.size;
     const zeroed = jobs.filter(j => j.zeroedItem && !failedItems.has(j.itemId)).length;
     const zeroedNote = zeroed > 0 ? ` (${zeroed} uncounted set to 0)` : "";
+    const logNote = logFailed ? " Count log NOT saved — run db/2026-06-10-count-log.sql." : "";
     if (failedItems.size === 0 && skipped.length === 0) {
-      showToast("ok", `Committed ${succeeded} item${succeeded === 1 ? "" : "s"}${zeroedNote}.`);
+      showToast(logFailed ? "info" : "ok", `Committed ${succeeded} item${succeeded === 1 ? "" : "s"}${zeroedNote}.${logNote}`);
     } else if (failedItems.size === 0) {
-      showToast("info", `Committed ${succeeded}${zeroedNote}. ${skipped.length} item${skipped.length === 1 ? "" : "s"} skipped (conflicts/invalid).`);
+      showToast("info", `Committed ${succeeded}${zeroedNote}. ${skipped.length} item${skipped.length === 1 ? "" : "s"} skipped (conflicts/invalid).${logNote}`);
     } else {
-      showToast("bad", `Committed ${succeeded}, ${failedItems.size} failed.`);
+      showToast("bad", `Committed ${succeeded}, ${failedItems.size} failed.${logNote}`);
     }
 
     await load();
-
-    // Reset stale "done" flags: a counter whose drafts were all committed
-    // shouldn't carry a frozen/done state into the next stock-take cycle.
-    try {
-      const stillCounting = new Set<string>();
-      for (const [, d] of draftsRef.current) if (!isDraftEmpty(d)) stillCounting.add(d.user_id);
-      const toReset: string[] = [];
-      for (const [uid, info] of doneByUser) if (info.done && !stillCounting.has(uid)) toReset.push(uid);
-      if (toReset.length > 0) {
-        await sb().from("reconciliation_done").update({ done: false, done_at: null }).in("user_id", toReset);
-        await refreshDone();
-      }
-    } catch { /* non-fatal: a stale flag self-resolves when the counter resumes */ }
+    await resetStaleDoneFlags();
   };
 
   // ─── per-item apply (admin picks a counter's value and commits just that
@@ -1303,27 +1387,9 @@ export default function ReconciliationPage() {
     const newErrors: typeof errors = [];
     let failed = false;
 
-    // Count log snapshot — every counter's entries on this item (the chosen
-    // source row marked applied), written before the drafts are wiped.
+    // Snapshot every counter's entries on this item NOW (drafts intact); the
+    // log row insert happens AFTER the stock RPCs so `applied` is truthful.
     const snapDrafts = (draftsByItem.get(item.id) || []).filter(d => !isDraftEmpty(d));
-    if (snapDrafts.length > 0) {
-      const rows = snapDrafts.map(d => {
-        const sA = draftSide(d, "A", item.case_size || 0);
-        const sB = draftSide(d, "B", item.case_size || 0);
-        return {
-          commit_note: `Reconciliation ${date}`, commit_kind: "single", committed_by: profile?.id ?? null,
-          user_id: d.user_id, user_name: displayUser(d),
-          item_id: item.id, item_code: item.item_code, brand: item.brand, model: item.model, size: item.size, colour: item.colour,
-          case_size: item.case_size || 0,
-          case_size_raw: d.case_size_raw, a_cases_raw: d.a_cases_raw, a_loose_raw: d.a_loose_raw,
-          b_cases_raw: d.b_cases_raw, b_loose_raw: d.b_loose_raw,
-          a_pieces: sA.touched ? sA.pcs : null, b_pieces: sB.touched ? sB.pcs : null,
-          applied: d.user_id === source.user_id,
-        };
-      });
-      const { error: logErr } = await sb().from("reconciliation_count_log").insert(rows);
-      if (logErr) showToast("info", "Count will apply, but the count log couldn't be saved — run db/2026-06-10-count-log.sql.");
-    }
 
     if (rd.caseSizeChanged) {
       const { error } = await sb().from("items").update({ case_size: rd.csNew }).eq("id", item.id);
@@ -1343,6 +1409,31 @@ export default function ReconciliationPage() {
         if (error) { newErrors.push({ itemId: item.id, godown: g, message: error.message }); failed = true; }
       }
     }
+
+    // Count log — every counter's entries on this item; the chosen source
+    // row is `applied` only when the stock writes actually landed.
+    let logFailed = false;
+    if (snapDrafts.length > 0) {
+      const rows = snapDrafts.map(d => {
+        const sA = draftSide(d, "A", item.case_size || 0);
+        const sB = draftSide(d, "B", item.case_size || 0);
+        return {
+          commit_note: `Reconciliation ${date}`, commit_kind: "single", committed_by: profile?.id ?? null,
+          user_id: d.user_id, user_name: displayUser(d),
+          item_id: item.id, item_code: item.item_code, brand: item.brand, model: item.model, size: item.size, colour: item.colour,
+          case_size: item.case_size || 0,
+          case_size_raw: d.case_size_raw, a_cases_raw: d.a_cases_raw, a_loose_raw: d.a_loose_raw,
+          b_cases_raw: d.b_cases_raw, b_loose_raw: d.b_loose_raw,
+          a_pieces: sA.touched ? sA.pcs : null, b_pieces: sB.touched ? sB.pcs : null,
+          applied: !failed && d.user_id === source.user_id,
+        };
+      });
+      const { error: logErr } = await sb().from("reconciliation_count_log").insert(rows);
+      if (logErr) logFailed = true;
+    }
+
+    // Drafts cleared only after the count is committed AND logged — the
+    // permanent log is what preserves the other counters' unapplied entries.
     if (!failed) {
       const { error: delErr } = await sb().from("reconciliation_drafts").delete().eq("item_id", item.id);
       if (delErr) newErrors.push({ itemId: item.id, message: `Draft cleanup failed: ${delErr.message}` });
@@ -1351,9 +1442,11 @@ export default function ReconciliationPage() {
     setErrors(newErrors);
     setApplyingItemId(null);
     const label = `${item.brand ? item.brand + " · " : ""}${item.model}`;
-    if (!failed) showToast("ok", `Applied ${label} — ${displayUser(source)}'s count saved to stock.`);
-    else showToast("bad", `Couldn't apply ${label}. See the error on the card.`);
+    const logNote = logFailed ? " Count log NOT saved — run db/2026-06-10-count-log.sql." : "";
+    if (!failed) showToast(logFailed ? "info" : "ok", `Applied ${label} — ${displayUser(source)}'s count saved to stock.${logNote}`);
+    else showToast("bad", `Couldn't apply ${label}. See the error on the card.${logNote}`);
     await load();
+    await resetStaleDoneFlags();
   };
 
   // ─── count history (admin) ───────────────────────────────────────────────
@@ -1368,6 +1461,8 @@ export default function ReconciliationPage() {
   };
   const [historyOpen, setHistoryOpen] = useState(false);
   const [historyRows, setHistoryRows] = useState<CountLogRow[] | null>(null);
+  useEscape(historyOpen, () => setHistoryOpen(false));
+  useEscape(!!commitConfirm, () => setCommitConfirm(null));
   const openHistory = async () => {
     setHistoryOpen(true);
     setHistoryRows(null);
@@ -1412,7 +1507,7 @@ export default function ReconciliationPage() {
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `count-log-${new Date().toISOString().slice(0, 10)}.csv`;
+    a.download = `count-log-${todayISO()}.csv`;
     document.body.appendChild(a);
     a.click();
     a.remove();
@@ -1443,6 +1538,7 @@ export default function ReconciliationPage() {
           mode={mode} setMode={setMode} isAdmin={isAdmin}
           usersWithDrafts={stats.usersWithDrafts.size}
           myDone={myDone}
+          canCount={canCount}
           onToggleDone={toggleDone}
           doneSaving={doneSaving}
           onPrint={() => window.print()}
@@ -1474,6 +1570,13 @@ export default function ReconciliationPage() {
           </div>
         )}
 
+        {mode === "my" && !canCount && (
+          <div className="mb-4 flex items-center gap-3 rounded-lg border border-zinc-200 dark:border-zinc-800 bg-zinc-100/70 dark:bg-zinc-900 px-4 py-2.5 text-sm text-zinc-600 dark:text-zinc-300">
+            <Eye className="w-4 h-4 flex-shrink-0 text-zinc-400" />
+            Your role is view-only — counts are entered by staff and admins. You can watch the live numbers here.
+          </div>
+        )}
+
         {!loaded ? (
           <SkeletonBody />
         ) : filtered.length === 0 ? (
@@ -1485,11 +1588,24 @@ export default function ReconciliationPage() {
             drafts={drafts}
             lastRecon={lastRecon}
             currentUserId={profile?.id ?? ""}
-            frozen={myDone}
+            // Read-only for viewers too — the drafts RLS rejects their writes,
+            // so don't render live inputs that can't save.
+            frozen={myDone || !canCount}
             computeDiff={computeDiff}
-            setField={setField}
+            setField={canCount ? setField : () => {}}
             commitRow={commitRow}
-            resetMyRow={(itemId) => { if (profile?.id) void deleteDraft(profile.id, itemId); }}
+            resetMyRow={(itemId) => {
+              if (!profile?.id || !canCount) return;
+              void (async () => {
+                const ok = await confirm({
+                  title: "Reset this item's count?",
+                  body: "Your entered values for this item are deleted. This can't be undone.",
+                  danger: true,
+                  confirmLabel: "Reset",
+                });
+                if (ok && profile?.id) void deleteDraft(profile.id, itemId);
+              })();
+            }}
             errorsByItem={errorsByItem(errors)}
             otherUsersByItem={(itemId) => {
               const drs = draftsByItem.get(itemId) || [];
@@ -1513,7 +1629,18 @@ export default function ReconciliationPage() {
             computeItemConflict={computeItemConflict}
             setField={setField}
             commitRow={commitRow}
-            deleteDraft={deleteDraft}
+            deleteDraft={(uid, iid) => {
+              void (async () => {
+                const name = peopleRef.current.get(uid) || "this counter";
+                const ok = await confirm({
+                  title: `Clear ${name}'s count?`,
+                  body: "Their saved entries for this item are deleted — they'd have to recount it. This can't be undone.",
+                  danger: true,
+                  confirmLabel: "Clear count",
+                });
+                if (ok) void deleteDraft(uid, iid);
+              })();
+            }}
             currentUserId={profile?.id ?? ""}
             doneByUser={doneByUser}
             people={people}
@@ -1528,7 +1655,8 @@ export default function ReconciliationPage() {
 
         {/* Count history — the permanent per-counter record of past commits. */}
         {historyOpen && (
-          <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center p-4 bg-black/40" role="dialog" aria-modal="true" aria-label="Count history">
+          <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center p-4 bg-black/50 dark:bg-black/70" role="dialog" aria-modal="true" aria-label="Count history"
+            onMouseDown={(e) => { if (e.target === e.currentTarget) setHistoryOpen(false); }}>
             <div className="w-full max-w-2xl max-h-[85vh] flex flex-col bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-2xl shadow-xl overflow-hidden">
               <div className="flex items-center gap-2 px-4 sm:px-5 py-3 border-b border-zinc-200 dark:border-zinc-800">
                 <History className="w-4 h-4 text-violet-600 dark:text-violet-400 flex-shrink-0" />
@@ -1596,6 +1724,10 @@ export default function ReconciliationPage() {
                                         B {r.b_pieces === null ? "not counted" : `${fmtN(r.b_pieces)} pcs (${r.b_cases_raw || "0"}c + ${r.b_loose_raw || "0"}L)`}
                                       </span>
                                       {r.case_size_raw.trim() !== "" && <span className="text-amber-600 dark:text-amber-400">cs→{r.case_size_raw}</span>}
+                                      {/* In an Apply-one batch, mark whose count won. */}
+                                      {b.kind === "single" && r.applied && (
+                                        <span className="px-1 rounded bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 text-[9px] uppercase tracking-wide font-medium">applied</span>
+                                      )}
                                     </div>
                                   ))}
                                 </div>
@@ -1614,7 +1746,7 @@ export default function ReconciliationPage() {
 
         {/* Pre-commit confirmation — nothing writes until Commit is tapped. */}
         {commitConfirm && (
-          <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center p-4 bg-black/40" role="dialog" aria-modal="true" aria-label="Confirm make adjustments">
+          <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center p-4 bg-black/50 dark:bg-black/70" role="dialog" aria-modal="true" aria-label="Confirm make adjustments">
             <div className="w-full max-w-md bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-2xl shadow-xl p-5 space-y-4">
               <div className="flex items-center gap-2">
                 <CheckCircle2 className="w-5 h-5 text-cyan-600 dark:text-cyan-400" />
@@ -1630,6 +1762,12 @@ export default function ReconciliationPage() {
                   <div className="flex justify-between gap-3 text-rose-600 dark:text-rose-400">
                     <span>Skipped — conflicts still to resolve</span>
                     <span className="font-semibold">{fmtN(commitConfirm.conflicted)}</span>
+                  </div>
+                )}
+                {commitConfirm.invalid > 0 && (
+                  <div className="flex justify-between gap-3 text-rose-600 dark:text-rose-400">
+                    <span>Skipped — entries that aren&apos;t valid numbers</span>
+                    <span className="font-semibold">{fmtN(commitConfirm.invalid)}</span>
                   </div>
                 )}
               </div>
@@ -1656,6 +1794,7 @@ export default function ReconciliationPage() {
                       {commitConfirm.uncountedItems > 0 && commitConfirm.uncountedSides > 0 && " + "}
                       {commitConfirm.uncountedSides > 0 && <>{fmtN(commitConfirm.uncountedSides)} uncounted godown side{commitConfirm.uncountedSides === 1 ? "" : "s"}</>}
                       {" "}still show stock in the system — ticking this sets them to <strong>0</strong>. Untick for a partial count.
+                      {" "}<strong>Applies to ALL items — any filters on the list are ignored.</strong>
                     </span>
                   </span>
                 </label>
@@ -1672,7 +1811,7 @@ export default function ReconciliationPage() {
                 <button
                   type="button"
                   onClick={() => setCommitConfirm(null)}
-                  className="flex-1 min-h-11 rounded-lg border border-zinc-200 dark:border-zinc-700 text-sm font-medium text-zinc-700 dark:text-zinc-200 hover:bg-zinc-50 dark:hover:bg-zinc-800"
+                  className="flex-1 min-h-11 rounded-md border border-zinc-200 dark:border-zinc-700 text-sm font-medium text-zinc-700 dark:text-zinc-200 hover:bg-zinc-50 dark:hover:bg-zinc-800"
                 >
                   Cancel
                 </button>
@@ -1683,7 +1822,7 @@ export default function ReconciliationPage() {
                     setCommitConfirm(null);
                     void makeAdjustments(census);
                   }}
-                  className="flex-1 min-h-11 rounded-lg bg-cyan-500 hover:bg-cyan-400 text-white text-sm font-medium inline-flex items-center justify-center gap-1.5"
+                  className="flex-1 min-h-11 rounded-md bg-cyan-500 hover:bg-cyan-400 text-white text-sm font-medium inline-flex items-center justify-center gap-1.5"
                 >
                   <CheckCircle2 className="w-4 h-4" />
                   {censusZero && (commitConfirm.uncountedItems > 0 || commitConfirm.uncountedSides > 0) ? "Commit + zero uncounted" : "Commit"}
@@ -1708,7 +1847,14 @@ export default function ReconciliationPage() {
         )}
       </div>
 
-      <PrintSheet items={filtered} />
+      {confirmDialog}
+      <PrintSheet items={filtered} activeFilters={[
+        q && `search “${q}”`,
+        brand && `brand ${brand}`,
+        cat && `category ${cat}`,
+        showOnlyChanged && "only staged",
+        conflictsOnly && "conflicts only",
+      ].filter(Boolean) as string[]} />
     </Shell>
   );
 }
@@ -1738,9 +1884,8 @@ function Header({
   stats: { myStaged: number; anyStaged: number; conflicts: number; invalid: number; usersWithDrafts: Set<string> };
 }) {
   return (
-    <div className="mb-5">
+    <div className="mb-6">
       <div className="flex items-center gap-3 mb-1">
-        <ClipboardCheck className="w-5 h-5 text-cyan-600 dark:text-cyan-400" />
         <h1 className="text-xl sm:text-2xl font-semibold tracking-tight">Reconciliation</h1>
         <span className={cn(
           "px-2 py-0.5 rounded text-[10px] uppercase tracking-wider font-medium",
@@ -1788,7 +1933,7 @@ function Toolbar({
   conflictsOnly, setConflictsOnly, conflictCount,
   brands, cats, shownCount,
   mode, setMode, isAdmin, usersWithDrafts,
-  myDone, onToggleDone, doneSaving,
+  myDone, canCount, onToggleDone, doneSaving,
   onPrint, onHistory, onCommit, canCommit, processing, progress,
 }: {
   q: string; setQ: (s: string) => void;
@@ -1800,7 +1945,7 @@ function Toolbar({
   brands: string[]; cats: string[]; shownCount: number;
   mode: "my" | "reviewer"; setMode: (m: "my" | "reviewer") => void;
   isAdmin: boolean; usersWithDrafts: number;
-  myDone: boolean; onToggleDone: () => void; doneSaving: boolean;
+  myDone: boolean; canCount: boolean; onToggleDone: () => void; doneSaving: boolean;
   onPrint: () => void; onHistory: () => void; onCommit: () => void;
   canCommit: boolean; processing: boolean;
   progress: { done: number; total: number };
@@ -1824,13 +1969,13 @@ function Toolbar({
 
         {/* Desktop: inline filters */}
         <div className="hidden md:flex md:items-center md:gap-2">
-          <select value={brand} onChange={(e) => setBrand(e.target.value)}
-            className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-md px-3 py-1.5 text-sm">
+          <select value={brand} onChange={(e) => setBrand(e.target.value)} aria-label="Filter by brand"
+            className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-md px-3 py-1.5 text-sm focus:outline-none focus:border-cyan-500">
             <option value="">All brands</option>
             {brands.map(b => <option key={b} value={b}>{b}</option>)}
           </select>
-          <select value={cat} onChange={(e) => setCat(e.target.value)}
-            className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-md px-3 py-1.5 text-sm">
+          <select value={cat} onChange={(e) => setCat(e.target.value)} aria-label="Filter by category"
+            className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-md px-3 py-1.5 text-sm focus:outline-none focus:border-cyan-500">
             <option value="">All categories</option>
             {cats.map(c => <option key={c} value={c}>{c}</option>)}
           </select>
@@ -1909,8 +2054,10 @@ function Toolbar({
         </button>
 
         {/* My count: freeze/unfreeze my entries. Marking done turns any item I
-            leave blank but a teammate filled into a flagged conflict. */}
-        {mode === "my" && (
+            leave blank but a teammate filled into a flagged conflict.
+            Hidden for viewers — they can't count, so a done flag from them
+            would only turn other counters' items into false conflicts. */}
+        {mode === "my" && canCount && (
           <button
             type="button"
             onClick={onToggleDone}
@@ -1963,12 +2110,7 @@ function Toolbar({
             type="button"
             onClick={onCommit}
             disabled={!canCommit}
-            className={cn(
-              "inline-flex items-center gap-2 rounded-md px-4 py-1.5 text-sm font-medium border transition-colors",
-              canCommit
-                ? "bg-cyan-500 hover:bg-cyan-400 text-white border-cyan-500"
-                : "bg-zinc-200 dark:bg-zinc-800 text-zinc-500 border-zinc-200 dark:border-zinc-800 cursor-not-allowed"
-            )}
+            className="inline-flex items-center gap-2 rounded-md px-3.5 py-1.5 text-sm font-medium bg-cyan-500 hover:bg-cyan-400 text-white transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
           >
             {processing
               ? <><Loader2 className="w-3.5 h-3.5 animate-spin" /> {progress.done}/{progress.total}…</>
@@ -2121,17 +2263,31 @@ function GodownPanel({
   // One box filled, sibling blank on a counted godown → make the implied 0 explicit.
   const onlyCases = cRaw.trim() !== "" && lRaw.trim() === "";
   const onlyLoose = lRaw.trim() !== "" && cRaw.trim() === "";
+  // The diff (and the commit) compare at the NEW case size — show the system
+  // reference re-based the same way, so "SYS · You · Diff" always reconciles
+  // visually when the counter edited the case size.
+  const csEdited = csNew !== csOld;
+  const sysPcs = csEdited ? pieces(csNew, appSide.cases, appSide.loose) : side.appPieces;
+  // No case size (0) → the item counts loose-only; a Cases entry would be
+  // ignored by the maths, so don't offer the box (existing text stays
+  // editable so it can be cleared).
+  const casesDisabled = frozen || (csNew <= 0 && cRaw.trim() === "");
   return (
     <div className={cn("rounded-xl border-l-4 bg-zinc-50/70 dark:bg-zinc-800/40 p-2.5", rail)}>
       <div className="flex items-center justify-between gap-2 mb-2">
         <span className={cn("text-[11px] font-semibold uppercase tracking-wider", head)}>Godown {g}</span>
-        <SysChip label="SYS">{fmtN(side.appPieces)} pcs</SysChip>
+        <SysChip label="SYS">
+          {fmtN(sysPcs)} pcs{csEdited && <span className="text-zinc-400"> · was {fmtN(side.appPieces)}</span>}
+        </SysChip>
       </div>
       <div className={cn(compact ? "grid grid-cols-2 gap-2" : "space-y-2")}>
         <div>
           <span className="block text-[10px] uppercase tracking-wide text-zinc-500 mb-0.5">Cases</span>
-          <ExprInput value={cRaw} onChange={onCases} onBlur={onBlur} stepper={stepper} compact={compact} disabled={frozen}
+          <ExprInput value={cRaw} onChange={onCases} onBlur={onBlur} stepper={stepper && !casesDisabled} compact={compact} disabled={casesDisabled}
             tone={tone} ariaLabel={`${ariaPrefix} godown ${g} cases`} />
+          {csNew <= 0 && cRaw.trim() === "" && !frozen && (
+            <span className="block text-[9px] text-amber-600 dark:text-amber-400 mt-0.5">no case size — count loose</span>
+          )}
         </div>
         <div>
           <span className="block text-[10px] uppercase tracking-wide text-zinc-500 mb-0.5">Loose</span>
@@ -2360,7 +2516,9 @@ function ExprInput({
       : "bg-white dark:bg-zinc-900 placeholder:text-zinc-300 dark:placeholder:text-zinc-600 placeholder:font-normal",
     !disabled && tone === "amber" && "border-amber-500/60 focus:ring-amber-500/30 focus:border-amber-500",
     !disabled && tone === "rose" && "border-rose-500/70 focus:ring-rose-500/30 focus:border-rose-500",
-    !disabled && tone === "neutral" && "border-zinc-200 dark:border-zinc-700 focus:ring-violet-500/40 focus:border-violet-500"
+    // cyan-* = the remapped brand violet — keeps the heads-down count boxes
+    // on the literal brand colour instead of a near-miss raw violet.
+    !disabled && tone === "neutral" && "border-zinc-200 dark:border-zinc-700 focus:ring-cyan-500/40 focus:border-cyan-500"
   );
   const field = (
     <div className="flex-1 flex flex-col gap-0.5 min-w-0">
@@ -2393,7 +2551,7 @@ function ExprInput({
   };
   const atZero = (parseExpr(displayValue) ?? 0) <= 0;
   const stepBtn =
-    "flex-shrink-0 min-w-11 min-h-11 rounded-lg border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-100 select-none active:scale-95 active:bg-zinc-200 dark:active:bg-zinc-700 hover:border-violet-400 disabled:opacity-40 disabled:active:scale-100 flex items-center justify-center transition";
+    "flex-shrink-0 min-w-11 min-h-11 rounded-lg border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-100 select-none active:scale-95 active:bg-zinc-200 dark:active:bg-zinc-700 hover:border-cyan-400 disabled:opacity-40 disabled:active:scale-100 flex items-center justify-center transition";
   return (
     <div className="flex items-start gap-1.5">
       <button type="button" tabIndex={-1} onClick={() => bump(-1)} disabled={atZero || disabled}
@@ -2643,25 +2801,32 @@ function ReviewerView({
 
 // One godown block inside a reviewer counter row (A or B).
 function ReviewerGodown({
-  g, side, csNew, cRaw, lRaw, conflictCell, onCases, onLoose, onBlur, ariaPrefix,
+  g, side, csOld, csNew, cRaw, lRaw, conflictCell, onCases, onLoose, onBlur, ariaPrefix, appSide,
 }: {
   g: Godown;
   side: RowDiffType["A"];
-  csNew: number;
+  csOld: number; csNew: number;
   cRaw: string; lRaw: string;
   conflictCell: boolean;
   onCases: (v: string) => void; onLoose: (v: string) => void; onBlur: () => void;
   ariaPrefix: string;
+  appSide: AppStock;
 }) {
   const touched = side.userTouched;
   const rail = g === "A" ? "border-l-cyan-500/70" : "border-l-violet-500/70";
   const head = g === "A" ? "text-cyan-700 dark:text-cyan-300" : "text-violet-700 dark:text-violet-300";
   const tone: "neutral" | "amber" | "rose" = conflictCell ? "rose" : touched ? (side.valid ? "amber" : "rose") : "neutral";
+  // Re-base the system reference at the edited case size (same rule as the
+  // My-count panels) so SYS · Counted · Diff reconcile visually.
+  const csEdited = csNew !== csOld;
+  const sysPcs = csEdited ? pieces(csNew, appSide.cases, appSide.loose) : side.appPieces;
   return (
     <div className={cn("rounded-lg border-l-4 bg-zinc-50/60 dark:bg-zinc-800/30 p-2", rail, conflictCell && "ring-1 ring-rose-500/40")}>
       <div className="flex items-center justify-between gap-1 mb-1.5">
         <span className={cn("text-[10px] font-semibold uppercase tracking-wider", conflictCell ? "text-rose-600 dark:text-rose-400" : head)}>Godown {g}</span>
-        <SysChip label="SYS">{fmtN(side.appPieces)} pcs</SysChip>
+        <SysChip label="SYS">
+          {fmtN(sysPcs)} pcs{csEdited && <span className="text-zinc-400"> · was {fmtN(side.appPieces)}</span>}
+        </SysChip>
       </div>
       <div className="grid grid-cols-2 gap-1.5">
         <div>
@@ -2732,9 +2897,9 @@ function ReviewerUserRow({
 
       {/* Godown A + B */}
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-        <ReviewerGodown g="A" side={rd.A} csNew={rd.csNew} cRaw={d.a_cases_raw} lRaw={d.a_loose_raw}
+        <ReviewerGodown g="A" side={rd.A} csOld={rd.csOld} csNew={rd.csNew} appSide={app.A} cRaw={d.a_cases_raw} lRaw={d.a_loose_raw}
           conflictCell={!!conflict?.a} onCases={(v) => onChange("a_cases", v)} onLoose={(v) => onChange("a_loose", v)} onBlur={onBlur} ariaPrefix={`${name}`} />
-        <ReviewerGodown g="B" side={rd.B} csNew={rd.csNew} cRaw={d.b_cases_raw} lRaw={d.b_loose_raw}
+        <ReviewerGodown g="B" side={rd.B} csOld={rd.csOld} csNew={rd.csNew} appSide={app.B} cRaw={d.b_cases_raw} lRaw={d.b_loose_raw}
           conflictCell={!!conflict?.b} onCases={(v) => onChange("b_cases", v)} onLoose={(v) => onChange("b_loose", v)} onBlur={onBlur} ariaPrefix={`${name}`} />
       </div>
 
@@ -2832,8 +2997,12 @@ function EmptyState({ clearFilters }: { clearFilters: () => void }) {
 // ─── print sheet ─────────────────────────────────────────────────────────
 function PrintSheet({
   items,
+  activeFilters = [],
 }: {
   items: (Item & { categoryName: string | null })[];
+  // Printed in the header so a partial sheet can't be mistaken for the full
+  // catalogue (the sheet prints the FILTERED list).
+  activeFilters?: string[];
 }) {
   type Group = { brand: string; cats: Array<{ cat: string; rows: typeof items }> };
   const grouped: Group[] = useMemo(() => {
@@ -2860,7 +3029,10 @@ function PrintSheet({
       <div className="ps-header">
         <div>
           <div className="ps-title">Stock Reconciliation — Count Sheet</div>
-          <div className="ps-subtitle">Rye Electricals · {today}</div>
+          <div className="ps-subtitle">
+            Rye Electricals · {today} · {fmtN(items.length)} items
+            {activeFilters.length > 0 && <> · PARTIAL SHEET (filtered: {activeFilters.join(", ")})</>}
+          </div>
         </div>
         <div className="ps-meta">
           <div>Counted by: ______________________</div>
@@ -2890,7 +3062,7 @@ function PrintSheet({
                     <tr key={i.id}>
                       <td className="ps-model">
                         <div className="ps-model-name">{i.model}</div>
-                        <div className="ps-model-sub">{[i.size, i.colour].filter(Boolean).join(" · ")}</div>
+                        <div className="ps-model-sub">{[i.size, i.colour, i.item_code].filter(Boolean).join(" · ")}</div>
                       </td>
                       <td className="ps-cs"><div className="ps-blank-line"></div></td>
                       <td className="ps-cell"><div className="ps-blank-line"></div></td>

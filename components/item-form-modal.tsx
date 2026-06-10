@@ -1,7 +1,10 @@
 "use client";
-import { useState, useMemo } from "react";
+import { useEffect, useState, useMemo } from "react";
 import { X, Save, Loader2, AlertCircle, Plus, Archive, ArchiveRestore, FolderPlus } from "lucide-react";
 import { sb, type Item } from "@/lib/supabase";
+import { fmtN } from "@/lib/utils";
+import { useEscape } from "@/lib/hooks";
+import { useConfirm } from "@/components/confirm-dialog";
 import { CategoryTreePicker } from "@/components/category-tree-picker";
 import { pathById, type CatRow } from "@/lib/categories";
 
@@ -11,12 +14,14 @@ import { pathById, type CatRow } from "@/lib/categories";
 // item is global, so it appears in both Godown A and B immediately.
 
 export function ItemFormModal({
-  mode, item, categories, brands, onClose, onSaved,
+  mode, item, categories, brands, stockTotal, onClose, onSaved,
 }: {
   mode: "create" | "edit";
   item?: Item | null;
   categories: CatRow[];
   brands: string[];
+  /** Item's current total units (A+B) — powers the archive warning. */
+  stockTotal?: number;
   onClose: () => void;
   onSaved: () => void | Promise<void>;
 }) {
@@ -25,6 +30,9 @@ export function ItemFormModal({
   const [categoryId, setCategoryId] = useState(item?.category_id ?? "");
   // Local copy of the tree so a newly-created (sub)category shows up instantly.
   const [cats, setCats] = useState<CatRow[]>(categories);
+  // The page may pass [] before its async load lands — adopt the prop when it
+  // arrives (the local fork only exists to inject newly-created nodes).
+  useEffect(() => { setCats(categories); }, [categories]);
   const [showNewCat, setShowNewCat] = useState(false);
   const [newCatName, setNewCatName] = useState("");
   const [newCatParent, setNewCatParent] = useState<string>("");
@@ -36,18 +44,48 @@ export function ItemFormModal({
   const [reorderB, setReorderB] = useState(String(item?.reorder_point_b ?? ""));
   const [hsn, setHsn] = useState(item?.hsn_code ?? "");
   // items.gst_rate is stored as a fraction (0.18); the field shows a percent.
+  // Decimals allowed — fractional legal rates (0.25%, 1.5%) must survive a
+  // re-save instead of rounding to a whole percent.
   const [gstPct, setGstPct] = useState(
-    item?.gst_rate != null ? String(Math.round(item.gst_rate * 100)) : ""
+    item?.gst_rate != null ? String(+(item.gst_rate * 100).toFixed(2)) : ""
   );
   const [saving, setSaving] = useState(false);
   const [archiving, setArchiving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const onlyDigits = (s: string) => s.replace(/[^\d]/g, "");
+  // Digits + a single decimal point (for fractional GST rates).
+  const onlyDecimal = (s: string) => {
+    const cleaned = s.replace(/[^\d.]/g, "");
+    const dot = cleaned.indexOf(".");
+    return dot === -1 ? cleaned : cleaned.slice(0, dot + 1) + cleaned.slice(dot + 1).replace(/\./g, "");
+  };
+
+  const { confirm, confirmDialog } = useConfirm();
+  // Escape closes the modal — guarded while saving/archiving, and while the
+  // confirm dialog is up (so one Escape doesn't close both layers).
+  useEscape(!saving && !archiving && !confirmDialog, onClose);
 
   async function archive() {
     if (!item) return;
-    if (!confirm(`Archive "${item.model}"? It leaves the catalogue but its history is kept. You can restore it later.`)) return;
+    const units = stockTotal ?? 0;
+    const ok = await confirm({
+      title: `Archive “${item.model}”?`,
+      body: (
+        <>
+          It leaves the catalogue but its history is kept. You can restore it later.
+          {units > 0 && (
+            <>
+              {" "}This item still shows <b>{fmtN(units)}</b> unit{units === 1 ? "" : "s"} in stock —
+              archiving hides it from every list but keeps the stock rows.
+            </>
+          )}
+        </>
+      ),
+      danger: true,
+      confirmLabel: "Archive",
+    });
+    if (!ok) return;
     setError(null);
     setArchiving(true);
     try {
@@ -82,7 +120,7 @@ export function ItemFormModal({
     setSaving(true);
     try {
       const c = sb();
-      const gstFraction = gstPct.trim() === "" ? null : Math.max(0, Number(gstPct)) / 100;
+      const gstFraction = gstPct.trim() === "" ? null : Math.max(0, parseFloat(gstPct) || 0) / 100;
       const common = {
         p_model: model.trim(),
         p_brand: brand.trim() || null,
@@ -124,12 +162,20 @@ export function ItemFormModal({
       if (e) throw e;
       const newId = data as string;
       // Re-pull the tree so the picker shows the new (or reused) node.
-      const { data: fresh } = await sb().from("categories").select("*");
-      const rows: CatRow[] = ((fresh || []) as any[]).map((x) => ({
-        id: x.id, name: x.name, parent_id: x.parent_id ?? null,
-        sort_order: x.sort_order ?? 0, archived: x.archived ?? false,
-      }));
-      setCats(rows);
+      const { data: fresh, error: freshErr } = await sb().from("categories").select("*");
+      if (!freshErr && fresh) {
+        const rows: CatRow[] = (fresh as any[]).map((x) => ({
+          id: x.id, name: x.name, parent_id: x.parent_id ?? null,
+          sort_order: x.sort_order ?? 0, archived: x.archived ?? false,
+        }));
+        setCats(rows);
+      } else {
+        // Refresh failed — keep the current list and just append the created
+        // node locally so the picker isn't wiped.
+        setCats(prev => prev.some(r => r.id === newId)
+          ? prev
+          : [...prev, { id: newId, name, parent_id: newCatParent || null, sort_order: 0, archived: false }]);
+      }
       setCategoryId(newId);
       setShowNewCat(false);
       setNewCatName("");
@@ -189,7 +235,7 @@ export function ItemFormModal({
           ) : null}
 
           <Field label="Category" hint="pick any level — this is where the item lives in the tree">
-            <CategoryTreePicker rows={cats} value={categoryId} onChange={setCategoryId} className={inputCls} />
+            <CategoryTreePicker rows={cats} value={categoryId} onChange={setCategoryId} className={inputCls} archivedValueId={item?.category_id ?? null} />
             {categoryId && (
               <div className="text-[11px] text-zinc-500 mt-1 truncate">{pathOf.get(categoryId) || ""}</div>
             )}
@@ -251,11 +297,13 @@ export function ItemFormModal({
               <input inputMode="numeric" value={caseSize} onChange={(e) => setCaseSize(onlyDigits(e.target.value))} placeholder="0" className={`${inputCls} tnum`} />
             </Field>
             <Field label="GST %">
-              <input inputMode="numeric" value={gstPct} onChange={(e) => setGstPct(onlyDigits(e.target.value))} placeholder="18" className={`${inputCls} tnum`} />
+              <input inputMode="decimal" value={gstPct} onChange={(e) => setGstPct(onlyDecimal(e.target.value))} placeholder="18" className={`${inputCls} tnum`} />
+              <p className="text-[10px] text-zinc-400 mt-1 leading-snug">Used until a pricing row exists — the Pricing page then takes over.</p>
             </Field>
             <Field label="Reorder A"><input inputMode="numeric" value={reorderA} onChange={(e) => setReorderA(onlyDigits(e.target.value))} placeholder="0" className={`${inputCls} tnum`} /></Field>
             <Field label="Reorder B"><input inputMode="numeric" value={reorderB} onChange={(e) => setReorderB(onlyDigits(e.target.value))} placeholder="0" className={`${inputCls} tnum`} /></Field>
           </div>
+          <p className="text-[11px] text-zinc-500 -mt-1">Low-stock alerts trigger at max(A+B, 2) on Items / per godown on Godown pages.</p>
 
           <Field label="HSN code" hint="optional">
             <input value={hsn} onChange={(e) => setHsn(e.target.value)} placeholder="e.g. 8414" className={`${inputCls} tnum`} />
@@ -293,6 +341,8 @@ export function ItemFormModal({
             {saving ? "Saving…" : mode === "create" ? "Create item" : "Save changes"}
           </button>
         </div>
+        {/* Inside the card so its clicks don't bubble to the overlay's onClose */}
+        {confirmDialog}
       </div>
     </div>
   );

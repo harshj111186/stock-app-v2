@@ -57,7 +57,7 @@ export function DemoHowItWorks() {
         </div>
         <div className="px-6 py-4 border-t border-zinc-200 dark:border-zinc-800 flex items-center justify-between gap-3 bg-zinc-50 dark:bg-zinc-900/50">
           <p className="text-xs text-zinc-500">Everything here is sample data — real numbers stay private. <span className="hidden sm:inline">Built by Nexvia.</span></p>
-          <button onClick={close} className="flex-shrink-0 bg-cyan-500 hover:bg-cyan-400 text-white text-sm font-medium px-5 py-2 rounded-lg transition-colors">Explore the demo →</button>
+          <button onClick={close} className="flex-shrink-0 bg-cyan-500 hover:bg-cyan-400 text-white text-sm font-medium px-3.5 py-2 rounded-md transition-colors">Explore the demo →</button>
         </div>
       </div>
     </div>

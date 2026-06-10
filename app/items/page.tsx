@@ -1,5 +1,5 @@
 "use client";
-import { Fragment, useEffect, useState, useMemo, useCallback } from "react";
+import { Fragment, useEffect, useState, useMemo, useCallback, useRef } from "react";
 import {
   Plus, ChevronRight, ChevronDown,
   LayoutGrid, Table as TableIcon, Package,
@@ -8,19 +8,21 @@ import {
 } from "lucide-react";
 import { Shell } from "@/components/shell";
 import { useAuth } from "@/app/providers";
-import { sb, type Item, type Stock } from "@/lib/supabase";
-import { colourCss, fmtN, matchesQuery } from "@/lib/utils";
+import { sb, fetchAllRows, type Item, type Stock } from "@/lib/supabase";
+import { colourCss, fmtN, matchesQuery, lowThresholdCombined, stockStatus } from "@/lib/utils";
 import { ItemFormModal } from "@/components/item-form-modal";
 import { CategoryTreePicker } from "@/components/category-tree-picker";
 import { pathById, type CatRow } from "@/lib/categories";
 import { FilterSheet, SheetField, FilterButton } from "@/components/filter-sheet";
 import { SearchBox } from "@/components/search-box";
+import { useEscape } from "@/lib/hooks";
 
 // Combined now also carries raw cases/loose so the override modal can edit them directly.
 type Combined = Item & {
   totalA: number; totalB: number;
   casesA: number; looseA: number;
   casesB: number; looseB: number;
+  hasStockRow: boolean; // any godown_stock row exists — the dashboard's "carried" semantics
 };
 type View = "grid" | "table";
 type Depth = 0 | 1 | 2 | 3;
@@ -34,6 +36,9 @@ type Depth = 0 | 1 | 2 | 3;
 //   2 = Brand › Category (full path)
 //   3 = Category (full path) only
 const SEP = "›";
+// Sentinel for the "(No brand)" / "(No category)" filter options — the tree
+// shows these groups, so the dropdowns must be able to reach them too.
+const NONE = "__none__";
 const groupPath = (i: Combined, depth: number): string[] => {
   const catSegs = i.category ? i.category.split(" › ") : ["(No category)"];
   if (depth === 1) return [i.brand || "(No brand)"];
@@ -93,6 +98,7 @@ export default function ItemsPage() {
 
   const [items, setItems] = useState<Combined[]>([]);
   const [loaded, setLoaded] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   // filters
   const [q, setQ] = useState("");
@@ -132,20 +138,27 @@ export default function ItemsPage() {
       const v = localStorage.getItem("items.view");
       if (v === "grid" || v === "table") setView(v);
       const d = localStorage.getItem("items.depth");
-      if (d !== null) setDepth(Number(d) as Depth);
+      // Validate — a corrupt value would NaN-blank the whole tree.
+      if (d !== null && [0, 1, 2, 3].includes(Number(d))) setDepth(Number(d) as Depth);
       const e = localStorage.getItem("items.expanded");
       if (e) setExpanded(new Set(JSON.parse(e)));
     } catch { /* ignore */ }
   }, []);
   // Deep-link filters + actions from the dashboard / command palette
   // (e.g. /items?status=out, ?status=low, ?new=1).
+  // ?status/?q apply ONCE (ref guard) — this effect re-runs when isAdmin
+  // resolves, and re-applying them would stomp the user's filter changes.
+  const queryApplied = useRef(false);
   useEffect(() => {
     try {
       const p = new URLSearchParams(window.location.search);
-      const s = p.get("status");
-      if (s && ["stock", "out", "low"].includes(s)) setStatus(s);
-      const query = p.get("q");
-      if (query) setQ(query);
+      if (!queryApplied.current) {
+        queryApplied.current = true;
+        const s = p.get("status");
+        if (s && ["stock", "out", "low"].includes(s)) setStatus(s);
+        const query = p.get("q");
+        if (query) setQ(query);
+      }
       if (p.get("new") === "1" && isAdmin) setCreating(true);
     } catch { /* ignore */ }
   }, [isAdmin]);
@@ -157,11 +170,23 @@ export default function ItemsPage() {
   // Extracted to a callback so the override modal can refresh after saving.
   const loadData = useCallback(async () => {
     const c = sb();
-    const [{ data: rows }, { data: stock }, { data: cats }] = await Promise.all([
-      c.from("items").select("*").order("item_code"),
-      c.from("godown_stock").select("*"),
+    // Errors are captured (not destructured away) so a failed load shows a
+    // Retry banner instead of a fake "0 products". fetchAllRows pages past
+    // PostgREST's 1,000-row clamp (stable order: item_code,id / item_id,godown).
+    const [itemsRes, stockRes, catsRes] = await Promise.all([
+      fetchAllRows<Item>((f, t) => c.from("items").select("*").order("item_code").order("id").range(f, t)),
+      fetchAllRows<Stock>((f, t) => c.from("godown_stock").select("*").order("item_id").order("godown").range(f, t)),
       c.from("categories").select("*"),
     ]);
+    const loadErr = itemsRes.error || stockRes.error || catsRes.error?.message || null;
+    if (loadErr) {
+      // Keep whatever data is already on screen — the banner offers Retry.
+      setLoadError(loadErr);
+      setLoaded(true);
+      return;
+    }
+    setLoadError(null);
+    const rows = itemsRes.rows, stock = stockRes.rows, cats = catsRes.data;
     const catRows: CatRow[] = ((cats || []) as any[]).map(x => ({
       id: x.id, name: x.name, parent_id: x.parent_id ?? null,
       sort_order: x.sort_order ?? 0, archived: x.archived ?? false,
@@ -192,6 +217,7 @@ export default function ItemsPage() {
         totalB: cs > 0 ? b.cases * cs + b.loose : b.loose,
         casesA: a.cases || 0, looseA: a.loose || 0,
         casesB: b.cases || 0, looseB: b.loose || 0,
+        hasStockRow: !!sMap[i.id],
       };
     });
     setItems(combined);
@@ -203,30 +229,67 @@ export default function ItemsPage() {
   const onEdit = useCallback((it: Combined) => setEditingItem(it), []);
 
   // ─── derived: filter dropdown sources ───────────────────────────────────
+  // Options come from LIVE items only — archived ones shouldn't steer filters.
   const brands = useMemo(
-    () => [...new Set(items.map(i => i.brand || "").filter(Boolean))].sort(),
+    () => [...new Set(items.filter(i => !i.archived).map(i => i.brand || "").filter(Boolean))].sort(),
     [items]
   );
   const cats = useMemo(
-    () => [...new Set(items.map(i => i.category || "").filter(Boolean))].sort(),
+    () => [...new Set(items.filter(i => !i.archived).map(i => i.category || "").filter(Boolean))].sort(),
     [items]
   );
 
+  // ─── derived: status (the ONE shared rule — lib/utils) ──────────────────
+  // "out" mirrors the dashboard's "carried, now zero" KPI it deep-links from:
+  // an item with no godown_stock row at all was never stocked, so it isn't
+  // counted as out (it still displays total 0).
+  const statusOf = useCallback((i: Combined): "out" | "low" | "ok" => {
+    const t = i.totalA + i.totalB;
+    if (t === 0) return i.hasStockRow ? "out" : "ok";
+    return stockStatus(t, lowThresholdCombined(i));
+  }, []);
+
   // ─── derived: filtered items ────────────────────────────────────────────
-  const filtered = useMemo(() => items.filter(i => {
-    // Archived items only appear under the "Archived" status filter.
-    if (status === "archived") { if (!i.archived) return false; }
-    else if (i.archived) return false;
-    if (brand && i.brand !== brand) return false;
-    if (cat && i.category !== cat) return false;
-    const total = i.totalA + i.totalB;
-    if (status === "stock" && total === 0) return false;
-    if (status === "out" && total > 0) return false;
-    if (status === "low" && !(total > 0 && total <= 2)) return false;
+  // Everything EXCEPT the status filter — also powers the status-chip counts.
+  const preStatus = useMemo(() => items.filter(i => {
+    if (brand && (brand === NONE ? !!i.brand : i.brand !== brand)) return false;
+    // Category filter is subtree-aware: picking a parent shows its children.
+    if (cat && (cat === NONE ? !!i.category : !(i.category === cat || i.category?.startsWith(cat + " › ")))) return false;
     const hay = `${i.brand || ""} ${i.model} ${i.size} ${i.colour} ${i.category || ""} ${i.subcategory || ""} ${i.item_code}`;
     if (!matchesQuery(hay, q)) return false;
     return true;
-  }), [items, q, brand, cat, status]);
+  }), [items, q, brand, cat]);
+  const filtered = useMemo(() => preStatus.filter(i => {
+    // Archived items only appear under the "Archived" status filter.
+    if (status === "archived") { if (!i.archived) return false; }
+    else if (i.archived) return false;
+    const s = statusOf(i);
+    if (status === "stock" && i.totalA + i.totalB === 0) return false;
+    if (status === "out" && s !== "out") return false;
+    if (status === "low" && s !== "low") return false;
+    return true;
+  }), [preStatus, status, statusOf]);
+  // Live counts for the desktop status chips (respect every non-status filter).
+  const statusCounts = useMemo(() => {
+    const live = preStatus.filter(i => !i.archived);
+    return {
+      all: live.length,
+      stock: live.filter(i => i.totalA + i.totalB > 0).length,
+      low: live.filter(i => statusOf(i) === "low").length,
+      out: live.filter(i => statusOf(i) === "out").length,
+      archived: preStatus.length - live.length,
+    };
+  }, [preStatus, statusOf]);
+  // Selections must never outlive the filters that made them visible (a bulk
+  // move would otherwise silently include hidden items).
+  useEffect(() => {
+    setSelected(prev => {
+      if (prev.size === 0) return prev;
+      const visible = new Set(filtered.map(i => i.id));
+      const next = new Set([...prev].filter(id => visible.has(id)));
+      return next.size === prev.size ? prev : next;
+    });
+  }, [filtered]);
 
   // ─── derived: grouped tree ──────────────────────────────────────────────
   const tree = useMemo(() => buildTree(filtered, depth), [filtered, depth]);
@@ -236,6 +299,7 @@ export default function ItemsPage() {
   const searching = q.trim().length > 0;
   const isOpen = (key: string) => searching || expanded.has(key);
   const toggle = (key: string) => {
+    if (searching) return; // search forces all open — don't mutate the persisted set invisibly
     setExpanded(prev => {
       const next = new Set(prev);
       next.has(key) ? next.delete(key) : next.add(key);
@@ -257,12 +321,6 @@ export default function ItemsPage() {
   const collapseAll = () => setExpanded(new Set());
 
   // ─── render helpers ─────────────────────────────────────────────────────
-  const statusOf = (i: Combined): "out" | "low" | "ok" => {
-    const t = i.totalA + i.totalB;
-    if (t === 0) return "out";
-    if (t <= 2) return "low";
-    return "ok";
-  };
   const statusBadge = (i: Combined) => {
     const s = statusOf(i);
     return s === "out" ? <span className="text-rose-500 text-xs">● Out</span>
@@ -287,8 +345,20 @@ export default function ItemsPage() {
         )}
       </div>
 
+      {/* Load failure — keep stale data visible, offer a retry */}
+      {loadError && (
+        <div className="text-sm text-rose-600 dark:text-rose-300 bg-rose-500/10 border border-rose-500/30 rounded-md p-2.5 mb-4 flex items-start gap-2">
+          <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
+          <span className="min-w-0 break-words">Couldn’t load items — {loadError}</span>
+          <button type="button" onClick={() => loadData()} className="ml-auto shrink-0 underline underline-offset-2 font-medium">Retry</button>
+        </div>
+      )}
+
       {/* ─── Toolbar ─────────────────────────────────────────── */}
-      <div className="flex flex-wrap gap-2 mb-4 items-center">
+      {/* Sticky (reconciliation pattern) so search + filters stay reachable
+          while scrolling; negative margins span the full content width. */}
+      <div className="sticky top-0 z-20 -mx-4 sm:-mx-6 md:-mx-8 px-4 sm:px-6 md:px-8 pt-1 pb-2.5 mb-4 bg-zinc-50 dark:bg-zinc-950 border-b border-zinc-200/70 dark:border-zinc-800/70">
+      <div className="flex flex-wrap gap-2 items-center">
         <SearchBox
           value={q}
           onChange={setQ}
@@ -301,34 +371,56 @@ export default function ItemsPage() {
 
         {/* Desktop: inline filters */}
         <div className="hidden md:flex md:flex-wrap md:gap-2 md:items-center">
-          <select value={brand} onChange={(e) => setBrand(e.target.value)}
-            className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-md px-3 py-1.5 text-sm">
+          <select value={brand} onChange={(e) => setBrand(e.target.value)} aria-label="Filter by brand"
+            className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-md px-3 py-1.5 text-sm focus:outline-none focus:border-cyan-500">
             <option value="">All brands</option>
+            <option value={NONE}>(No brand)</option>
             {brands.map(b => <option key={b} value={b}>{b}</option>)}
           </select>
 
-          <select value={cat} onChange={(e) => setCat(e.target.value)}
-            className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-md px-3 py-1.5 text-sm">
+          <select value={cat} onChange={(e) => setCat(e.target.value)} aria-label="Filter by category"
+            className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-md px-3 py-1.5 text-sm focus:outline-none focus:border-cyan-500">
             <option value="">All categories</option>
+            <option value={NONE}>(No category)</option>
             {cats.map(c => <option key={c} value={c}>{c}</option>)}
           </select>
 
-          <select value={status} onChange={(e) => setStatus(e.target.value)}
-            className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-md px-3 py-1.5 text-sm">
-            <option value="">All statuses</option>
-            <option value="stock">In stock</option>
-            <option value="out">Out of stock</option>
-            <option value="low">Low (≤2)</option>
-            <option value="archived">Archived</option>
-          </select>
+          {/* Status: one-tap chips with live counts (the mobile sheet keeps its select) */}
+          {([
+            ["", "All", statusCounts.all],
+            ["stock", "In stock", statusCounts.stock],
+            ["low", "Low", statusCounts.low],
+            ["out", "Out", statusCounts.out],
+            ["archived", "Archived", statusCounts.archived],
+          ] as [string, string, number][]).map(([val, label, n]) => (
+            <button
+              key={label}
+              type="button"
+              onClick={() => setStatus(val)}
+              aria-pressed={status === val}
+              className={`px-2.5 py-1 rounded-full text-xs border transition-colors ${status === val ? "bg-cyan-500/15 border-cyan-500/50 text-cyan-700 dark:text-cyan-300" : "bg-white dark:bg-zinc-900 border-zinc-200 dark:border-zinc-800 text-zinc-600 dark:text-zinc-300"}`}
+            >
+              {label} <span className="tabular-nums opacity-70">{n}</span>
+            </button>
+          ))}
 
-          <select value={depth} onChange={(e) => setDepth(Number(e.target.value) as Depth)}
-            className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-md px-3 py-1.5 text-sm">
+          <select value={depth} onChange={(e) => setDepth(Number(e.target.value) as Depth)} aria-label="Grouping"
+            className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-md px-3 py-1.5 text-sm focus:outline-none focus:border-cyan-500">
             <option value={0}>No grouping</option>
             <option value={1}>Group: Brand</option>
             <option value={2}>Group: Brand · Category</option>
             <option value={3}>Group: Category only</option>
           </select>
+
+          {(brand || cat || status) && (
+            <button
+              type="button"
+              onClick={() => { setBrand(""); setCat(""); setStatus(""); }}
+              className="text-xs text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-200 underline underline-offset-2 px-1.5 py-1"
+            >
+              Clear all
+            </button>
+          )}
         </div>
 
         {/* View toggle */}
@@ -370,7 +462,10 @@ export default function ItemsPage() {
           </div>
         )}
 
-        <div className="text-xs text-zinc-500 self-center ml-auto tabular-nums">{filtered.length} shown</div>
+        <div className="text-xs text-zinc-500 self-center ml-auto tabular-nums">
+          Showing {fmtN(filtered.length)} of {fmtN(items.filter(i => !i.archived).length)}
+        </div>
+      </div>
       </div>
 
       {/* Mobile filters sheet — keeps the toolbar to one row on phones */}
@@ -382,12 +477,14 @@ export default function ItemsPage() {
         <SheetField label="Brand">
           <select value={brand} onChange={(e) => setBrand(e.target.value)} className="w-full bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-cyan-500">
             <option value="">All brands</option>
+            <option value={NONE}>(No brand)</option>
             {brands.map(b => <option key={b} value={b}>{b}</option>)}
           </select>
         </SheetField>
         <SheetField label="Category">
           <select value={cat} onChange={(e) => setCat(e.target.value)} className="w-full bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-cyan-500">
             <option value="">All categories</option>
+            <option value={NONE}>(No category)</option>
             {cats.map(c => <option key={c} value={c}>{c}</option>)}
           </select>
         </SheetField>
@@ -396,7 +493,7 @@ export default function ItemsPage() {
             <option value="">All statuses</option>
             <option value="stock">In stock</option>
             <option value="out">Out of stock</option>
-            <option value="low">Low (≤2)</option>
+            <option value="low">Low (below reorder)</option>
             <option value="archived">Archived</option>
           </select>
         </SheetField>
@@ -420,12 +517,12 @@ export default function ItemsPage() {
       {!loaded ? (
         <Skeleton view={view} />
       ) : filtered.length === 0 ? (
-        <Empty />
+        <Empty onClear={q || brand || cat || status ? () => { setQ(""); setBrand(""); setCat(""); setStatus(""); } : undefined} />
       ) : view === "grid" ? (
         <GridBody tree={tree} depth={depth} isOpen={isOpen} toggle={toggle} statusOf={statusOf} canWrite={canWrite} onEdit={onEdit}
           selectMode={selectMode} selected={selected} onToggleSelect={toggleSelect} />
       ) : (
-        <TableBody tree={tree} depth={depth} isOpen={isOpen} toggle={toggle} statusBadge={statusBadge} canWrite={canWrite} onEdit={onEdit}
+        <TableBody tree={tree} depth={depth} isOpen={isOpen} toggle={toggle} statusOf={statusOf} statusBadge={statusBadge} canWrite={canWrite} onEdit={onEdit}
           selectMode={selectMode} selected={selected} onToggleSelect={toggleSelect} />
       )}
 
@@ -454,6 +551,7 @@ export default function ItemsPage() {
         <ItemFormModal
           mode="edit"
           item={editingDetails}
+          stockTotal={editingDetails.totalA + editingDetails.totalB}
           categories={categories}
           brands={brands}
           onClose={() => setEditingDetails(null)}
@@ -587,8 +685,10 @@ function Card({ item, statusOf, canWrite, onEdit, selectMode, selected, onToggle
   const isSel = !!selected?.has(item.id);
   return (
     <div
-      onClick={selectMode ? () => onToggleSelect?.(item.id) : undefined}
-      className={`group relative bg-white dark:bg-zinc-900 border rounded-lg p-3 transition-all cursor-pointer flex flex-col ${isSel ? "border-cyan-500 ring-2 ring-cyan-500/40" : "border-zinc-200 dark:border-zinc-800 hover:border-cyan-500/50 hover:shadow-sm dark:hover:shadow-cyan-500/5"}`}
+      // Whole card opens the stock-edit modal for admin/staff (same action as
+      // the pencil); viewers get no fake cursor-pointer affordance.
+      onClick={selectMode ? () => onToggleSelect?.(item.id) : canWrite ? () => onEdit(item) : undefined}
+      className={`group relative bg-white dark:bg-zinc-900 border rounded-lg p-3 transition-all ${selectMode || canWrite ? "cursor-pointer" : ""} flex flex-col ${isSel ? "border-cyan-500 ring-2 ring-cyan-500/40" : "border-zinc-200 dark:border-zinc-800 hover:border-cyan-500/50 hover:shadow-sm dark:hover:shadow-cyan-500/5"}`}
     >
       {/* Selection checkbox (select mode) */}
       {selectMode && (
@@ -603,19 +703,20 @@ function Card({ item, statusOf, canWrite, onEdit, selectMode, selected, onToggle
           onClick={(e) => { e.stopPropagation(); onEdit(item); }}
           title="Edit stock (manual override)"
           aria-label="Edit stock (manual override)"
-          className="absolute top-2 right-2 z-10 p-1.5 rounded-md bg-white/90 dark:bg-zinc-900/90 border border-zinc-200 dark:border-zinc-700 text-zinc-500 hover:text-cyan-600 dark:hover:text-cyan-300 hover:border-cyan-500/50 opacity-100 md:opacity-0 md:group-hover:opacity-100 transition-opacity shadow-sm"
+          className="absolute top-2 right-2 z-10 p-1.5 rounded-md bg-white/90 dark:bg-zinc-900/90 border border-zinc-200 dark:border-zinc-700 text-zinc-500 hover:text-cyan-600 dark:hover:text-cyan-300 hover:border-cyan-500/50 opacity-100 md:opacity-0 md:group-hover:opacity-100 md:focus-visible:opacity-100 transition-opacity shadow-sm"
         >
           <Pencil className="w-3.5 h-3.5" />
         </button>
       )}
-      {/* Colour-derived header strip; falls back to a neutral gradient */}
+      {/* Colour-derived strip (slimmed from a 5:2 banner so far more cards fit
+          per screen); falls back to a neutral gradient */}
       <div
-        className="aspect-[5/2] rounded-md mb-3 flex items-center justify-center relative overflow-hidden"
+        className="h-9 rounded-md mb-3 flex items-center justify-center relative overflow-hidden"
         style={c ? { background: c.bg } : undefined}
       >
         {!c && (
           <div className="absolute inset-0 bg-gradient-to-br from-zinc-100 to-zinc-200 dark:from-zinc-800 dark:to-zinc-900 flex items-center justify-center">
-            <Package className="w-6 h-6 text-zinc-400 dark:text-zinc-600" strokeWidth={1.5} />
+            <Package className="w-4 h-4 text-zinc-400 dark:text-zinc-600" strokeWidth={1.5} />
           </div>
         )}
       </div>
@@ -645,24 +746,35 @@ function Card({ item, statusOf, canWrite, onEdit, selectMode, selected, onToggle
           the model as the primary identifier. */}
       {item.category && (
         <div
-          className="text-[10px] text-zinc-400 dark:text-zinc-500 mb-3 truncate"
+          className="text-[10px] text-zinc-400 dark:text-zinc-400 mb-3 truncate"
           title={item.category}
         >
           {item.category}
         </div>
       )}
 
-      {/* Footer: stock + status */}
-      <div className="mt-auto flex items-center justify-between text-xs border-t border-zinc-100 dark:border-zinc-800 pt-2">
-        <div className="flex gap-3 tabular-nums">
-          <span className="text-zinc-500">
-            A <span className="text-zinc-700 dark:text-zinc-200 font-medium">{fmtN(item.totalA)}</span>
-          </span>
-          <span className="text-zinc-500">
-            B <span className="text-zinc-700 dark:text-zinc-200 font-medium">{fmtN(item.totalB)}</span>
-          </span>
-        </div>
-        <span className={`${statusColour} font-medium tabular-nums`}>● {fmtN(total)}</span>
+      {/* Footer: stock + status — carton + loose ALWAYS shown separately */}
+      <div className="mt-auto flex items-center justify-between gap-2 text-xs border-t border-zinc-100 dark:border-zinc-800 pt-2">
+        {item.hasStockRow ? (
+          <div className="flex flex-col gap-0.5 text-[11px] text-zinc-500 tnum min-w-0">
+            <span className="truncate">
+              A {fmtN(item.casesA)}c + {fmtN(item.looseA)}L = <span className="text-zinc-700 dark:text-zinc-200 font-medium">{fmtN(item.totalA)}</span>
+            </span>
+            <span className="truncate">
+              B {fmtN(item.casesB)}c + {fmtN(item.looseB)}L = <span className="text-zinc-700 dark:text-zinc-200 font-medium">{fmtN(item.totalB)}</span>
+            </span>
+          </div>
+        ) : (
+          <div className="flex gap-3 tabular-nums">
+            <span className="text-zinc-500">
+              A <span className="text-zinc-700 dark:text-zinc-200 font-medium">{fmtN(item.totalA)}</span>
+            </span>
+            <span className="text-zinc-500">
+              B <span className="text-zinc-700 dark:text-zinc-200 font-medium">{fmtN(item.totalB)}</span>
+            </span>
+          </div>
+        )}
+        <span className={`${statusColour} font-medium tabular-nums flex-shrink-0`}>● {fmtN(total)}</span>
       </div>
     </div>
   );
@@ -673,12 +785,13 @@ function Card({ item, statusOf, canWrite, onEdit, selectMode, selected, onToggle
 // list with the same grouping. Both render from the same tree so the toggle
 // state and counts stay in sync.
 function TableBody({
-  tree, depth, isOpen, toggle, statusBadge, canWrite, onEdit, selectMode, selected, onToggleSelect,
+  tree, depth, isOpen, toggle, statusOf, statusBadge, canWrite, onEdit, selectMode, selected, onToggleSelect,
 }: {
   tree: Node[];
   depth: number;
   isOpen: (key: string) => boolean;
   toggle: (key: string) => void;
+  statusOf: (i: Combined) => "out" | "low" | "ok";
   statusBadge: (i: Combined) => React.ReactNode;
   canWrite: boolean;
   onEdit: (i: Combined) => void;
@@ -686,14 +799,14 @@ function TableBody({
   // ── mobile card row ────────────────────────────────────────────────────
   const renderMobileItem = (i: Combined) => {
     const total = i.totalA + i.totalB;
-    const s = total === 0 ? "out" : total <= 2 ? "low" : "ok";
+    const s = statusOf(i); // the ONE shared status rule — no inline copies
     const statusColour = s === "out" ? "text-rose-500" : s === "low" ? "text-amber-500" : "text-emerald-500";
     const swatch = colourCss(i.colour);
     const isSel = !!selected?.has(i.id);
     return (
       <div
         key={i.id}
-        onClick={selectMode ? () => onToggleSelect?.(i.id) : undefined}
+        onClick={selectMode ? () => onToggleSelect?.(i.id) : canWrite ? () => onEdit(i) : undefined}
         className={`border-t border-zinc-200/60 dark:border-zinc-800/60 px-4 py-4 flex gap-3 ${isSel ? "bg-cyan-500/10" : "active:bg-zinc-50 dark:active:bg-zinc-800/30"}`}
       >
         {selectMode && (
@@ -736,6 +849,12 @@ function TableBody({
               </button>
             )}
           </div>
+          {/* Carton + loose split (always shown separately per project rule) */}
+          {i.hasStockRow && (
+            <div className="text-[11px] text-zinc-500 tnum mt-1">
+              A {fmtN(i.casesA)}c + {fmtN(i.looseA)}L · B {fmtN(i.casesB)}c + {fmtN(i.looseB)}L
+            </div>
+          )}
         </div>
       </div>
     );
@@ -776,8 +895,10 @@ function TableBody({
     return (
       <tr
         key={i.id}
-        onClick={selectMode ? () => onToggleSelect?.(i.id) : undefined}
-        className={`group border-t border-zinc-200/50 dark:border-zinc-800/50 cursor-pointer ${isSel ? "bg-cyan-500/10" : "hover:bg-zinc-50 dark:hover:bg-zinc-800/40"}`}
+        // Whole row opens the stock-edit modal for admin/staff (same action as
+        // the pencil); viewers get no fake cursor-pointer affordance.
+        onClick={selectMode ? () => onToggleSelect?.(i.id) : canWrite ? () => onEdit(i) : undefined}
+        className={`group border-t border-zinc-200/50 dark:border-zinc-800/50 ${selectMode || canWrite ? "cursor-pointer" : ""} ${isSel ? "bg-cyan-500/10" : "hover:bg-zinc-50 dark:hover:bg-zinc-800/40"}`}
       >
         <td className="px-5 py-2.5" style={{ paddingLeft: `${indent * 16 + 20}px` }}>
           {i.brand
@@ -791,8 +912,14 @@ function TableBody({
             ? <span style={{ background: c.bg, color: c.fg }} className="px-2 py-0.5 rounded text-[11px]">{i.colour}</span>
             : i.colour}
         </td>
-        <td className="px-3 py-2.5 text-right tnum">{fmtN(i.totalA)}</td>
-        <td className="px-3 py-2.5 text-right tnum">{fmtN(i.totalB)}</td>
+        <td className="px-3 py-2.5 text-right tnum whitespace-nowrap">
+          {i.hasStockRow && <span className="text-[11px] text-zinc-500">{fmtN(i.casesA)}c + {fmtN(i.looseA)}L = </span>}
+          {fmtN(i.totalA)}
+        </td>
+        <td className="px-3 py-2.5 text-right tnum whitespace-nowrap">
+          {i.hasStockRow && <span className="text-[11px] text-zinc-500">{fmtN(i.casesB)}c + {fmtN(i.looseB)}L = </span>}
+          {fmtN(i.totalB)}
+        </td>
         <td className="px-3 py-2.5 text-right tnum font-semibold">{fmtN(i.totalA + i.totalB)}</td>
         <td className="px-3 py-2.5 text-right">{statusBadge(i)}</td>
         <td className="px-5 py-2.5 text-right w-10">
@@ -806,7 +933,7 @@ function TableBody({
               onClick={(e) => { e.stopPropagation(); onEdit(i); }}
               title="Edit stock (manual override)"
               aria-label="Edit stock (manual override)"
-              className="p-1 rounded text-zinc-400 hover:text-cyan-600 dark:hover:text-cyan-300 opacity-0 group-hover:opacity-100 transition-opacity"
+              className="p-1 rounded text-zinc-400 hover:text-cyan-600 dark:hover:text-cyan-300 opacity-0 group-hover:opacity-100 focus-visible:opacity-100 transition-opacity"
             >
               <Pencil className="w-3.5 h-3.5" />
             </button>
@@ -882,7 +1009,7 @@ function Skeleton({ view }: { view: View }) {
       <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5 gap-3">
         {Array.from({ length: 8 }).map((_, i) => (
           <div key={i} className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg p-3">
-            <div className="aspect-[5/2] rounded-md shimmer mb-3" />
+            <div className="h-9 rounded-md shimmer mb-3" />
             <div className="h-3 rounded shimmer w-1/3 mb-2" />
             <div className="h-4 rounded shimmer w-3/4 mb-2" />
             <div className="h-3 rounded shimmer w-1/2" />
@@ -900,11 +1027,14 @@ function Skeleton({ view }: { view: View }) {
   );
 }
 
-function Empty() {
+function Empty({ onClear }: { onClear?: () => void }) {
   return (
     <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg py-16 text-center">
       <Package className="w-8 h-8 text-zinc-400 dark:text-zinc-600 mx-auto mb-3" strokeWidth={1.5} />
       <div className="text-sm text-zinc-500">No items match your filters.</div>
+      {onClear && (
+        <button onClick={onClear} className="mt-3 text-xs text-cyan-600 dark:text-cyan-400 hover:underline">Clear filters</button>
+      )}
     </div>
   );
 }
@@ -951,6 +1081,10 @@ function EditStockModal({
   const nothingChanged = !csChanged && deltaA === 0 && deltaB === 0;
 
   const onlyDigits = (s: string) => s.replace(/[^\d]/g, "");
+
+  // Escape + overlay-click are blocked mid-save so the in-flight result
+  // (success or error) isn't hidden behind a closed modal.
+  useEscape(!saving, onClose);
 
   async function save() {
     if (nothingChanged) { setError("Nothing to save — change at least one value."); return; }
@@ -1017,10 +1151,10 @@ function EditStockModal({
       role="dialog"
       aria-modal="true"
       aria-label="Manual stock override"
-      onClick={onClose}
+      onClick={() => { if (!saving) onClose(); }}
     >
       <div
-        className="bg-white dark:bg-zinc-900 rounded-t-2xl sm:rounded-lg w-full max-w-2xl shadow-2xl border border-zinc-200 dark:border-zinc-800 flex flex-col max-h-[95vh] sm:max-h-[90vh]"
+        className="bg-white dark:bg-zinc-900 rounded-t-2xl sm:rounded-2xl w-full max-w-2xl shadow-lg border border-zinc-200 dark:border-zinc-800 flex flex-col max-h-[95vh] sm:max-h-[90vh] animate-slide-up"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
@@ -1102,7 +1236,7 @@ function EditStockModal({
 
         {/* Footer */}
         <div
-          className="px-5 py-3 border-t border-zinc-200 dark:border-zinc-800 flex flex-wrap items-center justify-between gap-3 bg-zinc-50 dark:bg-zinc-900/50 rounded-b-none sm:rounded-b-lg flex-shrink-0"
+          className="px-5 py-3 border-t border-zinc-200 dark:border-zinc-800 flex flex-wrap items-center justify-between gap-3 bg-zinc-50 dark:bg-zinc-900/50 flex-shrink-0"
           style={{ paddingBottom: "calc(0.75rem + env(safe-area-inset-bottom))" }}
         >
           <div className="text-[11px] text-zinc-500 w-full sm:w-auto sm:flex-1 min-w-0">
@@ -1212,6 +1346,7 @@ function MoveItemsModal({
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const targetPath = useMemo(() => (target ? pathById(categories).get(target) : ""), [target, categories]);
+  useEscape(true, onClose);
 
   async function move() {
     setError(null);
@@ -1227,7 +1362,7 @@ function MoveItemsModal({
   }
 
   return (
-    <div className="fixed inset-0 z-50 bg-black/50 dark:bg-black/70 flex items-end sm:items-center justify-center p-0 sm:p-4" role="dialog" aria-modal="true" onClick={onClose}>
+    <div className="fixed inset-0 z-50 bg-black/50 dark:bg-black/70 flex items-end sm:items-center justify-center p-0 sm:p-4" role="dialog" aria-modal="true" aria-label="Move items" onClick={onClose}>
       <div className="bg-white dark:bg-zinc-900 rounded-t-2xl sm:rounded-2xl w-full max-w-md shadow-lg border border-zinc-200 dark:border-zinc-800 animate-slide-up" onClick={(e) => e.stopPropagation()}>
         <div className="px-5 py-4 border-b border-zinc-200 dark:border-zinc-800 flex items-center justify-between">
           <h2 className="text-base font-semibold">Move {count} item{count === 1 ? "" : "s"}</h2>

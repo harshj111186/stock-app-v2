@@ -1,5 +1,5 @@
 "use client";
-import { Fragment, useEffect, useMemo, useState } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowDownToLine, ArrowUpFromLine, ArrowLeftRight, Wrench, Undo2,
   Search, RotateCcw, Loader2, CheckCircle2, AlertCircle,
@@ -7,9 +7,10 @@ import {
 } from "lucide-react";
 import { Shell } from "@/components/shell";
 import { useAuth } from "@/app/providers";
-import { sb, type Item, type Stock, type Txn } from "@/lib/supabase";
-import { fmtN, fmtMoney, matchesQuery } from "@/lib/utils";
+import { sb, fetchAllRows, type Item, type Stock, type Txn } from "@/lib/supabase";
+import { fmtN, fmtMoney, matchesQuery, todayISO, csvSafe } from "@/lib/utils";
 import { SearchBox } from "@/components/search-box";
+import { useConfirm } from "@/components/confirm-dialog";
 
 // ─── types ────────────────────────────────────────────────────────────────
 type ActionKind = "Purchase" | "Sale" | "Transfer" | "Adjustment" | "Return";
@@ -49,11 +50,15 @@ type QueuedTxn = {
   return_dir: 1 | -1;
   direction: number | null; // null for Purchase/Sale/Transfer (SQL resolves); ±1 for Adj/Return
   date: string;
+  // Insertion order for the same-priority tiebreak (uids are random, so
+  // sorting by them shuffled equal-priority rows on every refresh).
+  ord: number;
+  // True when the transaction_queue insert failed (offline / migration not
+  // run): the row lives only in this tab — no DB delete/claim for it.
+  local?: boolean;
 };
 
 type ProcessError = { rowUid: string; message: string };
-
-const TODAY = () => new Date().toISOString().slice(0, 10);
 
 const initialForm = (): FormState => ({
   action: "Purchase",
@@ -67,7 +72,7 @@ const initialForm = (): FormState => ({
   party_name: "",
   reason: "",
   return_dir: 1,
-  date: TODAY(),
+  date: todayISO(),
 });
 
 const ALL_ACTIONS: ActionKind[] = ["Purchase", "Sale", "Transfer", "Adjustment", "Return"];
@@ -82,6 +87,22 @@ const ADJ_DIRECTION: Record<string, 1 | -1> = {
   lost: -1,
   count_down: -1,
 };
+
+// Human label per reason slug — the note/log/CSV used to show the raw slug
+// ("customer_return_to_shelf"); persist the readable text instead.
+const ADJ_REASON_LABEL: Record<string, string> = {
+  found: "Found",
+  count_up: "Count up (physical > system)",
+  customer_return_to_shelf: "Customer return → back on shelf",
+  damage: "Damage",
+  lost: "Lost",
+  count_down: "Count down (physical < system)",
+};
+
+// PostgREST "function not found" — the hardening migration (adds
+// p_invoice_no / p_rate) hasn't run yet; fall back to the 7-arg call.
+const isFnNotFound = (e: any) =>
+  e?.code === "PGRST202" || /could not find the function|does not exist/i.test(e?.message || "");
 
 // ─── queue helpers ────────────────────────────────────────────────────────
 // Processing priority — LOWER runs first. The whole point of the queue is
@@ -170,9 +191,14 @@ export default function TransactionsPage() {
   const [stock, setStock] = useState<StockMap>({});
   const [txns, setTxns] = useState<Txn[]>([]);
   const [loaded, setLoaded] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [adding, setAdding] = useState(false);
+  const legacyRpc = useRef(false);
+  const { confirm, confirmDialog } = useConfirm();
 
   const [f, setF] = useState<FormState>(initialForm());
   const [toast, setToast] = useState<{ kind: "ok" | "bad"; text: string } | null>(null);
+  const toastTimer = useRef<number | null>(null);
 
   const [logFilter, setLogFilter] = useState<ActionKind | "">("");
   const [logQuery, setLogQuery] = useState("");
@@ -203,16 +229,34 @@ export default function TransactionsPage() {
 
   const reload = async () => {
     const c = sb();
-    const [{ data: rows }, { data: st }, { data: t }, { data: profs }, { data: qd }] = await Promise.all([
-      c.from("items").select("*").eq("archived", false).order("model"),
-      c.from("godown_stock").select("*"),
+    // Items are fetched INCLUDING archived (paginated past the 1,000-row
+    // PostgREST clamp): the log/CSV must label transactions of archived SKUs,
+    // and the case-size preflight needs their real case_size. The form picker
+    // filters to active items separately.
+    const [itemsR, stockR, txnsQ, namesQ, queueQ] = await Promise.all([
+      fetchAllRows<Item>((from, to) => c.from("items").select("*").order("model").order("id").range(from, to)),
+      fetchAllRows<Stock>((from, to) => c.from("godown_stock").select("*").order("item_id").order("godown").range(from, to)),
       c.from("transactions").select("*").order("created_at", { ascending: false }).limit(200),
-      c.from("user_profiles").select("id, name, email"),
+      // user_names view (2026-06-10 migration): staff can resolve colleague
+      // names. Falls back to user_profiles (self-or-admin RLS) pre-migration.
+      c.from("user_names").select("id, name, email"),
       c.from("transaction_queue").select("*").order("created_at"),  // RLS → only my rows
     ]);
-    setItems((rows || []) as Item[]);
+    let profs: any[] | null = namesQ.error ? null : namesQ.data;
+    if (!profs) profs = (await c.from("user_profiles").select("id, name, email")).data;
+
+    const err = itemsR.error || stockR.error || txnsQ.error?.message || queueQ.error?.message || null;
+    if (err) {
+      // Keep whatever is already on screen — a transient failure must not
+      // blank the queue/log (re-entering "missing" rows double-posts).
+      setLoadError(err);
+      setLoaded(true);
+      return;
+    }
+    setLoadError(null);
+    setItems(itemsR.rows);
     const sMap: StockMap = {};
-    (st || []).forEach((s: any) => {
+    stockR.rows.forEach((s: any) => {
       sMap[s.item_id] = sMap[s.item_id] || {
         A: { item_id: s.item_id, godown: "A", cases: 0, loose: 0 },
         B: { item_id: s.item_id, godown: "B", cases: 0, loose: 0 },
@@ -220,19 +264,21 @@ export default function TransactionsPage() {
       sMap[s.item_id][s.godown as "A" | "B"] = s as Stock;
     });
     setStock(sMap);
-    setTxns((t || []) as Txn[]);
+    setTxns((txnsQ.data || []) as Txn[]);
     const nm = new Map<string, string>();
     (profs || []).forEach((p: any) => nm.set(p.id, p.name?.trim() || p.email?.split("@")[0] || ""));
     setNameById(nm);
     // Hydrate the queue from the user's persisted rows so it survives leaving
-    // the app / refresh / switching device.
-    setQueue((qd || []).map((r: any): QueuedTxn => ({
+    // the app / refresh / switching device. Local-only rows (insert failed —
+    // they exist only in this tab) are preserved, not wiped.
+    const hydrated = (queueQ.data || []).map((r: any, idx: number): QueuedTxn => ({
       uid: r.id, action: r.action, item_id: r.item_id, godown: r.godown,
       to_godown: r.to_godown ?? r.godown, cartons: r.cartons ?? 0, loose: r.loose ?? 0,
       total_qty: r.total_qty ?? 0, rate: r.rate ?? "", invoice_no: r.invoice_no ?? "",
       party_name: r.party_name ?? "", reason: r.reason ?? "", return_dir: (r.return_dir ?? 1) as 1 | -1,
-      direction: r.direction ?? null, date: r.txn_date,
-    })));
+      direction: r.direction ?? null, date: r.txn_date, ord: idx, local: false,
+    }));
+    setQueue((prev) => [...hydrated, ...prev.filter((t) => t.local)]);
     setLoaded(true);
   };
   useEffect(() => { reload(); }, []);
@@ -243,6 +289,9 @@ export default function TransactionsPage() {
     return m;
   }, [items]);
 
+  // Pickers only offer active items; the log/preflight maps keep archived too.
+  const activeItems = useMemo(() => items.filter((i) => !i.archived), [items]);
+
   const selectedItem = f.item_id ? itemById.get(f.item_id) : null;
   const cs = selectedItem?.case_size || 0;
   const cartonsN = Number(f.cartons || 0);
@@ -250,8 +299,11 @@ export default function TransactionsPage() {
   const totalQty = cs > 0 ? cartonsN * cs + looseN : looseN;
 
   const showToast = (kind: "ok" | "bad", text: string) => {
+    // Cancel the previous timer — back-to-back toasts used to get cut short
+    // by the earlier toast's stale timeout.
+    if (toastTimer.current) window.clearTimeout(toastTimer.current);
     setToast({ kind, text });
-    setTimeout(() => setToast(null), 4000);
+    toastTimer.current = window.setTimeout(() => setToast(null), 4000);
   };
 
   // created_by → display name (— for unknown / removed users).
@@ -273,7 +325,7 @@ export default function TransactionsPage() {
     return [...queue].sort((a, b) => {
       const dp = priorityOf(a) - priorityOf(b);
       if (dp !== 0) return dp;
-      return a.uid.localeCompare(b.uid); // stable tiebreak by insertion
+      return a.ord - b.ord; // stable tiebreak: true insertion order
     });
   }, [queue]);
 
@@ -328,6 +380,7 @@ export default function TransactionsPage() {
     if (!canWrite) { showToast("bad", "Read-only role can't log transactions."); return; }
     if (!selectedItem) { showToast("bad", "Pick an item first."); return; }
     if (totalQty <= 0) { showToast("bad", "Quantity must be greater than zero."); return; }
+    if (!f.date) { showToast("bad", "Pick a date for the entry."); return; }
     if (f.action === "Transfer" && f.godown === f.to_godown) {
       showToast("bad", "From and To godowns must differ."); return;
     }
@@ -342,19 +395,25 @@ export default function TransactionsPage() {
       direction = f.return_dir;
     }
 
+    // Only the fields the CURRENT action renders go into the row — values
+    // typed for an earlier action (a Sale's customer + rate, an abandoned
+    // Adjustment reason) must not ride along into this entry's note.
+    const hasParty = f.action === "Purchase" || f.action === "Sale" || f.action === "Return";
+    const hasRate = f.action === "Purchase" || f.action === "Sale";
     const row: QueuedTxn = {
       uid: makeUid(),
+      ord: Date.now(),
       action: f.action,
       item_id: selectedItem.id,
       godown: f.godown,
-      to_godown: f.to_godown,
+      to_godown: f.action === "Transfer" ? f.to_godown : f.godown,
       cartons: cartonsN,
       loose: looseN,
       total_qty: totalQty,
-      rate: f.rate,
-      invoice_no: f.invoice_no,
-      party_name: f.party_name,
-      reason: f.reason,
+      rate: hasRate ? f.rate : "",
+      invoice_no: hasParty ? f.invoice_no : "",
+      party_name: hasParty ? f.party_name : "",
+      reason: f.action === "Adjustment" ? f.reason : "",
       return_dir: f.return_dir,
       direction,
       date: f.date,
@@ -375,11 +434,16 @@ export default function TransactionsPage() {
   // The actual queue-push, separated so the case-size modal can call it
   // after either Save-and-continue or Skip-as-loose.
   const doAddToQueue = async (row: QueuedTxn) => {
+    // Double-tap guard: during the insert round-trip a second tap used to
+    // queue the identical row twice.
+    if (adding) return;
+    setAdding(true);
     // Persist the queued row so it survives leaving the app / refresh / device
-    // switch. The DB id becomes the row's uid. If the queue table isn't there
-    // yet (migration not run), fall back to an in-memory row so the feature
-    // still works — it just won't persist until the SQL is applied.
+    // switch. The DB id becomes the row's uid. If the insert fails (offline /
+    // migration not run), keep an in-memory row so the feature still works —
+    // flagged `local` so the queue never tries to claim/delete it server-side.
     let uid = row.uid;
+    let local = true;
     try {
       const { data, error } = await sb().from("transaction_queue").insert({
         user_id: profile?.id,
@@ -389,13 +453,16 @@ export default function TransactionsPage() {
         reason: row.reason || null, return_dir: row.return_dir, direction: row.direction,
         txn_date: row.date,
       }).select("id").single();
-      if (!error && data) uid = data.id;
+      if (!error && data) { uid = data.id; local = false; }
     } catch { /* keep the in-memory uid */ }
-    setQueue((q) => [...q, { ...row, uid }]);
+    setQueue((q) => [...q, { ...row, uid, local }]);
     try { localStorage.setItem("txn.lastAction", row.action); } catch {}
     // Keep item + godown + action + date for fast repeat entry; clear the rest.
     setF((x) => ({ ...x, cartons: "", loose: "", rate: "", invoice_no: "", party_name: "", reason: "" }));
-    showToast("ok", `Queued ${row.action} of ${fmtN(row.total_qty)} unit${row.total_qty === 1 ? "" : "s"}.`);
+    showToast(local ? "bad" : "ok", local
+      ? `Queued ${row.action} on this device only — the server couldn't save it (offline?). It will still post when you process the queue.`
+      : `Queued ${row.action} of ${fmtN(row.total_qty)} unit${row.total_qty === 1 ? "" : "s"}.`);
+    setAdding(false);
   };
 
   // Admin path from the modal: writes the new case_size to items, reloads,
@@ -453,6 +520,9 @@ export default function TransactionsPage() {
     // Optimistic: drop it from the UI right away…
     setQueue((q) => q.filter((t) => t.uid !== uid));
     setProcessErrors((errs) => errs.filter((e) => e.rowUid !== uid));
+    // Local-only rows were never persisted — nothing to delete server-side
+    // (their non-uuid id would also make Postgres reject the DELETE).
+    if (removed?.local) return;
     // …then actually delete the persisted row. The `await` is essential — a
     // Supabase query builder is lazy and only fires its request inside .then()/
     // await, so a fire-and-forget `void` call never reached the server and the
@@ -467,9 +537,17 @@ export default function TransactionsPage() {
 
   const clearQueue = async () => {
     if (queue.length === 0) return;
-    if (!confirm(`Clear all ${queue.length} queued ${queue.length === 1 ? "entry" : "entries"}?`)) return;
+    const ok = await confirm({
+      title: `Clear all ${queue.length} queued ${queue.length === 1 ? "entry" : "entries"}?`,
+      body: "Queued entries haven't touched stock yet — clearing just empties the list.",
+      danger: true,
+      confirmLabel: "Clear queue",
+    });
+    if (!ok) return;
     const snapshot = queue;
-    const ids = snapshot.map((t) => t.uid);
+    // Local-only rows have no DB row (and a non-uuid id would abort the whole
+    // bulk DELETE) — only persisted ids go to the server.
+    const ids = snapshot.filter((t) => !t.local).map((t) => t.uid);
     setQueue([]);
     setProcessErrors([]);
     if (ids.length) {
@@ -483,6 +561,7 @@ export default function TransactionsPage() {
 
   // ── Run the entire queue in safe order ────────────────────────────────
   const processQueue = async () => {
+    if (processing) return; // re-entrancy guard (mirrors exportCsv)
     if (queue.length === 0) return;
     if (!canWrite) { showToast("bad", "Read-only role can't process."); return; }
     if (!preflight.ok) {
@@ -495,18 +574,36 @@ export default function TransactionsPage() {
     setProcessIdx(0);
 
     const failures: ProcessError[] = [];
-    const succeeded: string[] = [];
+    const uidRemap = new Map<string, string>(); // failed rows restored under a fresh queue id
+    const localFlag = new Set<string>();        // failed rows whose restore ALSO failed
     let processed = 0;
+    let claimedElsewhere = 0;
 
     for (let i = 0; i < sortedQueue.length; i++) {
       setProcessIdx(i);
       const t = sortedQueue[i];
       const note = [
-        t.reason && `reason: ${t.reason}`,
+        t.reason && `reason: ${ADJ_REASON_LABEL[t.reason] || t.reason}`,
         t.invoice_no && `inv: ${t.invoice_no}`,
         t.party_name && `party: ${t.party_name}`,
         t.rate && `rate: ${t.rate}`,
       ].filter(Boolean).join(" • ") || null;
+
+      // CLAIM the persisted row by deleting it BEFORE posting. The delete is
+      // the cross-device lock: if another open session already processed this
+      // row, the delete returns 0 rows here and we skip instead of posting the
+      // same stock movement twice. (The old order — post first, bulk-delete
+      // after — could resurrect already-posted rows when the delete failed.)
+      if (!t.local) {
+        const { data: claimed, error: claimErr } = await sb()
+          .from("transaction_queue").delete().eq("id", t.uid).select("id");
+        if (claimErr) {
+          failures.push({ rowUid: t.uid, message: "Couldn't reach the server to lock this entry — nothing was posted. Try again." });
+          setProcessErrors([...failures]);
+          continue;
+        }
+        if (!claimed || claimed.length === 0) { claimedElsewhere++; continue; }
+      }
 
       // Up to 3 attempts, but ONLY for transient network failures — a real DB
       // rejection (stock check, constraint…) breaks out immediately with its
@@ -518,7 +615,7 @@ export default function TransactionsPage() {
       for (let attempt = 0; attempt < 3; attempt++) {
         if (attempt > 0) await sleep(attempt === 1 ? 500 : 1500); // back off, then retry
         try {
-          const { error } = await sb().rpc("process_transaction", {
+          const baseArgs = {
             p_item_id: t.item_id,
             p_action: t.action,
             p_godown: t.godown,
@@ -526,8 +623,19 @@ export default function TransactionsPage() {
             p_date: t.date,
             p_note: note,
             p_direction: t.direction,
-          });
-          if (error) throw error;
+          };
+          const rateNum = t.rate !== "" && Number.isFinite(Number(t.rate)) ? Number(t.rate) : null;
+          // New 9-arg call writes invoice_no/rate to their real columns; if
+          // the hardening migration hasn't run, PostgREST can't find the
+          // signature — drop to the legacy 7-arg call for the session.
+          let res = legacyRpc.current
+            ? await sb().rpc("process_transaction", baseArgs)
+            : await sb().rpc("process_transaction", { ...baseArgs, p_invoice_no: t.invoice_no || null, p_rate: rateNum });
+          if (res.error && !legacyRpc.current && isFnNotFound(res.error)) {
+            legacyRpc.current = true;
+            res = await sb().rpc("process_transaction", baseArgs);
+          }
+          if (res.error) throw res.error;
           ok = true;
           break;
         } catch (e: any) {
@@ -536,20 +644,28 @@ export default function TransactionsPage() {
         }
       }
 
-      if (ok) {
-        processed++;
-        succeeded.push(t.uid);
-      } else {
-        const message = isNetworkError(lastErr)
-          ? "Network error — couldn't reach the server. Check your connection and tap Process queue again."
-          : (lastErr?.message || "Unknown error");
-        failures.push({ rowUid: t.uid, message });
-      }
-    }
+      if (ok) { processed++; continue; }
 
-    // Drop processed rows from the persisted queue; failures stay for retry.
-    if (succeeded.length) {
-      try { await sb().from("transaction_queue").delete().in("id", succeeded); } catch { /* reload reconciles */ }
+      const message = isNetworkError(lastErr)
+        ? "Network error — couldn't reach the server. Check your connection and tap Process queue again."
+        : (lastErr?.message || "Unknown error");
+      // The claim already deleted the persisted row — put it back so the
+      // entry survives closing the tab before a retry.
+      let rowUid = t.uid;
+      if (!t.local) {
+        try {
+          const { data: re } = await sb().from("transaction_queue").insert({
+            user_id: profile?.id, item_id: t.item_id, action: t.action, godown: t.godown,
+            to_godown: t.to_godown, cartons: t.cartons, loose: t.loose, total_qty: t.total_qty,
+            rate: t.rate || null, invoice_no: t.invoice_no || null, party_name: t.party_name || null,
+            reason: t.reason || null, return_dir: t.return_dir, direction: t.direction, txn_date: t.date,
+          }).select("id").single();
+          if (re?.id) { uidRemap.set(t.uid, re.id); rowUid = re.id; }
+          else localFlag.add(t.uid);
+        } catch { localFlag.add(t.uid); }
+      }
+      failures.push({ rowUid, message });
+      setProcessErrors([...failures]); // live status — the row shows its error immediately
     }
 
     setProcessIdx(sortedQueue.length);
@@ -557,11 +673,20 @@ export default function TransactionsPage() {
 
     if (failures.length === 0) {
       setQueue([]);
-      showToast("ok", `Processed ${processed} transaction${processed === 1 ? "" : "s"}.`);
+      showToast("ok",
+        `Processed ${processed} transaction${processed === 1 ? "" : "s"}.` +
+        (claimedElsewhere ? ` ${claimedElsewhere} ${claimedElsewhere === 1 ? "entry was" : "entries were"} already processed on another device.` : ""));
     } else {
-      // Keep only the failed rows so the user can fix and retry.
-      const failedUids = new Set(failures.map((f) => f.rowUid));
-      setQueue((q) => q.filter((t) => failedUids.has(t.uid)));
+      // Keep only the failed rows (under their restored ids) so the user can
+      // fix and retry.
+      const keep = new Set(failures.map((x) => x.rowUid));
+      setQueue((q) => q
+        .map((t) => ({
+          ...t,
+          uid: uidRemap.get(t.uid) || t.uid,
+          local: t.local || localFlag.has(t.uid),
+        }))
+        .filter((t) => keep.has(t.uid)));
       setProcessErrors(failures);
       showToast("bad", `Processed ${processed}, ${failures.length} failed — see queue.`);
     }
@@ -570,7 +695,13 @@ export default function TransactionsPage() {
   };
 
   const reverseRow = async (id: string) => {
-    if (!confirm("Reverse this transaction? A reversing entry will be added; the original stays for the audit trail.")) return;
+    const ok = await confirm({
+      title: "Reverse this transaction?",
+      body: "A reversing entry will be added; the original stays for the audit trail.",
+      danger: true,
+      confirmLabel: "Reverse",
+    });
+    if (!ok) return;
     setReversingId(id);
     try {
       const { error } = await sb().rpc("reverse_transaction", { p_txn_id: id });
@@ -607,13 +738,14 @@ export default function TransactionsPage() {
     if (exporting) return;
     setExporting(true);
     try {
-      const { data, error } = await sb()
-        .from("transactions")
-        .select("*")
-        .order("created_at", { ascending: false })
-        .limit(5000);
-      if (error) throw error;
-      let rows = (data || []) as Txn[];
+      // Paginated past PostgREST's 1,000-row clamp (.limit(5000) silently
+      // returned only 1,000 before); capped at 5,000 with a warning.
+      const { rows: fetched, error, truncated } = await fetchAllRows<Txn>((from, to) =>
+        sb().from("transactions").select("*")
+          .order("created_at", { ascending: false }).order("id").range(from, to),
+        { maxRows: 5000 });
+      if (error) throw new Error(error);
+      let rows = fetched;
       if (logFilter) rows = rows.filter((t) => t.action === logFilter);
       if (logQuery) {
         rows = rows.filter((t) => {
@@ -626,14 +758,21 @@ export default function TransactionsPage() {
         const s = String(v ?? "");
         return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
       };
-      const header = ["Txn date", "Logged at", "Action", "Reversal", "Brand", "Model", "Size", "Colour", "Item code", "Godown", "Direction", "Qty", "Note", "Invoice", "By", "Txn id", "Reverses id"];
+      // "Logged at" in IST, human-readable (was a raw UTC ISO timestamp —
+      // wrong day for evening entries when summed by date in Excel).
+      const loggedAt = (iso: string) => {
+        try {
+          return new Date(iso).toLocaleString("en-IN", { timeZone: "Asia/Kolkata", hour12: true });
+        } catch { return iso; }
+      };
+      const header = ["Txn date", "Logged at", "Action", "Reversal", "Brand", "Model", "Size", "Colour", "Item code", "Godown", "Direction", "Qty", "Rate", "Note", "Invoice", "By", "Txn id", "Reverses id"];
       const lines = rows.map((t) => {
         const it = itemById.get(t.item_id);
         return [
-          (t.txn_date || "").slice(0, 10), t.created_at, t.action, t.reverses_id ? "yes" : "",
-          it?.brand || "", it?.model || "", it?.size || "", it?.colour || "", it?.item_code || "",
-          godownLabel(t), t.direction === 1 ? "in" : "out", t.qty,
-          t.note || t.reason || "", t.invoice_no || "", nameOf(t.created_by), t.id, t.reverses_id || "",
+          (t.txn_date || "").slice(0, 10), loggedAt(t.created_at), t.action, t.reverses_id ? "yes" : "",
+          csvSafe(it?.brand || ""), csvSafe(it?.model || ""), csvSafe(it?.size || ""), csvSafe(it?.colour || ""), csvSafe(it?.item_code || ""),
+          godownLabel(t), t.direction === 1 ? "in" : "out", t.qty, t.rate ?? "",
+          csvSafe(t.note || ""), csvSafe(t.invoice_no || ""), csvSafe(nameOf(t.created_by)), t.id, t.reverses_id || "",
         ].map(esc).join(",");
       });
       // BOM so Excel detects UTF-8 (brand/colour names can carry non-ASCII).
@@ -642,12 +781,15 @@ export default function TransactionsPage() {
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = `transactions-log-${new Date().toISOString().slice(0, 10)}.csv`;
+      a.download = `transactions-log-${todayISO()}.csv`;
       document.body.appendChild(a);
       a.click();
       a.remove();
       URL.revokeObjectURL(url);
-      showToast("ok", `Exported ${rows.length} transaction${rows.length === 1 ? "" : "s"}.`);
+      showToast("ok",
+        truncated
+          ? `Exported the most recent 5,000 transactions — older rows are not in this file.`
+          : `Exported ${rows.length} transaction${rows.length === 1 ? "" : "s"}.`);
     } catch (e: any) {
       showToast("bad", `Export failed: ${e?.message || e}`);
     } finally {
@@ -673,6 +815,20 @@ export default function TransactionsPage() {
         </div>
       </div>
 
+      {loadError && (
+        <div className="mb-4 text-sm text-rose-600 dark:text-rose-300 bg-rose-500/10 border border-rose-500/30 rounded-md p-2.5 flex items-start gap-2">
+          <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
+          <span className="flex-1">Couldn&apos;t refresh — {loadError}. Showing the last loaded data.</span>
+          <button
+            type="button"
+            onClick={() => void reload()}
+            className="font-medium underline underline-offset-2 hover:text-rose-700 dark:hover:text-rose-200"
+          >
+            Retry
+          </button>
+        </div>
+      )}
+
       {/* ── Entry form ─────────────────────────────────────────────────── */}
       <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-2xl md:rounded-lg shadow-sm md:shadow-none overflow-hidden mb-6 md:mb-8">
         <div className="flex border-b border-zinc-200 dark:border-zinc-800">
@@ -687,7 +843,10 @@ export default function TransactionsPage() {
               <button
                 key={a}
                 type="button"
-                onClick={() => setF((x) => ({ ...x, action: a }))}
+                // Switching action clears the fields the new action doesn't
+                // render — an abandoned Sale's customer/rate must not ride
+                // along into a Transfer's note.
+                onClick={() => setF((x) => ({ ...x, action: a, reason: "", invoice_no: "", party_name: "", rate: "" }))}
                 title={a}
                 aria-label={a}
                 className={[
@@ -708,7 +867,7 @@ export default function TransactionsPage() {
           <div className="md:col-span-2">
             <Label>Item</Label>
             <ItemPicker
-              items={items}
+              items={activeItems}
               value={f.item_id}
               onChange={(id) => setF((x) => ({ ...x, item_id: id }))}
             />
@@ -745,7 +904,13 @@ export default function TransactionsPage() {
                 <Label>To</Label>
                 <SegBtn
                   value={f.to_godown}
-                  onChange={(v) => setF((x) => ({ ...x, to_godown: v as "A" | "B" }))}
+                  // Picking the same godown as From auto-flips From — a
+                  // Transfer can never be A→A, so don't offer a dead end.
+                  onChange={(v) => setF((x) => ({
+                    ...x,
+                    to_godown: v as "A" | "B",
+                    godown: v === x.godown ? (v === "A" ? "B" : "A") : x.godown,
+                  }))}
                   options={[{ v: "A", l: "A" }, { v: "B", l: "B" }]}
                 />
               </div>
@@ -838,7 +1003,7 @@ export default function TransactionsPage() {
               <select
                 value={f.reason}
                 onChange={(e) => setF((x) => ({ ...x, reason: e.target.value }))}
-                className="w-full bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-md px-3 py-2 text-sm"
+                className="w-full bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-cyan-500"
               >
                 <option value="">— pick a reason —</option>
                 <optgroup label="Stock goes UP (+)">
@@ -925,11 +1090,11 @@ export default function TransactionsPage() {
             </div>
             <button
               type="button"
-              disabled={processing || !canWrite}
+              disabled={processing || !canWrite || adding}
               onClick={addToQueue}
-              className="bg-cyan-500 hover:bg-cyan-400 disabled:opacity-40 disabled:cursor-not-allowed text-white px-4 py-2 rounded-md text-sm font-medium flex items-center gap-2"
+              className="bg-cyan-500 hover:bg-cyan-400 disabled:opacity-40 disabled:cursor-not-allowed text-white px-3.5 py-2 rounded-md text-sm font-medium flex items-center gap-2"
             >
-              <Plus className="w-4 h-4" />
+              {adding ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />}
               Add {f.action} to queue
             </button>
           </div>
@@ -991,17 +1156,17 @@ export default function TransactionsPage() {
 
           {/* Desktop / tablet table */}
           <table className="w-full text-sm hidden md:table">
-            <thead className="bg-zinc-50 dark:bg-zinc-900/50">
+            <thead className="bg-zinc-50 dark:bg-zinc-900/50 border-b border-zinc-200 dark:border-zinc-800">
               <tr className="text-zinc-500 text-[11px] uppercase tracking-wider">
-                <th className="text-left px-5 py-2 font-medium">#</th>
-                <th className="text-left px-3 py-2 font-medium">Action</th>
-                <th className="text-left px-3 py-2 font-medium">Item</th>
-                <th className="text-left px-3 py-2 font-medium">Godown</th>
-                <th className="text-right px-3 py-2 font-medium">Qty</th>
-                <th className="text-right px-3 py-2 font-medium">A after</th>
-                <th className="text-right px-3 py-2 font-medium">B after</th>
-                <th className="text-left px-3 py-2 font-medium">Status</th>
-                <th className="text-right px-5 py-2 font-medium" />
+                <th className="text-left px-5 py-2.5 font-medium">#</th>
+                <th className="text-left px-3 py-2.5 font-medium">Action</th>
+                <th className="text-left px-3 py-2.5 font-medium">Item</th>
+                <th className="text-left px-3 py-2.5 font-medium">Godown</th>
+                <th className="text-right px-3 py-2.5 font-medium">Qty</th>
+                <th className="text-right px-3 py-2.5 font-medium">A after</th>
+                <th className="text-right px-3 py-2.5 font-medium">B after</th>
+                <th className="text-left px-3 py-2.5 font-medium">Status</th>
+                <th className="text-right px-5 py-2.5 font-medium" />
               </tr>
             </thead>
             <tbody>
@@ -1081,9 +1246,9 @@ export default function TransactionsPage() {
                 : t.action === "Transfer" ? -1
                 : t.direction;
               const status = procErr
-                ? <span className="text-rose-600 dark:text-rose-300 inline-flex items-center gap-1"><AlertCircle className="w-3 h-3 flex-shrink-0" /> <span className="truncate">{procErr}</span></span>
+                ? <span className="text-rose-600 dark:text-rose-300 inline-flex items-start gap-1"><AlertCircle className="w-3 h-3 flex-shrink-0 mt-0.5" /> <span className="min-w-0 break-words">{procErr}</span></span>
                 : snap?.warning
-                ? <span className="text-rose-600 dark:text-rose-300 inline-flex items-center gap-1"><AlertCircle className="w-3 h-3 flex-shrink-0" /> <span className="truncate">{snap.warning}</span></span>
+                ? <span className="text-rose-600 dark:text-rose-300 inline-flex items-start gap-1"><AlertCircle className="w-3 h-3 flex-shrink-0 mt-0.5" /> <span className="min-w-0 break-words">{snap.warning}</span></span>
                 : processing && i < processIdx
                 ? <span className="text-emerald-600 dark:text-emerald-400 inline-flex items-center gap-1"><CheckCircle2 className="w-3 h-3" /> done</span>
                 : processing && i === processIdx
@@ -1151,11 +1316,17 @@ export default function TransactionsPage() {
       )}
 
       {toast && (
-        <div className={[
-          "fixed bottom-4 right-4 z-30 px-4 py-2 rounded-md text-sm shadow-lg flex items-center gap-2 max-w-md",
-          toast.kind === "ok" ? "bg-emerald-500/20 text-emerald-600 dark:text-emerald-300 border border-emerald-500/30"
-                              : "bg-rose-500/20 text-rose-600 dark:text-rose-300 border border-rose-500/30",
-        ].join(" ")}>
+        <div
+          role="status"
+          aria-live="polite"
+          className={[
+            // bottom-20 clears the 56px mobile tab bar; z-[60] floats above
+            // the z-50 modals (errors fired from the case-size flow used to
+            // render dimmed BEHIND the overlay).
+            "fixed bottom-20 md:bottom-6 left-1/2 -translate-x-1/2 z-[60] px-4 py-2 rounded-lg text-sm font-medium shadow-lg flex items-center gap-2 max-w-md",
+            toast.kind === "ok" ? "bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 border border-emerald-500/40"
+                                : "bg-rose-500/15 text-rose-700 dark:text-rose-300 border border-rose-500/40",
+          ].join(" ")}>
           {toast.kind === "ok" ? <CheckCircle2 className="w-4 h-4" /> : <AlertCircle className="w-4 h-4" />}
           {toast.text}
         </div>
@@ -1169,7 +1340,8 @@ export default function TransactionsPage() {
           <select
             value={logFilter}
             onChange={(e) => setLogFilter(e.target.value as ActionKind | "")}
-            className="bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-md px-2 py-1 text-xs"
+            className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-md px-3 py-1.5 text-sm text-zinc-600 dark:text-zinc-300 focus:outline-none focus:border-cyan-500"
+            aria-label="Filter by action"
           >
             <option value="">All actions</option>
             <option value="Purchase">Purchases</option>
@@ -1198,24 +1370,30 @@ export default function TransactionsPage() {
 
         {/* Desktop / tablet table */}
         <table className="w-full text-sm hidden md:table">
-          <thead className="bg-zinc-50 dark:bg-zinc-900/50">
+          <thead className="bg-zinc-50 dark:bg-zinc-900/50 border-b border-zinc-200 dark:border-zinc-800">
             <tr className="text-zinc-500 text-[11px] uppercase tracking-wider">
-              <th className="text-left px-5 py-2 font-medium">Date</th>
-              <th className="text-left px-3 py-2 font-medium">Action</th>
-              <th className="text-left px-3 py-2 font-medium">Item</th>
-              <th className="text-left px-3 py-2 font-medium">Godown</th>
-              <th className="text-right px-3 py-2 font-medium">Qty</th>
-              <th className="text-left px-3 py-2 font-medium">Note</th>
-              <th className="text-left px-3 py-2 font-medium">By</th>
-              <th className="text-right px-5 py-2 font-medium" />
+              <th className="text-left px-5 py-2.5 font-medium">Date</th>
+              <th className="text-left px-3 py-2.5 font-medium">Action</th>
+              <th className="text-left px-3 py-2.5 font-medium">Item</th>
+              <th className="text-left px-3 py-2.5 font-medium">Godown</th>
+              <th className="text-right px-3 py-2.5 font-medium">Qty</th>
+              <th className="text-left px-3 py-2.5 font-medium">Note</th>
+              <th className="text-left px-3 py-2.5 font-medium">By</th>
+              <th className="text-right px-5 py-2.5 font-medium" />
             </tr>
           </thead>
           <tbody>
             {!loaded && (
-              <tr><td colSpan={8} className="py-10 text-center text-sm text-zinc-500">Loading…</td></tr>
+              Array.from({ length: 6 }).map((_, i) => (
+                <tr key={i} className="border-t border-zinc-100 dark:border-zinc-800/60">
+                  <td colSpan={8} className="px-5 py-3"><div className="h-4 rounded shimmer" style={{ width: `${50 + ((i * 13) % 45)}%` }} /></td>
+                </tr>
+              ))
             )}
             {loaded && visibleTxns.length === 0 && (
-              <tr><td colSpan={8} className="py-10 text-center text-sm text-zinc-500">No transactions match these filters.</td></tr>
+              <tr><td colSpan={8} className="py-10 text-center text-sm text-zinc-500">
+                {logFilter || logQuery ? "No transactions match these filters." : "No transactions yet — queue your first entry above."}
+              </td></tr>
             )}
             {loaded && visibleTxns.map((t) => {
               const it = itemById.get(t.item_id);
@@ -1240,7 +1418,7 @@ export default function TransactionsPage() {
                       <span>{fmtN(t.qty)}</span>
                     </span>
                   </td>
-                  <td className="px-3 py-2.5 text-xs text-zinc-500 truncate max-w-[260px]">{t.note || t.reason || t.invoice_no || t.status || ""}</td>
+                  <td className="px-3 py-2.5 text-xs text-zinc-500 truncate max-w-[260px]">{t.note || t.reason || t.invoice_no || ""}</td>
                   <td className="px-3 py-2.5 text-xs text-zinc-600 dark:text-zinc-300">{nameOf(t.created_by)}</td>
                   <td className="px-5 py-2.5 text-right">
                     {canWrite && !isReversal && !alreadyReversed ? (
@@ -1266,9 +1444,17 @@ export default function TransactionsPage() {
         </table>
         {/* Mobile cards */}
         <div className="md:hidden">
-          {!loaded && <div className="py-10 text-center text-sm text-zinc-500">Loading…</div>}
+          {!loaded && (
+            <div className="px-4 py-4 space-y-3">
+              {Array.from({ length: 5 }).map((_, i) => (
+                <div key={i} className="h-4 rounded shimmer" style={{ width: `${55 + ((i * 11) % 40)}%` }} />
+              ))}
+            </div>
+          )}
           {loaded && visibleTxns.length === 0 && (
-            <div className="py-10 text-center text-sm text-zinc-500">No transactions match these filters.</div>
+            <div className="py-10 text-center text-sm text-zinc-500">
+              {logFilter || logQuery ? "No transactions match these filters." : "No transactions yet — queue your first entry above."}
+            </div>
           )}
           <ul className="divide-y divide-zinc-200/60 dark:divide-zinc-800/60">
             {loaded && visibleTxns.map((t) => {
@@ -1276,7 +1462,7 @@ export default function TransactionsPage() {
               const isReversal = !!t.reverses_id;
               const alreadyReversed = txns.some((x) => x.reverses_id === t.id);
               const showDirHint = t.action === "Adjustment" || t.action === "Return" || t.action === "Transfer";
-              const note = t.note || t.reason || t.invoice_no || t.status || "";
+              const note = t.note || t.reason || t.invoice_no || "";
               return (
                 <li key={t.id} className="px-4 py-3">
                   <div className="flex items-center justify-between gap-2 mb-1">
@@ -1325,6 +1511,8 @@ export default function TransactionsPage() {
           </ul>
         </div>
       </div>
+
+      {confirmDialog}
     </Shell>
   );
 }
@@ -1342,7 +1530,7 @@ function Label({ children }: { children: React.ReactNode }) {
 }
 
 function Input({
-  value, onChange, type = "text", placeholder, step, min, inputMode,
+  value, onChange, type = "text", placeholder, step, min, inputMode, autoFocus,
 }: {
   value: string;
   onChange: (v: string) => void;
@@ -1351,16 +1539,21 @@ function Input({
   step?: string;
   min?: string;
   inputMode?: "numeric" | "decimal" | "text";
+  autoFocus?: boolean;
 }) {
   return (
     <input
       type={type}
       value={value}
       onChange={(e) => onChange(e.target.value)}
+      // Number inputs change value on mouse-wheel while focused — blur instead
+      // so scrolling the page can't silently corrupt a quantity.
+      onWheel={type === "number" ? (e) => (e.currentTarget as HTMLInputElement).blur() : undefined}
       placeholder={placeholder}
       step={step}
       min={min}
       inputMode={inputMode}
+      autoFocus={autoFocus}
       className="w-full bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-cyan-500 tnum"
     />
   );
@@ -1403,11 +1596,14 @@ function SegBtn({
 }
 
 function ActionBadge({ action, reversal }: { action: string; reversal?: boolean }) {
+  // Canonical action→colour map (shared with the dashboard's Recent
+  // activity). Adjustment is sky — raw violet collided with the brand-violet
+  // Purchase badge (`cyan-*` renders violet via the palette remap).
   const colour =
     action === "Purchase" ? "bg-cyan-500/15 text-cyan-600 dark:text-cyan-300"
     : action === "Sale" ? "bg-emerald-500/15 text-emerald-600 dark:text-emerald-300"
     : action === "Transfer" ? "bg-amber-500/15 text-amber-600 dark:text-amber-300"
-    : action === "Adjustment" ? "bg-violet-500/15 text-violet-600 dark:text-violet-300"
+    : action === "Adjustment" ? "bg-sky-500/15 text-sky-600 dark:text-sky-300"
     : action === "Return" ? "bg-rose-500/15 text-rose-600 dark:text-rose-300"
     : "bg-zinc-500/15 text-zinc-600 dark:text-zinc-300";
   return (
@@ -1427,6 +1623,7 @@ function ItemPicker({
 }) {
   const [q, setQ] = useState("");
   const [open, setOpen] = useState(false);
+  const [hi, setHi] = useState(0); // keyboard-highlighted row
   const selected = items.find((i) => i.id === value);
 
   const matches = useMemo(() => {
@@ -1436,6 +1633,13 @@ function ItemPicker({
     ).slice(0, 30);
   }, [items, q]);
 
+  useEffect(() => { setHi(0); }, [q, open]);
+
+  const pick = (i: Item) => { onChange(i.id); setQ(""); setOpen(false); };
+  // Closing without a pick also clears the stale query so the previous
+  // selection's label (not the abandoned search text) shows on next focus.
+  const close = () => { setOpen(false); setQ(""); };
+
   return (
     <div className="relative">
       <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-zinc-500 pointer-events-none" />
@@ -1443,21 +1647,37 @@ function ItemPicker({
         value={selected && !open ? `${selected.brand ? selected.brand + " · " : ""}${selected.model} · ${selected.size} · ${selected.colour}` : q}
         onChange={(e) => { setQ(e.target.value); setOpen(true); }}
         onFocus={() => setOpen(true)}
-        onBlur={() => setTimeout(() => setOpen(false), 150)}
+        onBlur={() => setTimeout(close, 150)}
+        onKeyDown={(e) => {
+          if (!open) return;
+          if (e.key === "ArrowDown") { e.preventDefault(); setHi((h) => Math.min(h + 1, matches.length - 1)); }
+          else if (e.key === "ArrowUp") { e.preventDefault(); setHi((h) => Math.max(h - 1, 0)); }
+          else if (e.key === "Enter") { e.preventDefault(); if (matches[hi]) pick(matches[hi]); }
+          else if (e.key === "Escape") { e.stopPropagation(); close(); }
+        }}
+        role="combobox"
+        aria-expanded={open}
+        aria-label="Search items"
         placeholder="Search model / colour / item code…"
         className="w-full bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-md pl-9 pr-3 py-2 text-sm focus:outline-none focus:border-cyan-500"
       />
       {open && (
-        <div className="absolute z-20 mt-1 left-0 right-0 max-h-80 overflow-y-auto bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-700 rounded-md shadow-lg">
+        <div role="listbox" className="absolute z-20 mt-1 left-0 right-0 max-h-80 overflow-y-auto bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-700 rounded-md shadow-lg">
           {matches.length === 0 && (
             <div className="py-6 px-3 text-center text-xs text-zinc-500">No matches.</div>
           )}
-          {matches.map((i) => (
+          {matches.map((i, idx) => (
             <button
               key={i.id}
               type="button"
-              onMouseDown={(e) => { e.preventDefault(); onChange(i.id); setQ(""); setOpen(false); }}
-              className="w-full text-left px-3 py-2 text-sm hover:bg-zinc-50 dark:hover:bg-zinc-800/60 flex items-center justify-between gap-3 border-b border-zinc-100 dark:border-zinc-800/60 last:border-b-0"
+              role="option"
+              aria-selected={idx === hi}
+              onMouseDown={(e) => { e.preventDefault(); pick(i); }}
+              onMouseEnter={() => setHi(idx)}
+              className={[
+                "w-full text-left px-3 py-2 text-sm flex items-center justify-between gap-3 border-b border-zinc-100 dark:border-zinc-800/60 last:border-b-0",
+                idx === hi ? "bg-zinc-50 dark:bg-zinc-800/60" : "",
+              ].join(" ")}
             >
               <div className="min-w-0 flex-1">
                 <div className="truncate">{i.brand && <span className="text-zinc-400">{i.brand} · </span>}{i.model}</div>
@@ -1508,12 +1728,12 @@ function CaseSizeModal({
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/60 backdrop-blur-sm p-0 sm:p-4"
+      className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/50 dark:bg-black/70 p-0 sm:p-4"
       onClick={() => { if (!saving) onCancel(); }}
     >
       <div
         onClick={(e) => e.stopPropagation()}
-        className="w-full max-w-md bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-t-2xl sm:rounded-lg shadow-xl overflow-hidden"
+        className="w-full max-w-md bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-t-2xl sm:rounded-2xl shadow-lg animate-slide-up overflow-hidden"
         style={{ paddingBottom: "env(safe-area-inset-bottom)" }}
       >
         <div className="px-5 py-4 border-b border-zinc-200 dark:border-zinc-800 flex items-start gap-3">
@@ -1538,8 +1758,8 @@ function CaseSizeModal({
         <div className="p-5 space-y-4">
           <div className="bg-zinc-50 dark:bg-zinc-800/40 rounded p-3 border border-zinc-200 dark:border-zinc-700/50">
             <div className="text-[11px] uppercase tracking-wider text-zinc-500 mb-1">Pending {pendingAction.toLowerCase()}</div>
-            <div className="text-2xl font-semibold tnum text-zinc-900 dark:text-zinc-100">
-              {fmtN(pendingQty)} <span className="text-xs font-normal text-zinc-500">unit{pendingQty === 1 ? "" : "s"}</span>
+            <div className="text-2xl font-semibold font-display tnum text-zinc-900 dark:text-zinc-100">
+              {fmtN(pendingQty)} <span className="text-xs font-normal font-sans text-zinc-500">unit{pendingQty === 1 ? "" : "s"}</span>
             </div>
             <div className="text-[11px] text-zinc-500 mt-1">
               Currently entered as loose-only. Set a case size to split into cartons + loose.
@@ -1550,7 +1770,7 @@ function CaseSizeModal({
             <div>
               <Label>Case size (units per carton)</Label>
               <Input
-                type="number" min="1" inputMode="numeric"
+                type="number" min="1" inputMode="numeric" autoFocus
                 value={sizeStr}
                 onChange={(v) => setSizeStr(v.replace(/[^\d]/g, ""))}
                 placeholder="e.g. 12"
@@ -1576,7 +1796,7 @@ function CaseSizeModal({
             type="button"
             onClick={onCancel}
             disabled={saving}
-            className="text-xs text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-300 px-3 py-1.5 disabled:opacity-40"
+            className="text-sm text-zinc-600 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800 px-3 py-2 rounded-md disabled:opacity-40"
           >
             Cancel
           </button>
@@ -1584,7 +1804,7 @@ function CaseSizeModal({
             type="button"
             onClick={onSkip}
             disabled={saving}
-            className="text-xs text-zinc-700 dark:text-zinc-200 hover:bg-zinc-100 dark:hover:bg-zinc-800 px-3 py-1.5 rounded-md border border-zinc-200 dark:border-zinc-700 disabled:opacity-40"
+            className="text-sm text-zinc-700 dark:text-zinc-200 hover:bg-zinc-100 dark:hover:bg-zinc-800 px-3 py-2 rounded-md border border-zinc-200 dark:border-zinc-700 disabled:opacity-40"
           >
             Skip — add as loose
           </button>
@@ -1593,9 +1813,9 @@ function CaseSizeModal({
               type="button"
               onClick={() => onSave(n)}
               disabled={!valid || saving}
-              className="bg-cyan-500 hover:bg-cyan-400 disabled:opacity-40 disabled:cursor-not-allowed text-white px-4 py-1.5 rounded-md text-xs font-medium flex items-center gap-2"
+              className="bg-cyan-500 hover:bg-cyan-400 disabled:opacity-40 disabled:cursor-not-allowed text-white px-3.5 py-2 rounded-md text-sm font-medium flex items-center gap-2"
             >
-              {saving ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <CheckCircle2 className="w-3.5 h-3.5" />}
+              {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <CheckCircle2 className="w-4 h-4" />}
               Set case size &amp; add
             </button>
           )}

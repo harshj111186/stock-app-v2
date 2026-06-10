@@ -193,7 +193,7 @@ export function PinGate({
               placeholder="Master key"
               disabled={busy}
               autoComplete="off"
-              className="w-full bg-zinc-50 dark:bg-zinc-800 border-2 border-zinc-200 dark:border-zinc-700 rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:border-cyan-500 disabled:opacity-50"
+              className="w-full bg-zinc-50 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:border-cyan-500 disabled:opacity-50"
               aria-label="Master key"
             />
             <button

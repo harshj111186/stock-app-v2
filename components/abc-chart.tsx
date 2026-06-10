@@ -4,6 +4,7 @@ import {
 } from "recharts";
 import { TrendingUp } from "lucide-react";
 import { fmtN, fmtMoney } from "@/lib/utils";
+import { useIsDark } from "@/lib/hooks";
 
 // Pareto chart for the ABC report, split into its own module + loaded via
 // next/dynamic (ssr:false) so recharts (~50kB) stays off the report route's
@@ -13,8 +14,7 @@ import { fmtN, fmtMoney } from "@/lib/utils";
 type ChartDatum = { idx: number; label: string; cls: string; revenue: number; cumPct: number };
 
 export default function AbcChart({ chartData, totalRows }: { chartData: ChartDatum[]; totalRows: number }) {
-  const isDark =
-    typeof document !== "undefined" && document.documentElement.classList.contains("dark");
+  const isDark = useIsDark();
   return (
     <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg p-4 mb-6">
       <div className="flex items-center gap-2 mb-3">

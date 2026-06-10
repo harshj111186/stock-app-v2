@@ -48,3 +48,6 @@ coverage/
 .pr-*.tmp.*
 .merge*.tmp.*
 .runs.tmp.*
+
+# local static-preview junction (visual verification only)
+.preview-static/

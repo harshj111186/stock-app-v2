@@ -2,35 +2,43 @@
 
 > Snapshot to resume work in a fresh session. **Read `PROGRESS.md` too** — it's the
 > full source of truth (this file is just the "where things stand right now" summary).
-> As of commit **`2103606`** (2026-06-03) — fully activated. Branch `main` is in sync with origin.
+> As of the 2026-06-10 "god mode" audit commit. Branch `main` should be in sync with origin.
 
 ---
 
-## ⚠️ Status: ONE migration to run, then fully activated
+## ⚠️ Status: TWO migrations to run, then fully activated
 
-**Run `db/2026-06-10-count-log.sql` in Supabase → SQL editor.** It creates `reconciliation_count_log` —
-the permanent per-counter record written automatically at every commit ("Make adjustments" / "Apply this
-count"), powering the Reviewer's **Count history** modal + its CSV export. Until it runs, commits still
-work and just toast that the log wasn't saved. Idempotent.
+1. **`db/2026-06-10-count-log.sql`** (if not yet run) — creates `reconciliation_count_log`, the
+   permanent per-counter record behind the Reviewer's Count history modal. Commits work without it
+   (they just warn). Idempotent.
+2. **`db/2026-06-10-hardening-fixes.sql`** (NEW — run it soon, it closes real security holes):
+   role-gates `process_transaction`/`reverse_transaction` (any authenticated account could post
+   stock via raw RPC), server-side double-reverse guard + unique index, optional invoice/rate params
+   (the client auto-falls-back to the old 7-arg call until this runs), PIN `set_pin`/`change_pin`
+   lockout hardening, peer-admin/self guards on admin RPCs, master-login brute-force throttle,
+   viewer-proof reconciliation drafts/done RLS, `user_names` view (staff see colleague names in the
+   log), friendly category-collision errors, `price_history.discounts`. Idempotent.
 
-The 2026-06-09 coordination migration (`2026-06-09-reconciliation-coordination.sql`) **has been run**
-(live-confirmed: done flags + cross-counter visibility working in production).
+Optional: redeploy `supabase/functions/master-login` (CORS now origin-locked) — the brute-force
+throttle lives in SQL and works without the redeploy.
 
-Everything else is **committed, pushed, live, and switched on**. Every earlier `db/*.sql` (through
-`2026-06-02-category-redo.sql`) has been run, and both Edge Functions (`master-login`, `admin-account`)
-are deployed.
+The 2026-06-09 coordination migration **has been run** (live-confirmed). Every earlier `db/*.sql`
+(through `2026-06-02-category-redo.sql`) has been run; both Edge Functions are deployed.
 
-A full re-audit on 2026-06-03 (8 subsystems, adversarially verified) found the codebase healthy; the
-2026-06-09 reconciliation revamp was design-panel + adversarially reviewed (see PROGRESS changelog).
-NOTE for future sessions: `transactions.reason` is a dead column — audit text lives in
-`transactions.note` (see the 2026-06-10 changelog entry).
+**2026-06-10 (later): full-app "god mode" audit** — 7 subsystems audited adversarially, ~70 findings
+fixed in one pass (the silent PostgREST 1,000-row cap corrupting reports, ABC class-boundary bug,
+3 conflicting low-stock rules unified into `lib/utils`, queue double-posting, returns netting,
+IST dates, truthful reconciliation count-log ordering, pricing silent-coercion saves, 13 native
+confirm/prompts → styled `useConfirm` dialog, toasts/buttons/tables/modals converged, demo-mode
+repairs). Full detail in the PROGRESS changelog. `transactions.reason` is still a dead column —
+audit text lives in `transactions.note`.
 
 **Known follow-ups (low priority, not blocking):**
-- Low-stock threshold is computed 3 different ways (dashboard `Math.max(reorder_a+reorder_b,2)`,
-  godown-view per-godown reorder points, items page flat `≤2`). Unify into one `lib/utils` helper when
-  convenient — changes "low" semantics app-wide, so confirm intent first.
-- `db/diagnostics-reconciliation-integrity.sql` has an **uncommitted local edit** (the user's read-only
-  diagnostic query, not from our work). Commit or leave it — zero app effect.
+- `items.image_url` + `items.alert_threshold` are dead schema columns (no UI reads/writes them) —
+  either wire item photos someday or drop them from the docs.
+- `category_rename` doesn't sync the legacy `items.category` text column (only v1 would notice).
+- Invoice/rate now land in real columns for NEW transactions; party name still lives in the note
+  (parties table is empty — a party master is a future feature).
 
 ---
 
@@ -56,7 +64,12 @@ NOTE for future sessions: `transactions.reason` is a dead column — audit text 
 
 ## What shipped this session (newest first; full detail in PROGRESS.md changelog)
 
-- **(newest)** **Persistent transaction queue** (run `transaction_queue` SQL) + **actor name** shown
+- **(newest) 2026-06-10 full-app audit + fixes** — see the changelog's "GOD MODE" entry: pagination
+  helper (`fetchAllRows`), security hardening migration, unified low-stock rules, queue claim
+  semantics, returns netting, truthful count-log ordering, `useConfirm` dialog system, design
+  convergence across every page, demo-mode repairs. NEW shared files: `lib/hooks.ts`,
+  `components/confirm-dialog.tsx`.
+- **Persistent transaction queue** (run `transaction_queue` SQL) + **actor name** shown
   in the transaction log & audit log (resolves `created_by` / `user_id` → name).
 1. **Admin: reset password + remove account** (`admin-account` Edge Function) — pending deploy.
 2. **Fix:** `apply_reconciliation` "godown_t cast bug" (the Edit-stock `process_transaction does

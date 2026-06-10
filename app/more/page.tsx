@@ -46,7 +46,7 @@ export default function MorePage() {
           <div className="flex-1 min-w-0">
             <div className="text-sm font-medium truncate">{profile?.name || profile?.email}</div>
             <div className="text-xs text-zinc-500 mt-0.5">
-              <span className="inline-block bg-cyan-500/15 text-cyan-600 dark:text-cyan-300 px-1.5 py-0.5 rounded text-[10px] uppercase tracking-wider font-medium mr-2">{profile?.role}</span>
+              <span className="inline-block bg-cyan-500/15 text-cyan-600 dark:text-cyan-300 px-1.5 py-0.5 rounded text-[10px] uppercase tracking-wider font-medium mr-2">{profile?.is_super_admin ? "super admin" : profile?.role}</span>
               {profile?.email}
             </div>
           </div>

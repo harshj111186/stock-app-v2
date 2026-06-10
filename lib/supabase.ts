@@ -39,6 +39,35 @@ export function sb(): SupabaseClient {
   return _client;
 }
 
+// ─── Paginated fetch — defeats PostgREST's silent 1,000-row cap ─────────
+//
+// Supabase clamps every select to Max Rows (1,000 on this project) no matter
+// what .limit() asks for. Any query that can grow past that MUST page with
+// .range() or its tail silently vanishes (the 2026-06-10 audit found reports
+// computing totals over an arbitrary first-1000 subset because of this).
+//
+// Usage — the builder gets a [from, to] window and MUST include a stable
+// .order() so pages don't overlap:
+//   const { rows, error } = await fetchAllRows<Txn>((f, t) =>
+//     sb().from("transactions").select("*").order("created_at").range(f, t));
+export async function fetchAllRows<T>(
+  build: (from: number, to: number) => PromiseLike<{ data: T[] | null; error: { message: string } | null }>,
+  opts: { pageSize?: number; maxRows?: number } = {}
+): Promise<{ rows: T[]; error: string | null; truncated: boolean }> {
+  const pageSize = opts.pageSize ?? 1000;
+  const maxRows = opts.maxRows ?? 50000;
+  const rows: T[] = [];
+  for (let from = 0; from < maxRows; from += pageSize) {
+    const to = Math.min(from + pageSize, maxRows) - 1;
+    const { data, error } = await build(from, to);
+    if (error) return { rows, error: error.message, truncated: false };
+    if (!data || data.length === 0) break;
+    rows.push(...data);
+    if (data.length < pageSize) break;
+  }
+  return { rows, error: null, truncated: rows.length >= maxRows };
+}
+
 // ---- Types matching our public.* tables ----
 export type Item = {
   id: string;

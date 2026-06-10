@@ -6,8 +6,8 @@ import {
 } from "lucide-react";
 import { Shell } from "@/components/shell";
 import { ReportsSubnav } from "@/components/reports-subnav";
-import { sb, type Item, type Stock, type Pricing, type Txn } from "@/lib/supabase";
-import { fmtN, fmtMoney } from "@/lib/utils";
+import { sb, fetchAllRows, type Item, type Stock, type Pricing, type Txn } from "@/lib/supabase";
+import { fmtN, fmtMoney, netRate, csvSafe } from "@/lib/utils";
 
 // ─── date helpers (local-time, NOT UTC) ──────────────────────────────────
 const fmtISO = (d: Date) => {
@@ -69,41 +69,60 @@ type Row = {
   neverMoved: boolean;
 };
 
+// What the fetch stores: everything except the basis-dependent fields, which
+// derive in a memo so switching basis doesn't refetch (both date maps are
+// always built anyway).
+type BaseRow = Omit<Row, "daysSinceMovement" | "neverMoved">;
+
 export default function DeadStockPage() {
-  const [thresholdDays, setThresholdDays] = useState<number>(90);
-  const [basis, setBasis] = useState<MovementBasis>("salesOnly");
-  const [includeNeverSold, setIncludeNeverSold] = useState<boolean>(true);
+  // Persisted UI state restores LAZILY (not in a post-mount effect) so the
+  // first render already has the saved values — no double work on mount.
+  const [thresholdDays, setThresholdDays] = useState<number>(() => {
+    try {
+      if (typeof window === "undefined") return 90;
+      return Number(localStorage.getItem("deadStock.threshold")) || 90;
+    } catch { return 90; }
+  });
+  const [basis, setBasis] = useState<MovementBasis>(() => {
+    try {
+      if (typeof window === "undefined") return "salesOnly";
+      const b = localStorage.getItem("deadStock.basis");
+      return b === "salesOnly" || b === "anyOutbound" ? b : "salesOnly";
+    } catch { return "salesOnly"; }
+  });
+  const [includeNeverSold, setIncludeNeverSold] = useState<boolean>(() => {
+    try {
+      if (typeof window === "undefined") return true;
+      const n = localStorage.getItem("deadStock.includeNeverSold");
+      return n === null ? true : n === "true";
+    } catch { return true; }
+  });
   const [query, setQuery] = useState("");
   const [brandFilter, setBrandFilter] = useState("");
   const [categoryFilter, setCategoryFilter] = useState("");
-  const [sortBy, setSortBy] = useState<"capital" | "days" | "units">("capital");
+  const [sortBy, setSortBy] = useState<"capital" | "days" | "units">(() => {
+    try {
+      if (typeof window === "undefined") return "capital";
+      const s = localStorage.getItem("deadStock.sortBy");
+      return s === "capital" || s === "days" || s === "units" ? s : "capital";
+    } catch { return "capital"; }
+  });
 
-  const [rows, setRows] = useState<Row[]>([]);
+  const [baseRows, setBaseRows] = useState<BaseRow[]>([]);
   const [loaded, setLoaded] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [hitLimit, setHitLimit] = useState(false);
   const todayIso = useMemo(() => fmtISO(new Date()), []);
 
-  // Persist UI state.
-  useEffect(() => {
-    try {
-      const t = localStorage.getItem("deadStock.threshold");
-      if (t) setThresholdDays(Number(t) || 90);
-      const b = localStorage.getItem("deadStock.basis");
-      if (b === "salesOnly" || b === "anyOutbound") setBasis(b);
-      const n = localStorage.getItem("deadStock.includeNeverSold");
-      if (n !== null) setIncludeNeverSold(n === "true");
-      const s = localStorage.getItem("deadStock.sortBy");
-      if (s === "capital" || s === "days" || s === "units") setSortBy(s);
-    } catch { /* ignore */ }
-  }, []);
+  // Persist UI state. (Restore happens in the lazy initializers above.)
   useEffect(() => { try { localStorage.setItem("deadStock.threshold", String(thresholdDays)); } catch {} }, [thresholdDays]);
   useEffect(() => { try { localStorage.setItem("deadStock.basis", basis); } catch {} }, [basis]);
   useEffect(() => { try { localStorage.setItem("deadStock.includeNeverSold", String(includeNeverSold)); } catch {} }, [includeNeverSold]);
   useEffect(() => { try { localStorage.setItem("deadStock.sortBy", sortBy); } catch {} }, [sortBy]);
 
-  // ── Fetch on basis change (threshold doesn't change the DB pull —
-  //    re-classifies in-memory). ────────────────────────────────────────
+  // ── Fetch ONCE on mount — basis and threshold never change the DB pull.
+  //    Both date maps are always built; the basis pick happens in the
+  //    `rows` memo below, the threshold cut in `deadRows`. ────────────────
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -113,48 +132,59 @@ export default function DeadStockPage() {
       try {
         const c = sb();
 
-        // 1) Full catalogue + current stock + pricing + category names. We
-        //    need every non-archived item, even ones with zero stock, so the
-        //    "include never-sold items" toggle behaves sensibly (it filters
-        //    by neverMoved AND totalUnits > 0).
-        const [
-          { data: items, error: e1 },
-          { data: stock, error: e2 },
-          { data: pricing, error: e3 },
-          { data: cats, error: e4 },
-        ] = await Promise.all([
-          c.from("items").select("*").eq("archived", false),
-          c.from("godown_stock").select("*"),
-          c.from("pricing").select("*"),
+        // 1) Full catalogue + current stock + pricing + category names, all
+        //    paged past PostgREST's silent 1,000-row clamp. We need every
+        //    non-archived item, even ones with zero stock, so the "include
+        //    never-sold items" toggle behaves sensibly (it filters by
+        //    neverMoved AND totalUnits > 0). Archived items stay excluded —
+        //    dead stock is about the active catalogue.
+        const [itemsRes, stockRes, pricingRes, catsRes] = await Promise.all([
+          fetchAllRows<Item>((f, t) =>
+            c.from("items").select("*").eq("archived", false).order("id").range(f, t)),
+          fetchAllRows<Stock>((f, t) =>
+            c.from("godown_stock").select("*").order("item_id").order("godown").range(f, t)),
+          fetchAllRows<Pricing>((f, t) =>
+            c.from("pricing").select("*").order("item_id").range(f, t)),
           c.from("categories").select("id, name"),
         ]);
-        if (e1) throw e1;
-        if (e2) throw e2;
-        if (e3) throw e3;
-        if (e4) throw e4;
+        if (itemsRes.error) throw new Error(itemsRes.error);
+        if (stockRes.error) throw new Error(stockRes.error);
+        if (pricingRes.error) throw new Error(pricingRes.error);
+        if (catsRes.error) throw catsRes.error;
         if (cancelled) return;
+        const items = itemsRes.rows;
+        const stock = stockRes.rows;
+        const pricing = pricingRes.rows;
+        const cats = catsRes.data;
 
         // 2) Outbound transactions — sales by default; also Transfer +
         //    negative-direction Adjustment + Return when basis is broader.
         //    We pull every relevant row (date unconstrained) — finding "the
         //    latest" per item needs the global max, not just recent rows.
+        //    Paged: a plain .limit(20000) is clamped to 1,000 server-side,
+        //    which falsely branded anything older than the newest-1,000
+        //    window as "never sold".
         //    Reversal handling: ignore rows that have reverses_id set (those
         //    are inverses, not real movement) and ignore originals whose id
         //    appears in another row's reverses_id (the move was undone).
-        const { data: txns, error: e5 } = await c
-          .from("transactions")
-          .select("id, item_id, action, direction, txn_date, reverses_id")
-          .in("action", ["Sale", "Transfer", "Adjustment", "Return"])
-          .order("txn_date", { ascending: false })
-          .limit(LIMIT);
-        if (e5) throw e5;
-        if (cancelled) return;
-        if (txns && txns.length === LIMIT) setHitLimit(true);
-
-        const allTxns = (txns || []) as Array<{
+        const { rows: txns, error: e5, truncated } = await fetchAllRows<{
           id: string; item_id: string; action: Txn["action"];
           direction: 1 | -1 | null; txn_date: string; reverses_id: string | null;
-        }>;
+        }>(
+          (f, t) => c
+            .from("transactions")
+            .select("id, item_id, action, direction, txn_date, reverses_id")
+            .in("action", ["Sale", "Transfer", "Adjustment", "Return"])
+            .order("txn_date", { ascending: false })
+            .order("id")
+            .range(f, t),
+          { maxRows: LIMIT }
+        );
+        if (e5) throw new Error(e5);
+        if (cancelled) return;
+        setHitLimit(truncated);
+
+        const allTxns = txns;
 
         // Build the reversed-original set: any id that appears as the
         // reverses_id of some other row was itself undone.
@@ -195,17 +225,10 @@ export default function DeadStockPage() {
           }
         }
 
-        // 4) Stock per item per godown.
-        const stockMap = new Map<string, { A: number; B: number }>();
-        for (const s of (stock || []) as Stock[]) {
-          const cur = stockMap.get(s.item_id) || { A: 0, B: 0 };
-          cur[s.godown] = (s.cases || 0); // hold cases here as a placeholder
-          stockMap.set(s.item_id, cur);
-        }
-        // Now expand cases × case_size + loose per item.
-        const itemMap = new Map<string, Item>((items || []).map((i: any) => [i.id, i]));
+        // 4) Stock per item per godown — cases × case_size + loose per item.
+        const itemMap = new Map<string, Item>(items.map(i => [i.id, i]));
         const stockRows: Record<string, { A: { cases: number; loose: number }; B: { cases: number; loose: number } }> = {};
-        for (const s of (stock || []) as Stock[]) {
+        for (const s of stock) {
           stockRows[s.item_id] = stockRows[s.item_id] || { A: { cases: 0, loose: 0 }, B: { cases: 0, loose: 0 } };
           stockRows[s.item_id][s.godown] = { cases: s.cases || 0, loose: s.loose || 0 };
         }
@@ -216,27 +239,24 @@ export default function DeadStockPage() {
           return cs > 0 ? r.cases * cs + r.loose : r.loose;
         };
 
-        const priceMap = new Map<string, Pricing>(
-          (pricing || []).map((p: any) => [p.item_id as string, p as Pricing])
-        );
+        const priceMap = new Map<string, Pricing>(pricing.map(p => [p.item_id, p]));
         const catMap = new Map<string, string>(
           (cats || []).map((x: any) => [x.id as string, x.name as string])
         );
 
-        // 5) Build a Row per item.
-        const built: Row[] = [];
-        for (const i of (items || []) as Item[]) {
+        // 5) Build a BaseRow per item — both last-dates kept; the
+        //    basis-dependent fields derive in the memo below.
+        const built: BaseRow[] = [];
+        for (const i of items) {
           const unitsA = totalUnitsAt(i.id, "A");
           const unitsB = totalUnitsAt(i.id, "B");
           const totalUnits = unitsA + unitsB;
           const lastSaleDate = lastSaleByItem.get(i.id) || null;
           const lastMovementDate = lastOutboundByItem.get(i.id) || null;
-          const reference = basis === "salesOnly" ? lastSaleDate : lastMovementDate;
-          const daysSinceMovement = daysSince(reference, todayIso);
 
           const price = priceMap.get(i.id);
           const hasPricing = !!price && (price.lp ?? 0) > 0;
-          const rate = hasPricing ? price!.lp * (1 - (price!.discount || 0)) : 0;
+          const rate = hasPricing ? netRate(price!.lp, price!.discount) : 0;
           const blockedCapital = totalUnits * rate;
 
           const category = i.category_id
@@ -255,26 +275,35 @@ export default function DeadStockPage() {
             totalUnits,
             lastSaleDate,
             lastMovementDate,
-            daysSinceMovement,
             rate,
             blockedCapital,
             hasPricing,
-            neverMoved: reference === null,
           });
         }
 
-        setRows(built);
+        setBaseRows(built);
         setLoaded(true);
       } catch (e: any) {
         if (cancelled) return;
         console.error("[dead-stock] load failed", e);
         setErr(e?.message || "Failed to load dead-stock report.");
-        setRows([]);
+        setBaseRows([]);
         setLoaded(true);
       }
     })();
     return () => { cancelled = true; };
-  }, [basis, todayIso]);
+  }, []);
+
+  // Pick the movement reference by basis — derived, so flipping the basis
+  // select never refetches.
+  const rows = useMemo<Row[]>(() => baseRows.map(r => {
+    const reference = basis === "salesOnly" ? r.lastSaleDate : r.lastMovementDate;
+    return {
+      ...r,
+      daysSinceMovement: daysSince(reference, todayIso),
+      neverMoved: reference === null,
+    };
+  }), [baseRows, basis, todayIso]);
 
   const brands = useMemo(() => {
     const s = new Set<string>();
@@ -338,10 +367,10 @@ export default function DeadStockPage() {
     const lines = [header.join(",")];
     visibleRows.forEach(r => {
       lines.push([
-        csvCell(r.itemCode),
-        csvCell(r.brand),
-        csvCell(r.category),
-        csvCell(r.itemLabel),
+        csvCell(csvSafe(r.itemCode)),
+        csvCell(csvSafe(r.brand)),
+        csvCell(csvSafe(r.category)),
+        csvCell(csvSafe(r.itemLabel)),
         String(r.unitsA),
         String(r.unitsB),
         String(r.totalUnits),
@@ -364,7 +393,9 @@ export default function DeadStockPage() {
 
   return (
     <Shell title="Dead stock">
-      <ReportsSubnav />
+      <div className="print:hidden">
+        <ReportsSubnav />
+      </div>
       <div className="mb-6">
         <h1 className="text-xl sm:text-2xl font-semibold tracking-tight">Dead stock</h1>
         <p className="text-sm text-zinc-500 mt-1 tabular-nums">
@@ -375,7 +406,7 @@ export default function DeadStockPage() {
       </div>
 
       {/* Toolbar */}
-      <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg p-4 mb-6 flex flex-wrap items-center gap-3">
+      <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg p-4 mb-6 flex flex-wrap items-center gap-3 print:hidden">
         <Clock className="w-4 h-4 text-zinc-500" />
         <label className="text-xs text-zinc-500 flex items-center gap-2">
           No movement for ≥
@@ -426,7 +457,7 @@ export default function DeadStockPage() {
           type="button"
           onClick={exportCsv}
           disabled={visibleRows.length === 0 || !loaded}
-          className="bg-cyan-500 hover:bg-cyan-400 disabled:opacity-40 disabled:cursor-not-allowed text-white px-3 py-1.5 rounded-md text-xs font-medium flex items-center gap-1.5"
+          className="inline-flex items-center gap-1.5 text-xs px-2.5 py-1.5 rounded-md border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 text-zinc-600 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800 disabled:opacity-40 disabled:cursor-not-allowed"
         >
           <Download className="w-3.5 h-3.5" />
           Export CSV
@@ -442,12 +473,12 @@ export default function DeadStockPage() {
       )}
       {hitLimit && (
         <div className="mb-4 text-xs text-amber-700 dark:text-amber-300 bg-amber-500/10 border border-amber-500/30 rounded-md p-2.5">
-          Reached the {fmtN(LIMIT)}-row transaction cap. Some items' "last movement" dates may be older than what's shown — they aren't in the window we scanned.
+          Movement scan stopped at {fmtN(LIMIT)} rows — very old items may show as “never sold” even though they sold before the scanned window.
         </div>
       )}
 
       {/* KPI strip */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6 print:hidden">
         <Kpi
           icon={<PackageX className="w-3.5 h-3.5" />}
           label="Dead SKUs"
@@ -477,7 +508,7 @@ export default function DeadStockPage() {
       </div>
 
       {/* Filters */}
-      <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg p-3 mb-3 flex flex-wrap items-center gap-3">
+      <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg p-3 mb-3 flex flex-wrap items-center gap-3 print:hidden">
         <div className="flex items-center gap-1.5 text-xs">
           <Search className="w-3.5 h-3.5 text-zinc-500" />
           <input
@@ -509,8 +540,9 @@ export default function DeadStockPage() {
         </div>
       </div>
 
-      {/* Table — desktop */}
-      <div className="hidden md:block bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg overflow-hidden">
+      {/* Table — desktop (print:block: print widths sit below md, so without
+          it the table would never appear on paper) */}
+      <div className="hidden md:block print:block bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg overflow-hidden">
         <table className="w-full text-sm">
           <thead className="bg-zinc-50 dark:bg-zinc-900/50 border-b border-zinc-200 dark:border-zinc-800">
             <tr className="text-zinc-500 text-[11px] uppercase tracking-wider">
@@ -525,9 +557,13 @@ export default function DeadStockPage() {
             </tr>
           </thead>
           <tbody>
-            {!loaded && (
-              <tr><td colSpan={8} className="py-10 text-center text-sm text-zinc-500">Loading…</td></tr>
-            )}
+            {!loaded && Array.from({ length: 6 }).map((_, i) => (
+              <tr key={i} className="border-t border-zinc-200/50 dark:border-zinc-800/50">
+                {Array.from({ length: 8 }).map((__, j) => (
+                  <td key={j} className="px-3 py-3"><div className="h-3 rounded shimmer" /></td>
+                ))}
+              </tr>
+            ))}
             {loaded && visibleRows.length === 0 && !err && (
               <tr>
                 <td colSpan={8} className="py-12 text-center text-sm text-zinc-500">
@@ -559,8 +595,10 @@ export default function DeadStockPage() {
                 </td>
                 <td className={[
                   "px-3 py-2.5 text-right tnum",
-                  r.neverMoved || (r.daysSinceMovement ?? 0) >= 180 ? "text-rose-500" :
-                  (r.daysSinceMovement ?? 0) >= 90 ? "text-amber-500" :
+                  // Tiers scale with the chosen threshold: rose at 2× the
+                  // cut, amber at the cut — not hardcoded 90/180.
+                  r.neverMoved || (r.daysSinceMovement ?? 0) >= thresholdDays * 2 ? "text-rose-500" :
+                  (r.daysSinceMovement ?? 0) >= thresholdDays ? "text-amber-500" :
                   "text-zinc-500",
                 ].join(" ")}>
                   {r.neverMoved ? "—" : fmtN(r.daysSinceMovement ?? 0)}
@@ -600,8 +638,12 @@ export default function DeadStockPage() {
       </div>
 
       {/* Mobile cards */}
-      <div className="md:hidden bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-2xl overflow-hidden shadow-sm">
-        {!loaded && <div className="py-10 text-center text-sm text-zinc-500">Loading…</div>}
+      <div className="md:hidden print:hidden bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-2xl overflow-hidden shadow-sm">
+        {!loaded && (
+          <div className="p-4 space-y-3">
+            {Array.from({ length: 6 }).map((_, i) => <div key={i} className="h-3 rounded shimmer" />)}
+          </div>
+        )}
         {loaded && visibleRows.length === 0 && !err && (
           <div className="py-12 text-center text-sm text-zinc-500 px-4">
             {deadRows.length === 0
@@ -612,8 +654,8 @@ export default function DeadStockPage() {
         <ul className="divide-y divide-zinc-200/60 dark:divide-zinc-800/60">
           {loaded && visibleRows.map(r => {
             const daysToneCls =
-              r.neverMoved || (r.daysSinceMovement ?? 0) >= 180 ? "text-rose-500" :
-              (r.daysSinceMovement ?? 0) >= 90 ? "text-amber-500" :
+              r.neverMoved || (r.daysSinceMovement ?? 0) >= thresholdDays * 2 ? "text-rose-500" :
+              (r.daysSinceMovement ?? 0) >= thresholdDays ? "text-amber-500" :
               "text-zinc-500";
             return (
               <li key={r.itemId} className="px-4 py-3">
@@ -672,7 +714,7 @@ function Kpi({
   return (
     <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg p-4">
       <div className="flex items-center gap-2 text-xs text-zinc-500 mb-2">{icon} {label}</div>
-      <div className={`text-2xl font-semibold tnum ${valueColour}`}>
+      <div className={`text-2xl font-semibold font-display tnum ${valueColour}`}>
         {value || <span className="shimmer inline-block h-7 w-16 rounded" />}
       </div>
       <div className="text-[11px] text-zinc-500 mt-1">{note}</div>

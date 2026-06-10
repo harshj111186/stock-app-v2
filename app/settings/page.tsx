@@ -4,6 +4,7 @@ import { useAuth } from "@/app/providers";
 import { useInstall } from "@/components/install-provider";
 import { useEffect, useState } from "react";
 import { sb } from "@/lib/supabase";
+import { useConfirm } from "@/components/confirm-dialog";
 import Link from "next/link";
 import {
   KeyRound, Loader2, CheckCircle2, AlertCircle, ShieldCheck,
@@ -15,7 +16,7 @@ export default function SettingsPage() {
   return (
     <Shell title="Settings">
       <div className="mb-6">
-        <h1 className="text-2xl font-semibold tracking-tight">Settings</h1>
+        <h1 className="text-xl sm:text-2xl font-semibold tracking-tight">Settings</h1>
         <p className="text-sm text-zinc-500 mt-1">Account + app preferences.</p>
       </div>
       <div className="grid gap-4 max-w-xl">
@@ -49,8 +50,7 @@ export default function SettingsPage() {
 
         <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg p-5">
           <div className="text-xs text-zinc-500 uppercase tracking-wider mb-3">About</div>
-          <Row label="App version" value="v2 — in development" />
-          <Row label="Connected to" value="Supabase: zvycuhldwfxpipcaeotc" />
+          <Row label="App version" value="v2" />
         </div>
       </div>
     </Shell>
@@ -202,6 +202,7 @@ function MasterKeyCard() {
   const [confirmVal, setConfirmVal] = useState("");
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<{ kind: "ok" | "bad"; text: string } | null>(null);
+  const { confirm, confirmDialog } = useConfirm();
 
   const refresh = async () => {
     try {
@@ -230,7 +231,13 @@ function MasterKeyCard() {
   };
 
   const remove = async () => {
-    if (!window.confirm("Remove the master key? Nobody will be able to use it to unlock accounts until you set a new one.")) return;
+    const ok = await confirm({
+      title: "Remove the master key?",
+      body: "Nobody will be able to use it to unlock accounts until you set a new one.",
+      danger: true,
+      confirmLabel: "Remove",
+    });
+    if (!ok) return;
     setBusy(true); setMsg(null);
     try {
       const { error } = await sb().rpc("clear_master_key");
@@ -304,6 +311,7 @@ function MasterKeyCard() {
           )}
         </div>
       </form>
+      {confirmDialog}
     </div>
   );
 }

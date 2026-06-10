@@ -11,14 +11,58 @@ export const fmtN = (n: number | null | undefined) =>
 export const fmtMoney = (n: number | null | undefined) =>
   "₹" + Math.round(n ?? 0).toLocaleString("en-IN");
 
+// Today's date as yyyy-mm-dd in the DEVICE's timezone (IST here) — NOT
+// `toISOString()`, which is UTC and stamps yesterday's date between
+// 00:00 and 05:30 IST. Use this for txn dates, commit notes, filenames.
+export const todayISO = () => {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+};
+
+// ─── stock-status rules (ONE definition app-wide) ──────────────────────
+// The audit found three diverging "low stock" rules (dashboard: reorder
+// sum, items page: flat ≤2, godown view: per-godown reorder). Canonical:
+//   combined scope  → total ≤ max(reorder_A + reorder_B, 2)
+//   per-godown scope → that godown's total ≤ max(reorder_X, 2)
+// The floor of 2 keeps a sane alert on items with no reorder points set.
+type ReorderFields = { reorder_point_a?: number | null; reorder_point_b?: number | null };
+export function lowThresholdCombined(i: ReorderFields): number {
+  return Math.max((i.reorder_point_a || 0) + (i.reorder_point_b || 0), 2);
+}
+export function lowThresholdGodown(i: ReorderFields, godown: "A" | "B"): number {
+  return Math.max((godown === "A" ? i.reorder_point_a : i.reorder_point_b) || 0, 2);
+}
+export type StockStatus = "out" | "low" | "ok";
+export function stockStatus(total: number, threshold: number): StockStatus {
+  return total === 0 ? "out" : total <= threshold ? "low" : "ok";
+}
+
+// ─── pricing math (shared + defensive) ──────────────────────────────────
+// `discount` is stored as a fraction (0.43), but legacy rows could hold a
+// percent (43). Guard every reader so one bad row can't go negative.
+export const asFraction = (d: number | null | undefined): number => {
+  const n = d ?? 0;
+  return n > 1 ? n / 100 : n;
+};
+export const DEFAULT_GST = 0.18;
+export const netRate = (lp: number | null | undefined, discount: number | null | undefined): number =>
+  (lp ?? 0) * (1 - asFraction(discount));
+
+// Neutralise spreadsheet formula injection for FREE-TEXT CSV fields (notes,
+// party names, models). Excel executes cells starting with = + - @.
+export const csvSafe = (s: string): string => (/^[=+@-]/.test(s) ? "'" + s : s);
+
 // ─── search helpers ────────────────────────────────────────────────────
 // Normalise text for forgiving search: lowercase, turn every run of
-// non-alphanumeric chars (brackets, dots, dashes, slashes…) into a single
+// non-letter/number chars (brackets, dots, dashes, slashes…) into a single
 // space, then trim. So "Phantom (BLDC) (WOOD)" → "phantom bldc wood".
+// Unicode-aware (\p{L}\p{N}) so Devanagari/accented model names stay
+// searchable — the old [^a-z0-9] stripped them entirely, making any
+// non-Latin query match EVERYTHING.
 export function normalizeText(s: string | null | undefined): string {
   return (s || "")
     .toLowerCase()
-    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
     .trim();
 }
 

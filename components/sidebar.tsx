@@ -10,7 +10,9 @@ import { useAuth } from "@/app/providers";
 import { useInstall } from "@/components/install-provider";
 import { cn } from "@/lib/utils";
 
-const NAV = [
+type NavItem = { href: string; label: string; icon: typeof LayoutDashboard; adminOnly?: boolean };
+
+const NAV: { group: string; items: NavItem[] }[] = [
   { group: "Daily", items: [
     { href: "/", label: "Dashboard", icon: LayoutDashboard },
     { href: "/items", label: "Items", icon: Boxes },
@@ -26,7 +28,8 @@ const NAV = [
     { href: "/reports/dead-stock", label: "Dead stock", icon: AlertOctagon },
   ]},
   { group: "System", items: [
-    { href: "/categories", label: "Categories", icon: FolderTree },
+    // Admin-gated page — hidden for non-admins here, same as mobile More + ⌘K.
+    { href: "/categories", label: "Categories", icon: FolderTree, adminOnly: true },
     { href: "/audit", label: "Audit log", icon: ShieldCheck },
     { href: "/users", label: "Users", icon: Users },
     { href: "/settings", label: "Settings", icon: Settings },
@@ -59,7 +62,7 @@ export function Sidebar() {
         {NAV.map((sec) => (
           <div key={sec.group}>
             <div className="pt-3 pb-1 px-3 text-[10px] uppercase tracking-wider text-zinc-500 font-semibold">{sec.group}</div>
-            {sec.items.map((item) => {
+            {sec.items.filter((item) => !item.adminOnly || profile?.role === "admin").map((item) => {
               const Icon = item.icon;
               return (
                 <Link key={item.href} href={item.href}
@@ -103,7 +106,7 @@ export function Sidebar() {
           <div className="text-xs font-medium truncate">{profile?.name || profile?.email}</div>
           <div className="text-[10px] text-zinc-500">{profile?.role}</div>
         </div>
-        <button onClick={signOut} className="text-zinc-500 hover:text-zinc-300" aria-label="Sign out">
+        <button onClick={signOut} className="text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-300" aria-label="Sign out">
           <LogOut className="w-4 h-4" />
         </button>
       </div>

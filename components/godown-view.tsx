@@ -1,12 +1,12 @@
 "use client";
-import { Fragment, useEffect, useState, useMemo } from "react";
+import { Fragment, useCallback, useEffect, useState, useMemo } from "react";
 import {
   ChevronRight, ChevronDown,
-  LayoutGrid, Table as TableIcon, Package,
+  LayoutGrid, Table as TableIcon, Package, AlertCircle,
 } from "lucide-react";
 import { Shell } from "@/components/shell";
-import { sb, type Item, type Stock } from "@/lib/supabase";
-import { colourCss, fmtN, matchesQuery } from "@/lib/utils";
+import { sb, fetchAllRows, type Item, type Stock } from "@/lib/supabase";
+import { colourCss, fmtN, matchesQuery, lowThresholdGodown, stockStatus } from "@/lib/utils";
 import { pathById, type CatRow } from "@/lib/categories";
 import { FilterSheet, SheetField, FilterButton } from "@/components/filter-sheet";
 import { SearchBox } from "@/components/search-box";
@@ -27,6 +27,9 @@ type ItemHere = Item & {
 
 // ─── grouping helpers ────────────────────────────────────────────────────
 const SEP = "›";
+// Sentinel for the "(No brand)" / "(No category)" filter options — the tree
+// shows these groups, so the dropdowns must be able to reach them too.
+const NONE = "__none__";
 // Group path per item. The category is the item's FULL place in the tree, so
 // categorising deeper just deepens the grouping — no separate free-text axis.
 //   1 = Brand · 2 = Brand › Category(full) · 3 = Category(full) only
@@ -82,6 +85,7 @@ function buildTree(items: ItemHere[], depth: number): Node[] {
 export function GodownView({ godown }: { godown: Godown }) {
   const [items, setItems] = useState<ItemHere[]>([]);
   const [loaded, setLoaded] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   // filters
   const [q, setQ] = useState("");
@@ -113,14 +117,26 @@ export function GodownView({ godown }: { godown: Godown }) {
   useEffect(() => { try { localStorage.setItem(`${lsKey}.expanded`, JSON.stringify([...expanded])); } catch {} }, [expanded, lsKey]);
 
   // ─── load data (filters godown_stock to this warehouse only) ───────────
-  useEffect(() => {
-    (async () => {
+  // Extracted to a callback so the error banner's Retry can re-run it.
+  const loadData = useCallback(async () => {
       const c = sb();
-      const [{ data: rows }, { data: stock }, { data: cats }] = await Promise.all([
-        c.from("items").select("*").eq("archived", false).order("item_code"),
-        c.from("godown_stock").select("*").eq("godown", godown),
+      // Errors are captured (not destructured away) so a failed load shows a
+      // Retry banner instead of an empty godown. fetchAllRows pages past
+      // PostgREST's 1,000-row clamp (stable order: item_code,id / item_id,godown).
+      const [itemsRes, stockRes, catsRes] = await Promise.all([
+        fetchAllRows<Item>((f, t) => c.from("items").select("*").eq("archived", false).order("item_code").order("id").range(f, t)),
+        fetchAllRows<Stock>((f, t) => c.from("godown_stock").select("*").eq("godown", godown).order("item_id").order("godown").range(f, t)),
         c.from("categories").select("*"),
       ]);
+      const loadErr = itemsRes.error || stockRes.error || catsRes.error?.message || null;
+      if (loadErr) {
+        // Keep whatever data is already on screen — the banner offers Retry.
+        setLoadError(loadErr);
+        setLoaded(true);
+        return;
+      }
+      setLoadError(null);
+      const rows = itemsRes.rows, stock = stockRes.rows, cats = catsRes.data;
       const catRows: CatRow[] = ((cats || []) as any[]).map(x => ({
         id: x.id, name: x.name, parent_id: x.parent_id ?? null,
         sort_order: x.sort_order ?? 0, archived: x.archived ?? false,
@@ -147,8 +163,8 @@ export function GodownView({ godown }: { godown: Godown }) {
       });
       setItems(combined);
       setLoaded(true);
-    })();
   }, [godown]);
+  useEffect(() => { loadData(); }, [loadData]);
 
   // ─── derived: filter dropdown sources ──────────────────────────────────
   const brands = useMemo(
@@ -161,22 +177,19 @@ export function GodownView({ godown }: { godown: Godown }) {
   );
 
   // ─── derived: helpers ──────────────────────────────────────────────────
-  // Reorder point for THIS godown. Fallback to 2 if both are 0/null.
-  const reorderFor = (i: ItemHere) =>
-    godown === "A" ? (i.reorder_point_a || 0) : (i.reorder_point_b || 0);
-
+  // Low threshold for THIS godown via the ONE shared rule (lib/utils):
+  // max(reorder_X, 2) — the floor of 2 applies always, not only when the
+  // reorder point is unset. "never" (no stock row) stays a separate state.
   const statusOf = (i: ItemHere): "never" | "out" | "low" | "ok" => {
     if (!i.hasStockRow) return "never";
-    if (i.total === 0) return "out";
-    const threshold = Math.max(reorderFor(i), 2);
-    if (i.total <= threshold) return "low";
-    return "ok";
+    return stockStatus(i.total, lowThresholdGodown(i, godown));
   };
 
   // ─── derived: filtered items ───────────────────────────────────────────
   const filtered = useMemo(() => items.filter(i => {
-    if (brand && i.brand !== brand) return false;
-    if (cat && i.category !== cat) return false;
+    if (brand && (brand === NONE ? !!i.brand : i.brand !== brand)) return false;
+    // Category filter is subtree-aware: picking a parent shows its children.
+    if (cat && (cat === NONE ? !!i.category : !(i.category === cat || i.category?.startsWith(cat + " › ")))) return false;
     const s = statusOf(i);
     if (status === "stock" && (s === "out" || s === "never")) return false;
     if (status === "out" && s !== "out") return false;
@@ -188,15 +201,17 @@ export function GodownView({ godown }: { godown: Godown }) {
   }), [items, q, brand, cat, status, godown]);
 
   // ─── derived: header stats ─────────────────────────────────────────────
+  // Computed from ALL items — the headline reads as the godown's total, so it
+  // must not shrink when filters are applied ("· X shown" covers that).
   const stats = useMemo(() => {
-    const inStock = filtered.filter(i => i.hasStockRow && i.total > 0);
+    const inStock = items.filter(i => i.hasStockRow && i.total > 0);
     return {
       countInStock: inStock.length,
       totalCases: inStock.reduce((s, i) => s + i.cases, 0),
       totalLoose: inStock.reduce((s, i) => s + i.loose, 0),
       totalUnits: inStock.reduce((s, i) => s + i.total, 0),
     };
-  }, [filtered]);
+  }, [items]);
 
   // ─── derived: grouped tree ─────────────────────────────────────────────
   const tree = useMemo(() => buildTree(filtered, depth), [filtered, depth]);
@@ -239,14 +254,27 @@ export function GodownView({ godown }: { godown: Godown }) {
                   <span className="text-zinc-700 dark:text-zinc-300">{fmtN(stats.totalCases)}</span> c +{" "}
                   <span className="text-zinc-700 dark:text-zinc-300">{fmtN(stats.totalLoose)}</span> L ={" "}
                   <span className="text-zinc-700 dark:text-zinc-300 font-medium">{fmtN(stats.totalUnits)}</span> units
+                  {filtered.length < items.length && <span className="text-zinc-400"> · {fmtN(filtered.length)} shown</span>}
                 </span>
               : "Loading…"}
           </p>
         </div>
       </div>
 
+      {/* Load failure — keep stale data visible, offer a retry */}
+      {loadError && (
+        <div className="text-sm text-rose-600 dark:text-rose-300 bg-rose-500/10 border border-rose-500/30 rounded-md p-2.5 mb-4 flex items-start gap-2">
+          <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
+          <span className="min-w-0 break-words">Couldn’t load Godown {godown} — {loadError}</span>
+          <button type="button" onClick={() => loadData()} className="ml-auto shrink-0 underline underline-offset-2 font-medium">Retry</button>
+        </div>
+      )}
+
       {/* Toolbar */}
-      <div className="flex flex-wrap gap-2 mb-4 items-center">
+      {/* Sticky (reconciliation pattern) so search + filters stay reachable
+          while scrolling; negative margins span the full content width. */}
+      <div className="sticky top-0 z-20 -mx-4 sm:-mx-6 md:-mx-8 px-4 sm:px-6 md:px-8 pt-1 pb-2.5 mb-4 bg-zinc-50 dark:bg-zinc-950 border-b border-zinc-200/70 dark:border-zinc-800/70">
+      <div className="flex flex-wrap gap-2 items-center">
         <SearchBox
           value={q}
           onChange={setQ}
@@ -259,26 +287,28 @@ export function GodownView({ godown }: { godown: Godown }) {
 
         {/* Desktop: inline filters */}
         <div className="hidden md:flex md:flex-wrap md:gap-2 md:items-center">
-          <select value={brand} onChange={(e) => setBrand(e.target.value)}
-            className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-md px-3 py-1.5 text-sm">
+          <select value={brand} onChange={(e) => setBrand(e.target.value)} aria-label="Filter by brand"
+            className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-md px-3 py-1.5 text-sm focus:outline-none focus:border-cyan-500">
             <option value="">All brands</option>
+            <option value={NONE}>(No brand)</option>
             {brands.map(b => <option key={b} value={b}>{b}</option>)}
           </select>
-          <select value={cat} onChange={(e) => setCat(e.target.value)}
-            className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-md px-3 py-1.5 text-sm">
+          <select value={cat} onChange={(e) => setCat(e.target.value)} aria-label="Filter by category"
+            className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-md px-3 py-1.5 text-sm focus:outline-none focus:border-cyan-500">
             <option value="">All categories</option>
+            <option value={NONE}>(No category)</option>
             {cats.map(c => <option key={c} value={c}>{c}</option>)}
           </select>
-          <select value={status} onChange={(e) => setStatus(e.target.value)}
-            className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-md px-3 py-1.5 text-sm">
+          <select value={status} onChange={(e) => setStatus(e.target.value)} aria-label="Filter by status"
+            className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-md px-3 py-1.5 text-sm focus:outline-none focus:border-cyan-500">
             <option value="">All statuses</option>
             <option value="stock">In stock</option>
             <option value="low">Low (≤ reorder)</option>
             <option value="out">Out of stock</option>
             <option value="never">Never stocked here</option>
           </select>
-          <select value={depth} onChange={(e) => setDepth(Number(e.target.value) as Depth)}
-            className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-md px-3 py-1.5 text-sm">
+          <select value={depth} onChange={(e) => setDepth(Number(e.target.value) as Depth)} aria-label="Grouping"
+            className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-md px-3 py-1.5 text-sm focus:outline-none focus:border-cyan-500">
             <option value={0}>No grouping</option>
             <option value={1}>Group: Brand</option>
             <option value={2}>Group: Brand · Category</option>
@@ -316,6 +346,7 @@ export function GodownView({ godown }: { godown: Godown }) {
 
         <div className="text-xs text-zinc-500 self-center ml-auto tabular-nums">{filtered.length} shown</div>
       </div>
+      </div>
 
       {/* Mobile filters sheet */}
       <FilterSheet
@@ -326,12 +357,14 @@ export function GodownView({ godown }: { godown: Godown }) {
         <SheetField label="Brand">
           <select value={brand} onChange={(e) => setBrand(e.target.value)} className="w-full bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-cyan-500">
             <option value="">All brands</option>
+            <option value={NONE}>(No brand)</option>
             {brands.map(b => <option key={b} value={b}>{b}</option>)}
           </select>
         </SheetField>
         <SheetField label="Category">
           <select value={cat} onChange={(e) => setCat(e.target.value)} className="w-full bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-cyan-500">
             <option value="">All categories</option>
+            <option value={NONE}>(No category)</option>
             {cats.map(c => <option key={c} value={c}>{c}</option>)}
           </select>
         </SheetField>
@@ -364,7 +397,7 @@ export function GodownView({ godown }: { godown: Godown }) {
       {!loaded ? (
         <Skeleton view={view} />
       ) : filtered.length === 0 ? (
-        <Empty godown={godown} />
+        <Empty godown={godown} onClear={q || brand || cat || status ? () => { setQ(""); setBrand(""); setCat(""); setStatus(""); } : undefined} />
       ) : view === "grid" ? (
         <GridBody tree={tree} depth={depth} isOpen={isOpen} toggle={toggle} statusOf={statusOf} />
       ) : (
@@ -464,7 +497,8 @@ function GodownCard({
     : "Healthy";
 
   return (
-    <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg p-3 hover:border-cyan-500/50 hover:shadow-sm dark:hover:shadow-cyan-500/5 transition-all cursor-pointer flex flex-col">
+    // No click action on these cards — so no cursor-pointer affordance either.
+    <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg p-3 hover:border-cyan-500/50 hover:shadow-sm dark:hover:shadow-cyan-500/5 transition-all flex flex-col">
       <div
         className="aspect-[5/2] rounded-md mb-3 flex items-center justify-center relative overflow-hidden"
         style={c ? { background: c.bg } : undefined}
@@ -622,7 +656,7 @@ function TableBody({
       : "Healthy";
 
     return (
-      <tr key={i.id} className="border-t border-zinc-200/50 dark:border-zinc-800/50 hover:bg-zinc-50 dark:hover:bg-zinc-800/40 cursor-pointer">
+      <tr key={i.id} className="border-t border-zinc-200/50 dark:border-zinc-800/50 hover:bg-zinc-50 dark:hover:bg-zinc-800/40">
         <td className="px-5 py-2.5" style={{ paddingLeft: `${indent * 16 + 20}px` }}>
           {i.brand
             ? <span className="bg-cyan-500/15 text-cyan-600 dark:text-cyan-300 px-2 py-0.5 rounded text-[11px]">{i.brand}</span>
@@ -724,11 +758,14 @@ function Skeleton({ view }: { view: View }) {
   );
 }
 
-function Empty({ godown }: { godown: Godown }) {
+function Empty({ godown, onClear }: { godown: Godown; onClear?: () => void }) {
   return (
     <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg py-16 text-center">
       <Package className="w-8 h-8 text-zinc-400 dark:text-zinc-600 mx-auto mb-3" strokeWidth={1.5} />
       <div className="text-sm text-zinc-500">No items in Godown {godown} match your filters.</div>
+      {onClear && (
+        <button onClick={onClear} className="mt-3 text-xs text-cyan-600 dark:text-cyan-400 hover:underline">Clear filters</button>
+      )}
     </div>
   );
 }
