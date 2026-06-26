@@ -113,6 +113,32 @@ function draftSide(d: DBDraft, g: Godown, itemCs: number) {
   return { touched, cases, loose, cs, pcs: pieces(cs, cases, loose) };
 }
 
+// Build the single "agreed" row a conflict-free item commits: each godown
+// taken WHOLE from one counter who entered THAT godown (never field-mixed
+// across counters — that could pair one person's cases with another's loose
+// and commit a number nobody entered), case size from any non-empty entry.
+// apply_reconciliation re-normalises the split, so which agreeing counter we
+// pick can't change the stored result. Shared by makeAdjustments, the commit
+// pre-check, and the Step-2 (system-difference) list so all three agree on
+// what "the agreed count" is.
+function mergeAgreed(base: DBDraft, nonEmpty: DBDraft[], itemId: string): DBDraft {
+  const touchedG = (d: DBDraft, g: Godown) =>
+    (g === "A" ? d.a_cases_raw : d.b_cases_raw).trim() !== "" ||
+    (g === "A" ? d.a_loose_raw : d.b_loose_raw).trim() !== "";
+  const repA = nonEmpty.find(d => touchedG(d, "A"));
+  const repB = nonEmpty.find(d => touchedG(d, "B"));
+  const csRaw = nonEmpty.find(d => d.case_size_raw.trim() !== "")?.case_size_raw || "";
+  return {
+    ...base,
+    item_id: itemId,
+    case_size_raw: csRaw,
+    a_cases_raw: repA?.a_cases_raw ?? "",
+    a_loose_raw: repA?.a_loose_raw ?? "",
+    b_cases_raw: repB?.b_cases_raw ?? "",
+    b_loose_raw: repB?.b_loose_raw ?? "",
+  };
+}
+
 function timeAgo(iso: string): string {
   const now = Date.now();
   const then = new Date(iso).getTime();
@@ -256,6 +282,20 @@ export default function ReconciliationPage() {
     try { sessionStorage.setItem("recon.mode", mode); } catch {}
   }, [isAdmin, mode]);
 
+  // Reviewer two-step wizard (admin only).
+  //   Step 1 "Reconcile staff counts"  — resolve disagreements BETWEEN counters
+  //                                        until every staff agrees on each item.
+  //   Step 2 "Reconcile with system"   — push the agreed counts to system stock
+  //                                        (where they differ). Gated: Step 2 is
+  //                                        only reachable once no staff conflict
+  //                                        remains. Persisted per session.
+  const [reviewerStep, setReviewerStep] = useState<1 | 2>(() => {
+    try { return sessionStorage.getItem("recon.reviewerStep") === "2" ? 2 : 1; } catch { return 1; }
+  });
+  useEffect(() => {
+    try { sessionStorage.setItem("recon.reviewerStep", String(reviewerStep)); } catch {}
+  }, [reviewerStep]);
+
   // Filters
   const [q, setQ] = useState("");
   const [brand, setBrand] = useState("");
@@ -380,7 +420,10 @@ export default function ReconciliationPage() {
     // not roll back a keystroke typed during the commit whose save hasn't
     // acked yet (the pending persist would then re-save a stale snapshot).
     {
-      const inFlight = (k: string) => saveTimers.current.has(k) || dirtyRef.current.has(k);
+      const inFlight = (k: string) => saveTimers.current.has(k) || dirtyRef.current.has(k) || deletingRef.current.has(k);
+      // A pending-delete key may still come back from the server (its delete
+      // hasn't committed) — purge it so a post-commit reload can't resurrect it.
+      for (const k of deletingRef.current) draftsMap.delete(k);
       for (const [k, local] of draftsRef.current) {
         if (inFlight(k) || local.id.startsWith("local-")) draftsMap.set(k, local);
       }
@@ -409,6 +452,12 @@ export default function ReconciliationPage() {
   // This replaces the old client-timestamp comparison, which could clobber a
   // freshly-typed value on a clock-skewed phone (server clock > client clock).
   const dirtyRef = useRef<Set<DraftKey>>(new Set());
+  // Keys whose DELETE is in flight. deleteDraft clears the local row + dirty +
+  // timers BEFORE the server delete commits, so without this the poll's `select
+  // *` can still see the not-yet-deleted row and re-adopt it (resurrecting a
+  // just-cleared count). Tracked separately from dirtyRef so refreshDrafts can
+  // skip a pending-delete key the same way it skips an in-flight edit.
+  const deletingRef = useRef<Set<DraftKey>>(new Set());
 
   // Refresh drafts on visibility regain + on the poll so other counters' edits
   // (and admin actions) show up without a full reload. The server is the
@@ -425,7 +474,9 @@ export default function ReconciliationPage() {
     (data || []).forEach((d: any) => serverByKey.set(dkey(d.user_id, d.item_id), d as DBDraft));
 
     const next = new Map(draftsRef.current);
-    const inFlight = (k: string) => saveTimers.current.has(k) || dirtyRef.current.has(k);
+    // In flight = pending save, dirty edit, OR a delete whose server commit
+    // hasn't landed yet (else we'd re-adopt the row we just cleared).
+    const inFlight = (k: string) => saveTimers.current.has(k) || dirtyRef.current.has(k) || deletingRef.current.has(k);
 
     // Drop local rows the server no longer has (e.g. admin committed them),
     // unless in flight or never persisted.
@@ -433,7 +484,9 @@ export default function ReconciliationPage() {
       if (inFlight(k) || serverByKey.has(k) || local.id.startsWith("local-")) continue;
       next.delete(k);
     }
-    // Adopt every server row that isn't being edited locally right now.
+    // Adopt every server row that isn't being edited locally right now. A
+    // pending-delete key is in flight, so a not-yet-committed delete can't be
+    // resurrected by the poll.
     for (const [k, server] of serverByKey) {
       if (inFlight(k)) continue;
       next.set(k, server);
@@ -634,13 +687,21 @@ export default function ReconciliationPage() {
 
   const deleteDraft = useCallback(async (userId: string, itemId: string) => {
     const k = dkey(userId, itemId);
+    // Tombstone the key BEFORE the local removal so the poll/load can't re-adopt
+    // the row from the server while its delete is still in flight. Cleared only
+    // after the server delete resolves (in finally).
+    deletingRef.current.add(k);
     const next = new Map(draftsRef.current);
     next.delete(k);
     writeDrafts(next);
     dirtyRef.current.delete(k);
     const t = saveTimers.current.get(k);
     if (t) { clearTimeout(t); saveTimers.current.delete(k); }
-    await sb().from("reconciliation_drafts").delete().eq("user_id", userId).eq("item_id", itemId);
+    try {
+      await sb().from("reconciliation_drafts").delete().eq("user_id", userId).eq("item_id", itemId);
+    } finally {
+      deletingRef.current.delete(k);
+    }
   }, [writeDrafts]);
 
   // ─── case-size rollover normalization ────────────────────────────────────
@@ -712,6 +773,44 @@ export default function ReconciliationPage() {
 
   // ─── "count done" toggle (freeze / resume) ───────────────────────────────
   const [doneSaving, setDoneSaving] = useState(false);
+
+  // Permanently save a staff member's reconciliation work the MOMENT they mark
+  // their count done — independent of (and earlier than) the admin commit. Each
+  // "done" press snapshots every non-empty draft they currently hold into
+  // reconciliation_done_snapshots, so their finished count survives even if a
+  // recount overwrites it, a conflict resolution clears it, or the admin never
+  // commits. Non-fatal: a failure (e.g. migration not yet run) never blocks the
+  // freeze — the done flag is already set; we just warn the snapshot wasn't kept.
+  const snapshotDoneCounts = useCallback(async (uid: string, doneIso: string) => {
+    const rows: Array<Record<string, unknown>> = [];
+    for (const [, d] of draftsRef.current) {
+      if (d.user_id !== uid || isDraftEmpty(d)) continue;
+      const item = itemById.get(d.item_id);
+      if (!item) continue;
+      const cs = item.case_size || 0;
+      const sA = draftSide(d, "A", cs);
+      const sB = draftSide(d, "B", cs);
+      rows.push({
+        user_id: uid,
+        user_name: profile?.name?.trim() || profile?.email?.split("@")[0] || null,
+        done_at: doneIso,
+        item_id: item.id, item_code: item.item_code, brand: item.brand,
+        model: item.model, size: item.size, colour: item.colour,
+        case_size: cs,
+        case_size_raw: d.case_size_raw,
+        a_cases_raw: d.a_cases_raw, a_loose_raw: d.a_loose_raw,
+        b_cases_raw: d.b_cases_raw, b_loose_raw: d.b_loose_raw,
+        a_pieces: sA.touched ? sA.pcs : null,
+        b_pieces: sB.touched ? sB.pcs : null,
+      });
+    }
+    if (rows.length === 0) return;
+    const { error } = await sb().from("reconciliation_done_snapshots").insert(rows);
+    if (error) {
+      showToast("info", `Count frozen, but the saved copy wasn't stored — run db/2026-06-26-staff-done-snapshots.sql. (${error.message})`);
+    }
+  }, [itemById, profile?.name, profile?.email]);
+
   const toggleDone = useCallback(async () => {
     if (!profile?.id || doneSaving) return;
     const uid = profile.id;
@@ -742,8 +841,10 @@ export default function ReconciliationPage() {
       showToast("bad", `Couldn't update done state: ${error.message}`);
       return;
     }
-    showToast(next ? "ok" : "info", next ? "Count marked done — your entries are frozen." : "Resumed — your entries are editable again.");
-  }, [profile?.id, myDone, doneSaving, flushAllPendingSaves]);
+    showToast(next ? "ok" : "info", next ? "Count marked done — your entries are frozen and saved." : "Resumed — your entries are editable again.");
+    // Persist this counter's finished work as a permanent snapshot.
+    if (next) void snapshotDoneCounts(uid, nowIso);
+  }, [profile?.id, myDone, doneSaving, flushAllPendingSaves, snapshotDoneCounts]);
 
   // Reviewer: add an editable (empty) row for a counter who has no draft yet,
   // so the admin can enter a count on their behalf. It's a local "local-add-…"
@@ -992,8 +1093,11 @@ export default function ReconciliationPage() {
           if (drs.length === 0) return false;
         }
       }
-      // "Conflicts only" — collapse to flagged items (My count + Reviewer).
-      if (conflictsOnly) {
+      // "Conflicts only" — My-count toggle. Scoped to My mode: the toggle is
+      // hidden in Reviewer (the two-step wizard drives that list), and the
+      // reviewer step memos derive from `filtered`, so a stale conflictsOnly=true
+      // left on from My count would otherwise silently empty Step 2.
+      if (conflictsOnly && mode === "my") {
         const drs = draftsByItem.get(i.id) || [];
         if (!computeItemConflict(i, drs).any) return false;
       }
@@ -1023,6 +1127,44 @@ export default function ReconciliationPage() {
     });
     return { myStaged, anyStaged, conflicts, invalid, usersWithDrafts };
   }, [items, appStock, draftsByItem, computeDiff, computeItemConflict, profile?.id]);
+
+  // ─── Reviewer two-step wizard: the two item lists ───────────────────────
+  // Step 1 — items where staff disagree (the staff-vs-staff reconciliation).
+  const reviewerStep1Items = useMemo(() => {
+    if (!isAdmin) return [];
+    return filtered.filter(i => {
+      const drs = draftsByItem.get(i.id) || [];
+      return computeItemConflict(i, drs).any;
+    });
+  }, [isAdmin, filtered, draftsByItem, computeItemConflict]);
+
+  // Step 2 — agreed items whose count differs from the system (the discrepancies
+  // to push to stock). Excludes conflicts (handled in Step 1) and no-change /
+  // invalid items (nothing to adjust). Uses mergeAgreed so the list matches
+  // exactly what "Make adjustments" would commit.
+  const reviewerStep2Items = useMemo(() => {
+    if (!isAdmin) return [];
+    return filtered.filter(i => {
+      const app = appStock.get(i.id);
+      if (!app) return false;
+      const nonEmpty = (draftsByItem.get(i.id) || []).filter(d => !isDraftEmpty(d));
+      if (nonEmpty.length === 0) return false;
+      if (computeItemConflict(i, nonEmpty).any) return false;
+      const rd = computeDiff(i, app, mergeAgreed(emptyDraft, nonEmpty, i.id));
+      return rd.hasAnyChange && !rd.invalid;
+    });
+  }, [isAdmin, filtered, appStock, draftsByItem, computeItemConflict, computeDiff, emptyDraft]);
+
+  const reviewerListItems = reviewerStep === 1 ? reviewerStep1Items : reviewerStep2Items;
+
+  // Enforce the wizard invariant: Step 2 is only valid with zero staff conflicts.
+  // If one exists — a stale session restored straight to Step 2, or a new
+  // disagreement arrived while the admin was reviewing (e.g. a counter marked
+  // done and left a blank) — snap back to Step 1, the same gate the Step-2 tab
+  // lock enforces for clicks. The rising-conflict toast already says why.
+  useEffect(() => {
+    if (mode === "reviewer" && reviewerStep === 2 && stats.conflicts > 0) setReviewerStep(1);
+  }, [mode, reviewerStep, stats.conflicts]);
 
   // Surface new conflicts to the reviewer without them having to watch the
   // screen — a toast fires when the conflict count rises (e.g. a counter just
@@ -1059,17 +1201,7 @@ export default function ReconciliationPage() {
       // Classify with the SAME merged row the commit will build, so the
       // dialog's numbers exactly match what makeAdjustments will do (an
       // invalid-only entry used to show as "counted" and then silently skip).
-      const touchedBy = (d: DBDraft, g: Godown) =>
-        (g === "A" ? d.a_cases_raw : d.b_cases_raw).trim() !== "" ||
-        (g === "A" ? d.a_loose_raw : d.b_loose_raw).trim() !== "";
-      const repA = nonEmpty.find(d => touchedBy(d, "A"));
-      const repB = nonEmpty.find(d => touchedBy(d, "B"));
-      const csRaw = nonEmpty.find(d => d.case_size_raw.trim() !== "")?.case_size_raw || "";
-      const merged: DBDraft = {
-        ...emptyDraft, item_id: i.id, case_size_raw: csRaw,
-        a_cases_raw: repA?.a_cases_raw ?? "", a_loose_raw: repA?.a_loose_raw ?? "",
-        b_cases_raw: repB?.b_cases_raw ?? "", b_loose_raw: repB?.b_loose_raw ?? "",
-      };
+      const merged = mergeAgreed(emptyDraft, nonEmpty, i.id);
       const rd = computeDiff(i, app, merged);
       if (rd.invalid) { invalid++; continue; }
       counted++;
@@ -1174,28 +1306,9 @@ export default function ReconciliationPage() {
       }
 
       // Conflict-free ⇒ everyone who entered a given godown agrees on its piece
-      // total. Build the committed row by taking EACH godown WHOLE from one
-      // counter who actually entered THAT godown — never assemble it field by
-      // field across counters (that could pair one person's cases with
-      // another's loose and commit a number nobody entered). case size from any
-      // non-empty entry. apply_reconciliation re-normalises the split, so which
-      // agreeing counter we pick can't change the stored result.
-      const touchedG = (d: DBDraft, g: Godown) =>
-        (g === "A" ? d.a_cases_raw : d.b_cases_raw).trim() !== "" ||
-        (g === "A" ? d.a_loose_raw : d.b_loose_raw).trim() !== "";
-      const repA = nonEmpty.find(d => touchedG(d, "A"));
-      const repB = nonEmpty.find(d => touchedG(d, "B"));
-      const csRaw = nonEmpty.find(d => d.case_size_raw.trim() !== "")?.case_size_raw || "";
-
-      const merged: DBDraft = {
-        ...emptyDraft,
-        item_id: i.id,
-        case_size_raw: csRaw,
-        a_cases_raw: repA?.a_cases_raw ?? "",
-        a_loose_raw: repA?.a_loose_raw ?? "",
-        b_cases_raw: repB?.b_cases_raw ?? "",
-        b_loose_raw: repB?.b_loose_raw ?? "",
-      };
+      // total. Build the committed row via mergeAgreed (each godown taken WHOLE
+      // from one counter who entered THAT godown — never field-mixed).
+      const merged = mergeAgreed(emptyDraft, nonEmpty, i.id);
       const rd = computeDiff(i, app, merged);
       if (rd.invalid) {
         skipped.push({ itemId: i.id, label, reason: "invalid input — fix before committing" });
@@ -1449,6 +1562,59 @@ export default function ReconciliationPage() {
     await resetStaleDoneFlags();
   };
 
+  // Reviewer Step 1 resolution: make the staff AGREE on ONE counter's numbers
+  // for an item, WITHOUT touching system stock (that's Step 2). The universal
+  // resolver that always clears a conflict:
+  //   1. delete the disagreeing counters' drafts (admin picks the winner),
+  //   2. un-mark any "done misser" — a counter who marked their whole count done
+  //      but left THIS item blank, whose blank computeItemConflict reads as
+  //      "found none (0)" and which would otherwise keep the conflict (and the
+  //      Step-2 lock) alive forever. Setting them back to not-done removes that
+  //      veto; their real "found nothing" is preserved in the on-done snapshot.
+  //   3. drop stale done flags for any counter now holding no drafts.
+  // After this only the kept counter's draft remains → no conflict, no stock
+  // write, and the item flows to Step 2 if it differs from the system.
+  const keepOnlyCount = useCallback((item: Item, keepUserId: string) => {
+    void (async () => {
+      const all = draftsByItem.get(item.id) || [];
+      if (!all.some(d => d.user_id === keepUserId && !isDraftEmpty(d))) return; // can only keep a real count
+      const disagreers = all.filter(d => !isDraftEmpty(d) && d.user_id !== keepUserId);
+      const enteredHere = new Set(all.filter(d => !isDraftEmpty(d)).map(d => d.user_id));
+      const doneMissers = [...doneByUser.entries()]
+        .filter(([uid, info]) => info.done && uid !== keepUserId && !enteredHere.has(uid))
+        .map(([uid]) => uid);
+      if (disagreers.length === 0 && doneMissers.length === 0) return; // nothing to resolve
+      // EVERY done counter who ends up blank on this item must be set back to
+      // not-done, else their blank re-reads as found-none(0) and re-raises the
+      // conflict. That's the done missers PLUS any done DISAGREER whose draft we
+      // delete below (resetStaleDoneFlags spares them — they've counted other
+      // items — so they'd otherwise become a fresh misser and need a 2nd click).
+      const undoneTargets = [...new Set([
+        ...doneMissers,
+        ...disagreers.filter(d => doneByUser.get(d.user_id)?.done).map(d => d.user_id),
+      ])];
+
+      const keepName = peopleRef.current.get(keepUserId) || "this counter";
+      const clearedNames = disagreers.map(d => peopleRef.current.get(d.user_id) || "a counter");
+      const misserNames = doneMissers.map(uid => peopleRef.current.get(uid) || "a counter");
+      const parts: string[] = [`The staff will agree on ${keepName}'s numbers for this item.`];
+      if (clearedNames.length) parts.push(`${clearedNames.join(", ")} ${clearedNames.length === 1 ? "count is" : "counts are"} cleared.`);
+      if (misserNames.length) parts.push(`${misserNames.join(", ")} (marked done but didn't count this item) ${misserNames.length === 1 ? "is" : "are"} set back to “not done”, so their blank stops flagging a conflict.`);
+      parts.push("This does NOT change system stock — that happens in Step 2. Cleared counts can't be recovered.");
+      const ok = await confirm({ title: `Keep ${keepName}'s count?`, body: parts.join(" "), danger: true, confirmLabel: "Keep this count" });
+      if (!ok) return;
+
+      for (const d of disagreers) await deleteDraft(d.user_id, item.id);
+      if (undoneTargets.length > 0) {
+        try {
+          await sb().from("reconciliation_done").update({ done: false, done_at: null }).in("user_id", undoneTargets);
+          await refreshDone();
+        } catch { /* non-fatal: the conflict can still be resolved by recount / per-item apply in Step 2 */ }
+      }
+      await resetStaleDoneFlags();
+    })();
+  }, [confirm, deleteDraft, draftsByItem, doneByUser, refreshDone, resetStaleDoneFlags]);
+
   // ─── count history (admin) ───────────────────────────────────────────────
   type CountLogRow = {
     id: string; commit_note: string; commit_kind: string; created_at: string;
@@ -1466,24 +1632,72 @@ export default function ReconciliationPage() {
   const openHistory = async () => {
     setHistoryOpen(true);
     setHistoryRows(null);
-    const { data, error } = await sb()
-      .from("reconciliation_count_log")
-      .select("*")
-      .order("created_at", { ascending: false })
-      .limit(1000);
-    if (error) {
-      showToast("bad", `Couldn't load the count log — has db/2026-06-10-count-log.sql been run? (${error.message})`);
+    // Two sources, merged into one timeline: admin COMMITS (count log) and each
+    // staff member's MARKED-DONE snapshots. If only the snapshots table is
+    // absent (migration not run yet) we still show the commit log, and vice versa.
+    // Paginated (PostgREST clamps any .limit() to 1,000 rows server-side, which
+    // would silently drop the OLDEST cycles from the viewer + CSV). Stable DESC
+    // order + id tiebreaker so pages don't overlap. Each source tolerated alone.
+    const [logRes, snapRes] = await Promise.all([
+      fetchAllRows<CountLogRow>((f, t) =>
+        sb().from("reconciliation_count_log").select("*").order("created_at", { ascending: false }).order("id").range(f, t),
+        { maxRows: 20000 }),
+      fetchAllRows<Record<string, unknown>>((f, t) =>
+        sb().from("reconciliation_done_snapshots").select("*").order("done_at", { ascending: false }).order("id").range(f, t),
+        { maxRows: 20000 }),
+    ]);
+    if (logRes.error && snapRes.error) {
+      showToast("bad", `Couldn't load history — has db/2026-06-10-count-log.sql been run? (${logRes.error})`);
       setHistoryRows([]);
       return;
     }
-    setHistoryRows((data || []) as CountLogRow[]);
+    // A single-source failure must not masquerade as "empty" — warn so the admin
+    // can tell "no snapshots yet" from "snapshots failed to load". A missing
+    // snapshots table (migration not run) is the benign, expected case.
+    if (snapRes.error && !logRes.error) {
+      showToast("info", `Showing commits only — the “marked done” snapshots didn't load (run db/2026-06-26-staff-done-snapshots.sql if you haven't). ${snapRes.error}`);
+    } else if (logRes.error && !snapRes.error) {
+      showToast("info", `Showing “marked done” snapshots only — the commit log didn't load. ${logRes.error}`);
+    }
+    const logRows = logRes.rows;
+    // Normalise each "marked done" snapshot into the same row shape, kind="done".
+    const doneRows: CountLogRow[] = (snapRes.rows as Array<Record<string, unknown>>).map(s => ({
+      id: s.id as string,
+      commit_note: `Marked done — ${(s.user_name as string) || "counter"}`,
+      commit_kind: "done",
+      created_at: s.done_at as string,
+      user_id: s.user_id as string,
+      user_name: (s.user_name as string) ?? null,
+      item_id: (s.item_id as string) ?? null,
+      item_code: (s.item_code as string) ?? null,
+      brand: (s.brand as string) ?? null,
+      model: (s.model as string) ?? null,
+      size: (s.size as string) ?? null,
+      colour: (s.colour as string) ?? null,
+      case_size: (s.case_size as number) ?? 0,
+      case_size_raw: (s.case_size_raw as string) ?? "",
+      a_cases_raw: (s.a_cases_raw as string) ?? "",
+      a_loose_raw: (s.a_loose_raw as string) ?? "",
+      b_cases_raw: (s.b_cases_raw as string) ?? "",
+      b_loose_raw: (s.b_loose_raw as string) ?? "",
+      a_pieces: (s.a_pieces as number) ?? null,
+      b_pieces: (s.b_pieces as number) ?? null,
+      applied: false,
+    }));
+    const all = [...logRows, ...doneRows].sort((a, b) =>
+      a.created_at < b.created_at ? 1 : a.created_at > b.created_at ? -1 : 0
+    );
+    setHistoryRows(all);
   };
   // One batch per commit (all rows of a commit share created_at + note).
   const historyBatches = useMemo(() => {
     if (!historyRows) return [];
     const m = new Map<string, { key: string; note: string; at: string; kind: string; rows: CountLogRow[] }>();
     for (const r of historyRows) {
-      const key = `${r.created_at}|${r.commit_note}|${r.commit_kind}`;
+      // A commit batch groups every counter's rows together; a "done" batch is
+      // per-user, so key it by user_id too (two staff marking done at the same
+      // instant must not merge).
+      const key = `${r.created_at}|${r.commit_note}|${r.commit_kind}${r.commit_kind === "done" ? "|" + r.user_id : ""}`;
       if (!m.has(key)) m.set(key, { key, note: r.commit_note, at: r.created_at, kind: r.commit_kind, rows: [] });
       m.get(key)!.rows.push(r);
     }
@@ -1534,8 +1748,9 @@ export default function ReconciliationPage() {
           conflictsOnly={conflictsOnly} setConflictsOnly={setConflictsOnly}
           conflictCount={stats.conflicts}
           brands={brands} cats={cats}
-          shownCount={filtered.length}
+          shownCount={mode === "reviewer" ? reviewerListItems.length : filtered.length}
           mode={mode} setMode={setMode} isAdmin={isAdmin}
+          reviewerStep={reviewerStep}
           usersWithDrafts={stats.usersWithDrafts.size}
           myDone={myDone}
           canCount={canCount}
@@ -1577,11 +1792,24 @@ export default function ReconciliationPage() {
           </div>
         )}
 
+        {/* Reviewer two-step wizard — Step 1 reconcile staff counts, Step 2
+            reconcile with system. Step 2 is gated until no staff conflict
+            remains. */}
+        {mode === "reviewer" && loaded && (
+          <ReviewerSteps
+            step={reviewerStep}
+            setStep={setReviewerStep}
+            conflicts={stats.conflicts}
+            step2Count={reviewerStep2Items.length}
+          />
+        )}
+
         {!loaded ? (
           <SkeletonBody />
-        ) : filtered.length === 0 ? (
-          <EmptyState clearFilters={() => { setQ(""); setBrand(""); setCat(""); setShowOnlyChanged(false); setConflictsOnly(false); }} />
         ) : mode === "my" ? (
+          filtered.length === 0 ? (
+            <EmptyState clearFilters={() => { setQ(""); setBrand(""); setCat(""); setShowOnlyChanged(false); setConflictsOnly(false); }} />
+          ) : (
           <MyView
             items={filtered}
             appStock={appStock}
@@ -1619,9 +1847,16 @@ export default function ReconciliationPage() {
               return computeItemConflict(item, drs);
             }}
           />
+          )
         ) : (
           <ReviewerView
-            items={filtered}
+            items={reviewerListItems}
+            step={reviewerStep}
+            totalConflicts={stats.conflicts}
+            hasActiveFilters={!!(q || brand || cat)}
+            clearFilters={() => { setQ(""); setBrand(""); setCat(""); }}
+            onGotoStep={setReviewerStep}
+            onKeepOnly={keepOnlyCount}
             appStock={appStock}
             draftsByItem={draftsByItem}
             lastRecon={lastRecon}
@@ -1679,7 +1914,7 @@ export default function ReconciliationPage() {
                   <div className="py-10 text-center text-sm text-zinc-500"><Loader2 className="w-4 h-4 animate-spin inline mr-2" />Loading…</div>
                 ) : historyRows.length === 0 ? (
                   <div className="py-10 text-center text-sm text-zinc-500 px-6">
-                    No counts logged yet. Every counter&apos;s entries are saved here automatically each time you run <strong>Make adjustments</strong> or <strong>Apply this count</strong> (requires <code className="px-1 bg-zinc-100 dark:bg-zinc-800 rounded">db/2026-06-10-count-log.sql</code>).
+                    No counts logged yet. Every counter&apos;s entries are saved here automatically whenever a staff member <strong>marks their count done</strong> (requires <code className="px-1 bg-zinc-100 dark:bg-zinc-800 rounded">db/2026-06-26-staff-done-snapshots.sql</code>), and each time you run <strong>Make adjustments</strong> or <strong>Apply this count</strong> (requires <code className="px-1 bg-zinc-100 dark:bg-zinc-800 rounded">db/2026-06-10-count-log.sql</code>).
                   </div>
                 ) : (
                   historyBatches.map(b => {
@@ -1697,9 +1932,11 @@ export default function ReconciliationPage() {
                           <span className="text-[13px] font-medium">{b.note}</span>
                           <span className={cn(
                             "text-[9px] uppercase tracking-wider px-1.5 py-0.5 rounded font-medium",
-                            b.kind === "bulk" ? "bg-cyan-500/15 text-cyan-700 dark:text-cyan-300" : "bg-violet-500/15 text-violet-700 dark:text-violet-300"
+                            b.kind === "bulk" ? "bg-cyan-500/15 text-cyan-700 dark:text-cyan-300"
+                              : b.kind === "done" ? "bg-emerald-500/15 text-emerald-700 dark:text-emerald-300"
+                              : "bg-violet-500/15 text-violet-700 dark:text-violet-300"
                           )}>
-                            {b.kind === "bulk" ? "Make adjustments" : "Apply one"}
+                            {b.kind === "bulk" ? "Make adjustments" : b.kind === "done" ? "Marked done" : "Apply one"}
                           </span>
                           <span className="text-[11px] text-zinc-500">{new Date(b.at).toLocaleString("en-IN", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" })}</span>
                           <span className="ml-auto text-[11px] text-zinc-500 tabular-nums">{itemKeys.size} item{itemKeys.size === 1 ? "" : "s"} · {counters.size} counter{counters.size === 1 ? "" : "s"}</span>
@@ -1932,7 +2169,7 @@ function Toolbar({
   showOnlyChanged, setShowOnlyChanged,
   conflictsOnly, setConflictsOnly, conflictCount,
   brands, cats, shownCount,
-  mode, setMode, isAdmin, usersWithDrafts,
+  mode, setMode, isAdmin, reviewerStep, usersWithDrafts,
   myDone, canCount, onToggleDone, doneSaving,
   onPrint, onHistory, onCommit, canCommit, processing, progress,
 }: {
@@ -1944,7 +2181,7 @@ function Toolbar({
   conflictCount: number;
   brands: string[]; cats: string[]; shownCount: number;
   mode: "my" | "reviewer"; setMode: (m: "my" | "reviewer") => void;
-  isAdmin: boolean; usersWithDrafts: number;
+  isAdmin: boolean; reviewerStep: 1 | 2; usersWithDrafts: number;
   myDone: boolean; canCount: boolean; onToggleDone: () => void; doneSaving: boolean;
   onPrint: () => void; onHistory: () => void; onCommit: () => void;
   canCommit: boolean; processing: boolean;
@@ -2029,29 +2266,31 @@ function Toolbar({
           </div>
         )}
 
-        {/* Jump straight to the items that need a decision/recheck. Available
-            in both My count (so a counter can spot where they disagree with a
-            teammate) and Reviewer. */}
-        <button
-          type="button"
-          onClick={() => setConflictsOnly(!conflictsOnly)}
-          className={cn(
-            "inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm border transition-colors",
-            conflictsOnly
-              ? "bg-rose-500/15 border-rose-500/50 text-rose-700 dark:text-rose-300"
-              : conflictCount > 0
-                ? "bg-white dark:bg-zinc-900 border-rose-300/60 dark:border-rose-500/30 text-rose-600 dark:text-rose-300 hover:border-rose-400"
-                : "bg-white dark:bg-zinc-900 border-zinc-200 dark:border-zinc-800 text-zinc-500 hover:border-zinc-300 dark:hover:border-zinc-700"
-          )}
-          aria-pressed={conflictsOnly}
-          title={mode === "my" ? "Show only items where a count disagrees" : "Show only items with a conflict"}
-        >
-          <AlertTriangle className="w-3.5 h-3.5" />
-          {conflictsOnly ? "Conflicts only" : "Conflicts"}
-          {conflictCount > 0 && (
-            <span className="ml-0.5 px-1.5 rounded-full bg-rose-500 text-white text-[10px] font-semibold tabular-nums">{conflictCount}</span>
-          )}
-        </button>
+        {/* Jump straight to the items where a count disagrees with a teammate.
+            My count only — in Reviewer the two-step wizard drives the list
+            (Step 1 IS the conflicts), so this would fight the step filter. */}
+        {mode === "my" && (
+          <button
+            type="button"
+            onClick={() => setConflictsOnly(!conflictsOnly)}
+            className={cn(
+              "inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm border transition-colors",
+              conflictsOnly
+                ? "bg-rose-500/15 border-rose-500/50 text-rose-700 dark:text-rose-300"
+                : conflictCount > 0
+                  ? "bg-white dark:bg-zinc-900 border-rose-300/60 dark:border-rose-500/30 text-rose-600 dark:text-rose-300 hover:border-rose-400"
+                  : "bg-white dark:bg-zinc-900 border-zinc-200 dark:border-zinc-800 text-zinc-500 hover:border-zinc-300 dark:hover:border-zinc-700"
+            )}
+            aria-pressed={conflictsOnly}
+            title="Show only items where a count disagrees"
+          >
+            <AlertTriangle className="w-3.5 h-3.5" />
+            {conflictsOnly ? "Conflicts only" : "Conflicts"}
+            {conflictCount > 0 && (
+              <span className="ml-0.5 px-1.5 rounded-full bg-rose-500 text-white text-[10px] font-semibold tabular-nums">{conflictCount}</span>
+            )}
+          </button>
+        )}
 
         {/* My count: freeze/unfreeze my entries. Marking done turns any item I
             leave blank but a teammate filled into a flagged conflict.
@@ -2105,7 +2344,10 @@ function Toolbar({
 
         <div className="flex-1 min-w-0" />
 
-        {isAdmin && (
+        {/* "Make adjustments" pushes counts to system stock — a Step 2 action.
+            In Reviewer it only appears on Step 2 (after staff are reconciled);
+            in My count an admin can still commit their own count as before. */}
+        {isAdmin && (mode === "my" || reviewerStep === 2) && (
           <button
             type="button"
             onClick={onCommit}
@@ -2153,6 +2395,129 @@ function Toolbar({
           {showOnlyChanged ? (mode === "my" ? "Showing only mine" : "Showing only staged") : "Show all items"}
         </button>
       </FilterSheet>
+    </div>
+  );
+}
+
+// ─── reviewer two-step wizard header ──────────────────────────────────────
+// Step 1 = reconcile disagreements between staff; Step 2 = reconcile the agreed
+// count against system stock. Step 2 is locked until no staff conflict remains.
+function StepNum({ n, active, done, locked }: { n: number; active: boolean; done?: boolean; locked?: boolean }) {
+  return (
+    <span className={cn(
+      "flex-shrink-0 w-6 h-6 rounded-full inline-flex items-center justify-center text-[12px] font-semibold tabular-nums",
+      locked
+        ? "bg-zinc-200 dark:bg-zinc-800 text-zinc-400"
+        : done
+          ? "bg-emerald-500 text-white"
+          : active
+            ? "bg-violet-600 text-white"
+            : "bg-zinc-200 dark:bg-zinc-700 text-zinc-600 dark:text-zinc-200"
+    )}>
+      {n}
+    </span>
+  );
+}
+
+function ReviewerSteps({
+  step, setStep, conflicts, step2Count,
+}: {
+  step: 1 | 2;
+  setStep: (s: 1 | 2) => void;
+  conflicts: number;
+  step2Count: number;
+}) {
+  const step2Locked = conflicts > 0;
+  return (
+    <div className="mb-4 space-y-2">
+      <div className="flex items-stretch gap-2">
+        {/* Step 1 — reconcile staff counts */}
+        <button
+          type="button"
+          onClick={() => setStep(1)}
+          className={cn(
+            "flex-1 text-left rounded-lg border px-3 py-2.5 transition-colors",
+            step === 1
+              ? "border-violet-500/60 bg-violet-500/10"
+              : "border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 hover:border-zinc-300 dark:hover:border-zinc-700"
+          )}
+          aria-current={step === 1 ? "step" : undefined}
+        >
+          <div className="flex items-center gap-2">
+            <StepNum n={1} active={step === 1} done={conflicts === 0} />
+            <div className="min-w-0">
+              <div className="text-sm font-medium">Reconcile staff counts</div>
+              <div className="text-[11px] text-zinc-500">
+                {conflicts > 0
+                  ? `${fmtN(conflicts)} item${conflicts === 1 ? "" : "s"} where staff disagree`
+                  : "All staff agree"}
+              </div>
+            </div>
+            {conflicts > 0 ? (
+              <span className="ml-auto px-1.5 rounded-full bg-rose-500 text-white text-[10px] font-semibold tabular-nums flex-shrink-0">{conflicts}</span>
+            ) : (
+              <CheckCircle2 className="ml-auto w-4 h-4 text-emerald-500 flex-shrink-0" />
+            )}
+          </div>
+        </button>
+
+        {/* Step 2 — reconcile with system */}
+        <button
+          type="button"
+          onClick={() => { if (!step2Locked) setStep(2); }}
+          disabled={step2Locked}
+          className={cn(
+            "flex-1 text-left rounded-lg border px-3 py-2.5 transition-colors",
+            step2Locked
+              ? "border-zinc-200 dark:border-zinc-800 bg-zinc-100/60 dark:bg-zinc-900/50 cursor-not-allowed opacity-70"
+              : step === 2
+                ? "border-violet-500/60 bg-violet-500/10"
+                : "border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 hover:border-zinc-300 dark:hover:border-zinc-700"
+          )}
+          aria-current={step === 2 ? "step" : undefined}
+          title={step2Locked ? "Resolve all staff conflicts first" : "Compare the agreed count with system stock"}
+        >
+          <div className="flex items-center gap-2">
+            <StepNum n={2} active={step === 2} locked={step2Locked} />
+            <div className="min-w-0">
+              <div className="text-sm font-medium flex items-center gap-1.5">
+                Reconcile with system {step2Locked && <Lock className="w-3 h-3 text-zinc-400" />}
+              </div>
+              <div className="text-[11px] text-zinc-500">
+                {step2Locked
+                  ? "Locked until staff agree"
+                  : step2Count > 0
+                    ? `${fmtN(step2Count)} differ${step2Count === 1 ? "s" : ""} from system`
+                    : "Counts match the system"}
+              </div>
+            </div>
+            {!step2Locked && step2Count > 0 && (
+              <span className="ml-auto px-1.5 rounded-full bg-violet-500 text-white text-[10px] font-semibold tabular-nums flex-shrink-0">{step2Count}</span>
+            )}
+          </div>
+        </button>
+      </div>
+
+      {/* Contextual nudge between the steps. */}
+      {step === 1 && conflicts === 0 && (
+        <div className="flex items-center gap-3 rounded-lg border border-emerald-500/40 bg-emerald-500/10 px-4 py-2.5">
+          <CheckCircle2 className="w-4 h-4 text-emerald-600 dark:text-emerald-400 flex-shrink-0" />
+          <div className="text-sm text-emerald-800 dark:text-emerald-200 flex-1 min-w-0">
+            <span className="font-medium">No staff disagreements.</span>{" "}
+            <span className="text-emerald-700/80 dark:text-emerald-300/70">Move on to compare the agreed counts against the system.</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => setStep(2)}
+            className="inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm font-medium bg-cyan-500 hover:bg-cyan-400 text-white flex-shrink-0"
+          >
+            Continue to Step 2 →
+          </button>
+        </div>
+      )}
+      {/* No "on Step 2 with conflicts" banner needed — the page clamps the step
+          back to 1 whenever a staff conflict exists, so Step 2 can't be shown
+          while unresolved. */}
     </div>
   );
 }
@@ -2659,12 +3024,23 @@ function MobileCards({
 }
 
 // ─── ReviewerView (admin only) ───────────────────────────────────────────
+// Two-step wizard body. Step 1 lists items where staff disagree (resolve via
+// inline edit / clear / "keep only this count"); Step 2 lists items whose agreed
+// count differs from the system (push to stock). The page decides which item
+// list to pass; this view renders the cards + the per-step empty state.
 function ReviewerView({
-  items, appStock, draftsByItem, lastRecon, computeDiff, computeItemConflict,
+  items, step, totalConflicts, hasActiveFilters, clearFilters, onGotoStep, onKeepOnly,
+  appStock, draftsByItem, lastRecon, computeDiff, computeItemConflict,
   setField, commitRow, deleteDraft, currentUserId, doneByUser,
   people, onAddCounter, onApplyItem, applyingItemId, errorsByItem,
 }: {
   items: (Item & { categoryName: string | null })[];
+  step: 1 | 2;
+  totalConflicts: number;
+  hasActiveFilters: boolean;
+  clearFilters: () => void;
+  onGotoStep: (s: 1 | 2) => void;
+  onKeepOnly: (item: Item, keepUserId: string) => void;
   appStock: Map<string, { A: AppStock; B: AppStock }>;
   draftsByItem: Map<string, DBDraft[]>;
   lastRecon: Map<string, LastReconciled>;
@@ -2681,6 +3057,17 @@ function ReviewerView({
   applyingItemId: string | null;
   errorsByItem: Map<string, string[]>;
 }) {
+  if (items.length === 0) {
+    return (
+      <ReviewerEmpty
+        step={step}
+        totalConflicts={totalConflicts}
+        hasActiveFilters={hasActiveFilters}
+        clearFilters={clearFilters}
+        onGotoStep={onGotoStep}
+      />
+    );
+  }
   return (
     <div className="space-y-3">
       {items.map(i => {
@@ -2695,10 +3082,24 @@ function ReviewerView({
         const applying = applyingItemId === i.id;
         const conflict = nonEmpty.length > 0 ? computeItemConflict(i, nonEmpty) : null;
         const ready = nonEmpty.length > 0 && !conflict?.any;
-        const rail = conflict?.any ? "border-l-rose-500" : ready ? "border-l-emerald-500" : "border-l-zinc-200 dark:border-l-zinc-800";
+        // Step 2 items all differ from the system (that's why they're listed),
+        // so amber = "needs adjustment"; Step 1 keeps the conflict/ready rail.
+        const rail = conflict?.any
+          ? "border-l-rose-500"
+          : step === 2
+            ? "border-l-amber-500"
+            : ready ? "border-l-emerald-500" : "border-l-zinc-200 dark:border-l-zinc-800";
         const cs = i.case_size || 0;
         const last = lastRecon.get(i.id);
         const errs = errorsByItem.get(i.id);
+        // Step 2 only: the single agreed count vs system, for the summary line.
+        const agreed = step === 2 && nonEmpty.length > 0
+          ? computeDiff(i, app, mergeAgreed(makeEmptyDraft("", i.id), nonEmpty, i.id))
+          : null;
+        // "Keep only this count" is offered on any conflicted item — it resolves
+        // a disagreement (multiple counters) OR a done-misser to the chosen
+        // counter's numbers without touching stock.
+        const canKeepOnly = !!conflict?.any;
         return (
           <div key={i.id} className={cn("bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 border-l-4 rounded-lg overflow-hidden", rail)}>
             {/* Verdict header — system reference lives in labelled chips, never inside a box */}
@@ -2721,6 +3122,10 @@ function ReviewerView({
                   <span className="inline-flex items-center gap-1 bg-rose-500/15 text-rose-700 dark:text-rose-300 px-2 py-0.5 rounded text-[10px] uppercase tracking-wider font-medium flex-shrink-0">
                     <AlertTriangle className="w-3 h-3" /> Conflict
                   </span>
+                ) : step === 2 ? (
+                  <span className="inline-flex items-center gap-1 bg-amber-500/15 text-amber-700 dark:text-amber-300 px-2 py-0.5 rounded text-[10px] uppercase tracking-wider font-medium flex-shrink-0">
+                    Differs from system
+                  </span>
                 ) : ready ? (
                   <span className="inline-flex items-center gap-1 bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 px-2 py-0.5 rounded text-[10px] uppercase tracking-wider font-medium flex-shrink-0">
                     <CheckCheck className="w-3 h-3" /> Ready
@@ -2736,8 +3141,27 @@ function ReviewerView({
               </div>
             </div>
 
-            {/* Plain-language reason so the reviewer resolves fast without decoding cells */}
-            {conflict?.any && conflict.reason && (
+            {/* Step 2: the agreed count vs the system — the discrepancy at a glance */}
+            {step === 2 && agreed && (
+              <div className="px-3 py-2 border-t border-zinc-200/60 dark:border-zinc-800/60 bg-amber-500/5 flex flex-wrap items-center gap-x-3 gap-y-1.5">
+                <span className="text-[9px] uppercase tracking-wider text-amber-600 dark:text-amber-400 font-semibold">Agreed → system</span>
+                <span className="inline-flex items-center gap-1.5 text-[11px] tabular-nums">
+                  <span className="text-cyan-700 dark:text-cyan-300 font-semibold">A</span>
+                  {agreed.A.userTouched && agreed.A.valid
+                    ? <><span className="text-zinc-600 dark:text-zinc-300">{fmtN(agreed.A.physPieces)} pcs</span><DiffPill diff={agreed.A.diff} /></>
+                    : <span className="text-zinc-400 italic">unchanged</span>}
+                </span>
+                <span className="inline-flex items-center gap-1.5 text-[11px] tabular-nums">
+                  <span className="text-violet-700 dark:text-violet-300 font-semibold">B</span>
+                  {agreed.B.userTouched && agreed.B.valid
+                    ? <><span className="text-zinc-600 dark:text-zinc-300">{fmtN(agreed.B.physPieces)} pcs</span><DiffPill diff={agreed.B.diff} /></>
+                    : <span className="text-zinc-400 italic">unchanged</span>}
+                </span>
+              </div>
+            )}
+
+            {/* Step 1: plain-language reason so the reviewer resolves fast */}
+            {step === 1 && conflict?.any && conflict.reason && (
               <div className="px-3 py-1.5 bg-rose-500/5 border-t border-rose-500/15 text-[11px] text-rose-700 dark:text-rose-300 flex items-start gap-1.5 tabular-nums">
                 <AlertTriangle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
                 <div>{conflict.reason}</div>
@@ -2754,15 +3178,18 @@ function ReviewerView({
                     i={i}
                     app={app}
                     d={d}
+                    step={step}
                     conflict={conflict}
                     isMe={d.user_id === currentUserId}
                     userDone={!!doneByUser.get(d.user_id)?.done}
                     computeDiff={computeDiff}
                     canApply={!isDraftEmpty(d)}
+                    canKeepOnly={canKeepOnly && !isDraftEmpty(d)}
                     applying={applying}
                     onChange={(field, value) => setField(d.user_id, i.id, field, value)}
                     onBlur={() => commitRow(d.user_id, i.id)}
                     onApply={() => onApplyItem(i, d)}
+                    onKeepOnly={() => onKeepOnly(i, d.user_id)}
                     onClear={() => deleteDraft(d.user_id, i.id)}
                   />
                 ))}
@@ -2795,6 +3222,52 @@ function ReviewerView({
           </div>
         );
       })}
+    </div>
+  );
+}
+
+// Per-step empty state for the reviewer wizard.
+function ReviewerEmpty({
+  step, totalConflicts, hasActiveFilters, clearFilters, onGotoStep,
+}: {
+  step: 1 | 2;
+  totalConflicts: number;
+  hasActiveFilters: boolean;
+  clearFilters: () => void;
+  onGotoStep: (s: 1 | 2) => void;
+}) {
+  // Empty because a search/brand/category filter hides the matching items
+  // (Step 1: conflicts exist but none match; Step 2: differences may exist).
+  if (hasActiveFilters && (step === 2 || totalConflicts > 0)) {
+    return (
+      <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg py-12 text-center">
+        <ClipboardCheck className="w-7 h-7 text-zinc-400 dark:text-zinc-600 mx-auto mb-3" strokeWidth={1.5} />
+        <div className="text-sm text-zinc-500 max-w-sm mx-auto px-4">
+          {step === 1
+            ? <>{fmtN(totalConflicts)} conflicted item{totalConflicts === 1 ? " is" : "s are"} hidden by your filter — clear it to resolve {totalConflicts === 1 ? "it" : "them"} and unlock Step 2.</>
+            : "No differing items match the current filter."}
+        </div>
+        <button onClick={clearFilters} className="mt-3 text-xs text-cyan-600 dark:text-cyan-400 hover:underline">Clear filters</button>
+      </div>
+    );
+  }
+  if (step === 1) {
+    return (
+      <div className="bg-white dark:bg-zinc-900 border border-emerald-500/30 rounded-lg py-12 text-center">
+        <CheckCircle2 className="w-7 h-7 text-emerald-500 mx-auto mb-3" strokeWidth={1.5} />
+        <div className="text-sm font-medium text-zinc-700 dark:text-zinc-200">All staff agree</div>
+        <div className="text-xs text-zinc-500 mt-1 max-w-sm mx-auto px-4">No disagreements between counters. Continue to compare the agreed counts against the system.</div>
+        <button onClick={() => onGotoStep(2)} className="mt-4 inline-flex items-center gap-1.5 rounded-md px-3.5 py-2 text-sm font-medium bg-cyan-500 hover:bg-cyan-400 text-white">
+          Continue to Step 2 →
+        </button>
+      </div>
+    );
+  }
+  return (
+    <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg py-12 text-center">
+      <CheckCircle2 className="w-7 h-7 text-emerald-500 mx-auto mb-3" strokeWidth={1.5} />
+      <div className="text-sm font-medium text-zinc-700 dark:text-zinc-200">Counts match the system</div>
+      <div className="text-xs text-zinc-500 mt-1 max-w-md mx-auto px-4">Every agreed count equals what the system already shows — nothing to adjust. To zero stock that nobody counted, use <strong>Make adjustments</strong> and tick “zero what nobody found”.</div>
     </div>
   );
 }
@@ -2851,20 +3324,23 @@ function ReviewerGodown({
 }
 
 function ReviewerUserRow({
-  i, app, d, conflict, isMe, userDone, computeDiff, canApply, applying, onChange, onBlur, onApply, onClear,
+  i, app, d, step, conflict, isMe, userDone, computeDiff, canApply, canKeepOnly, applying, onChange, onBlur, onApply, onKeepOnly, onClear,
 }: {
   i: Item;
   app: { A: AppStock; B: AppStock };
   d: DBDraft;
+  step: 1 | 2;
   conflict: ItemConflictType | null;
   isMe: boolean;
   userDone: boolean;
   computeDiff: (i: Item, app: { A: AppStock; B: AppStock }, d: DBDraft) => RowDiffType;
   canApply: boolean;
+  canKeepOnly: boolean;
   applying: boolean;
   onChange: (field: Field, value: string) => void;
   onBlur: () => void;
   onApply: () => void;
+  onKeepOnly: () => void;
   onClear: () => void;
 }) {
   const rd = computeDiff(i, app, d);
@@ -2903,8 +3379,23 @@ function ReviewerUserRow({
           conflictCell={!!conflict?.b} onCases={(v) => onChange("b_cases", v)} onLoose={(v) => onChange("b_loose", v)} onBlur={onBlur} ariaPrefix={`${name}`} />
       </div>
 
-      {/* Apply just this item to stock using THIS counter's numbers */}
-      {canApply && (
+      {/* Step 1: resolve a disagreement by keeping THIS counter's numbers and
+          clearing the others — staff "agree" without touching system stock. */}
+      {step === 1 && canKeepOnly && (
+        <button
+          type="button"
+          onClick={onKeepOnly}
+          disabled={applying}
+          className="mt-2 w-full min-h-11 inline-flex items-center justify-center gap-1.5 rounded-lg border border-violet-500/50 text-violet-700 dark:text-violet-300 hover:bg-violet-500/10 text-sm font-medium disabled:opacity-50 transition-colors"
+          title={`Keep ${name}'s count and clear the others for this item`}
+        >
+          <CheckCheck className="w-4 h-4" />
+          Keep only {name.split(" ")[0]}&apos;s count
+        </button>
+      )}
+
+      {/* Step 2: push THIS counter's numbers to system stock for this item. */}
+      {step === 2 && canApply && (
         <button
           type="button"
           onClick={onApply}
@@ -2945,7 +3436,7 @@ function HintCard({ isAdmin, mode }: { isAdmin: boolean; mode: "my" | "reviewer"
         <strong>Loose auto-packs:</strong> if you enter more loose than the case size (e.g. 3 loose on a case of 2), it rolls up to 1 case + 1 loose automatically when you leave the box.
       </div>
       <div>
-        <strong>Mark my count done</strong> freezes your entries so they can't change by accident. While you're done, any item you left <em>blank</em> but a teammate filled is read as “found none” and flagged to the reviewer as a conflict. Hit <strong>Resume editing</strong> if you find more.
+        <strong>Mark my count done</strong> freezes your entries so they can't change by accident — and <strong>saves a permanent copy</strong> of everything you counted right then (the admin can see it later in <strong>Count history</strong>, even before anything is committed). While you're done, any item you left <em>blank</em> but a teammate filled is read as “found none” and flagged to the reviewer as a conflict. Hit <strong>Resume editing</strong> if you find more.
       </div>
       {!isAdmin && (
         <div>
@@ -2954,14 +3445,13 @@ function HintCard({ isAdmin, mode }: { isAdmin: boolean; mode: "my" | "reviewer"
       )}
       {isAdmin && (
         <div>
-          <strong>Reviewer mode</strong> shows every counter's draft per item with each one's A/B totals. Disagreements (or a “done” counter who missed an item others found) are flagged{" "}
-          <span className="inline-block px-1 bg-rose-500/15 text-rose-700 dark:text-rose-300 rounded text-[10px]">Conflict</span> with the reason spelled out and skipped from the bulk commit. Use <strong>Conflicts</strong> to see only those. Agreed items show{" "}
-          <span className="inline-block px-1 bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 rounded text-[10px]">Ready</span>. Edit anyone's row inline to resolve, or ask them to recount.
+          <strong>Reviewer works in two steps.</strong> <strong>Step 1 — Reconcile staff counts</strong> lists only the items where counters <em>disagree</em> (or a “done” counter missed an item others found), flagged{" "}
+          <span className="inline-block px-1 bg-rose-500/15 text-rose-700 dark:text-rose-300 rounded text-[10px]">Conflict</span> with the reason spelled out. Resolve each by editing a row, clearing a wrong count, or <strong>Keep only [name]'s count</strong> (clears the others). None of this touches system stock. Once every disagreement is gone, <strong>Step 2 — Reconcile with system</strong> unlocks.
         </div>
       )}
       {isAdmin && (
         <div>
-          <strong>Add a count for</strong> at the bottom of each item lets you enter a count on behalf of a counter who didn't. And <strong>Apply this count</strong> on any row commits <em>just that item</em> to stock using that counter's numbers — your pick-the-value, item-by-item adjustment (overrides a conflict). <strong>Make adjustments</strong> bulk-commits every agreed item; its confirm box also offers <strong>“Full count — zero the stock nobody found”</strong> so after a complete stock-take the system matches the count exactly (untick it for a partial count).
+          <strong>Step 2</strong> lists the agreed items whose count <em>differs from the system</em>, with the <strong>Agreed → system</strong> difference on each. <strong>Make adjustments</strong> pushes every agreed count to stock at once; its confirm box also offers <strong>“Full count — zero the stock nobody found”</strong> so after a complete stock-take the system matches the count exactly (untick for a partial count). <strong>Apply this count</strong> on a single row pushes just that item. <strong>Add a count for</strong> lets you enter a count for a counter who didn't.
         </div>
       )}
       <div>

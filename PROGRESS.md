@@ -230,6 +230,54 @@ If you must touch one of these files: **read first, edit surgically, never repla
 
 ## 11. Changelog (latest first — add new entries at the top)
 
+### 2026-06-26 — Reconciliation: two-step Reviewer wizard + save staff counts on "mark done"
+
+**What & why (user ask):** "first show conflict among the staff, and once that is reconciled show conflict
+with system against staff entries" + "save the data done now in reconciliation by staff." The old Reviewer
+showed staff-vs-staff conflicts AND the system comparison at once; this sequences them and persists each
+staffer's finished count independently of the admin commit.
+
+**One new migration to run: `db/2026-06-26-staff-done-snapshots.sql`** (idempotent, additive — see below).
+Everything else is client code in `app/reconciliation/page.tsx`, live after deploy.
+
+**Reviewer is now a TWO-STEP WIZARD (admin only; My-count unchanged):**
+- A `ReviewerSteps` header shows **Step 1 — Reconcile staff counts** and **Step 2 — Reconcile with system**.
+  Step 2 is **gated**: locked (and the bulk "Make adjustments" button hidden) until `stats.conflicts === 0`.
+  A `useEffect` clamps the step back to 1 if a conflict exists (stale session restore, or a counter creates
+  a new conflict mid-review) — the same invariant the tab-lock enforces for clicks.
+- **Step 1** lists ONLY items where staff disagree (`reviewerStep1Items` = `filtered` ∩ conflict). Resolve via
+  inline edit, per-row clear, or the new **"Keep only [name]'s count"** — a *universal, no-stock* resolver:
+  it deletes the disagreeing counters' drafts AND sets any "done misser" (a counter who marked done but left
+  THIS item blank, whose blank reads as found-none=0 and would otherwise keep the conflict + Step-2 lock
+  alive) back to `done=false`, then `resetStaleDoneFlags`. After it runs only the kept count remains → no
+  conflict, no stock write. Empty state = "All staff agree → Continue to Step 2".
+- **Step 2** lists only the agreed items whose count DIFFERS from system (`reviewerStep2Items`, built from the
+  shared `mergeAgreed` helper so it matches exactly what commit does), each with an **"Agreed → system"** A/B
+  diff. "Make adjustments" (bulk, with the census "zero what nobody found" option) and per-item "Apply this
+  count to stock" live here. Empty state = "Counts match the system — nothing to adjust".
+
+**Save staff counts on "mark done":** pressing **Mark my count done** now snapshots that staffer's non-empty
+drafts into the new `reconciliation_done_snapshots` table the moment they freeze (independent of, and earlier
+than, the admin commit). The **Count history** modal now merges these "Marked done" batches with the commit
+log (`reconciliation_count_log`); both sources paginate via `fetchAllRows` (no silent 1,000-row cap) and a
+single-source load failure warns instead of silently showing empty. CSV export includes both.
+
+**`db/2026-06-26-staff-done-snapshots.sql`** (run once in Supabase SQL editor): immutable, insert-only audit
+(a staff/admin may insert only their OWN rows; admin any; read-all; no update/delete). `user_id` is a **bare
+`uuid not null` with NO FK** (mirrors `reconciliation_count_log`) so a user hard-delete can't CASCADE-wipe the
+audit — the very rows this table exists to preserve (counts marked done but never committed → no transaction →
+the user IS hard-deletable). Denormalized item/counter identity + computed A/B pieces; one batch per done press
+keyed by `(user_id, done_at)`.
+
+**Built with a 6-lens adversarial review + a focused fix-verification pass** (gating/state, keep-only resolution,
+save-on-done, history merge, SQL/RLS, regressions). Confirmed findings fixed before ship: stale `conflictsOnly`
+leaking into Reviewer (scoped to My-count), a keep-only done-misser deadlock (universal resolver above), a
+`deleteDraft` poll-resurrection race (new `deletingRef` tombstone honoured by `refreshDrafts`/`load`), the
+history 1,000-row cap (→ `fetchAllRows`), a swallowed snapshot-load error (per-source toast), and the SQL CASCADE.
+`tsc` + `next build` clean (`/reconciliation` ~27 kB).
+
+---
+
 ### 2026-06-10 (later) — FULL-APP "GOD MODE" AUDIT: ~70 findings fixed + security hardening + design convergence
 
 **What happened:** a 7-subsystem adversarial audit (reconciliation, transactions, items/godowns,
