@@ -51,3 +51,4 @@ coverage/
 
 # local static-preview junction (visual verification only)
 .preview-static/
+.tmp.driveupload/

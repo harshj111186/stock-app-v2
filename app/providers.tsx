@@ -178,8 +178,15 @@ export function Providers({ children }: { children: ReactNode }) {
     if (loading) return;
     if (isDemo()) return; // demo bypasses the auth redirect
     const onLogin = pathname?.endsWith("/login") || pathname?.endsWith("/login/");
+    // A signed-in user normally gets bounced off /login into the app. But the
+    // account-picker is reachable WITH a live session via "Switch account"
+    // (/login?switch=1) — don't bounce in that case, so they can hop into
+    // another account (tap their own card to return). The picker itself sends
+    // you home when you tap the account you're already in.
+    let switching = false;
+    try { switching = new URLSearchParams(window.location.search).has("switch"); } catch {}
     if (!profile && !onLogin) router.replace("/login");
-    if (profile && onLogin) router.replace("/");
+    if (profile && onLogin && !switching) router.replace("/");
   }, [loading, profile, pathname, router]);
 
   // ─── Actions exposed via context ──────────────────────────────────────

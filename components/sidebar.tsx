@@ -4,7 +4,7 @@ import { usePathname } from "next/navigation";
 import {
   LayoutDashboard, Boxes, Warehouse, ArrowLeftRight, Receipt,
   BarChart3, TrendingUp, AlertOctagon, ShieldCheck, Users, Settings, LogOut,
-  Package, Download, ClipboardCheck, FolderTree,
+  Package, Download, ClipboardCheck, FolderTree, UserCog,
 } from "lucide-react";
 import { useAuth } from "@/app/providers";
 import { useInstall } from "@/components/install-provider";
@@ -106,6 +106,11 @@ export function Sidebar() {
           <div className="text-xs font-medium truncate">{profile?.name || profile?.email}</div>
           <div className="text-[10px] text-zinc-500">{profile?.role}</div>
         </div>
+        {/* Switch account → the picker, keeping the current session so an admin
+            can hop into another account (master password bypasses their PIN). */}
+        <Link href="/login?switch=1" className="text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-300" aria-label="Switch account" title="Switch account">
+          <UserCog className="w-4 h-4" />
+        </Link>
         <button onClick={signOut} className="text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-300" aria-label="Sign out">
           <LogOut className="w-4 h-4" />
         </button>

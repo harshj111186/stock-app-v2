@@ -2,7 +2,7 @@
 import Link from "next/link";
 import {
   Warehouse, Receipt, ShieldCheck, Users, Settings, LogOut,
-  ChevronRight, Download, ClipboardCheck, FolderTree,
+  ChevronRight, Download, ClipboardCheck, FolderTree, UserCog,
 } from "lucide-react";
 import { Shell } from "@/components/shell";
 import { useAuth } from "@/app/providers";
@@ -98,6 +98,22 @@ export default function MorePage() {
             })}
           </ul>
         </div>
+
+        {/* Switch account — opens the picker while keeping this session, so an
+            admin can hop into another account (master password skips its PIN). */}
+        <Link
+          href="/login?switch=1"
+          className="w-full bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-2xl px-4 py-4 flex items-center gap-4 active:bg-zinc-100 dark:active:bg-zinc-800 transition-colors shadow-sm"
+        >
+          <span className="w-10 h-10 bg-cyan-500/10 text-cyan-600 dark:text-cyan-400 rounded-xl flex items-center justify-center flex-shrink-0">
+            <UserCog className="w-5 h-5" />
+          </span>
+          <span className="flex-1 text-left">
+            <span className="block text-sm font-medium">Switch account</span>
+            <span className="block text-xs text-zinc-500 mt-0.5">Sign in as someone else</span>
+          </span>
+          <ChevronRight className="w-4 h-4 text-zinc-400 flex-shrink-0" />
+        </Link>
 
         {/* Sign-out */}
         <button
