@@ -230,6 +230,12 @@ If you must touch one of these files: **read first, edit surgically, never repla
 
 ## 11. Changelog (latest first — add new entries at the top)
 
+### 2026-07-12 — Profile-picker login SHIPPED (built ~06-11, sat uncommitted until now)
+- Deployed the profile-picker login that had been sitting uncommitted in the working tree since mid-June: login screen lists every sign-in-able profile as tappable name cards (no email typing), password → PIN flow unchanged, master-password owner override bypasses PIN, "Switch account" entries in sidebar + More page hop accounts while keeping the session, signup passes display name via user_metadata.
+- Applied `db/2026-06-11-login-directory.sql` to Supabase via the Management API (PAT from nexvia-books vault; note: urllib needs a User-Agent header or Cloudflare blocks with error 1010). Verification returned view_present=1, anon_can_read=1, signin_able_accounts=6.
+- Files: `app/login/page.tsx` (rewrite), `app/more/page.tsx`, `app/providers.tsx` (`?switch=1` no-bounce), `components/sidebar.tsx`, `db/2026-06-11-login-directory.sql`, `.gitignore` (+`.tmp.driveupload/`).
+- Commit `ee5fa81`, Actions run green, live bundle verified to contain the `login_directory` fetch.
+
 ### 2026-06-26 — Reconciliation: two-step Reviewer wizard + save staff counts on "mark done"
 
 **What & why (user ask):** "first show conflict among the staff, and once that is reconciled show conflict
