@@ -230,6 +230,45 @@ If you must touch one of these files: **read first, edit surgically, never repla
 
 ## 11. Changelog (latest first — add new entries at the top)
 
+### 2026-07-13 — Reconciliation: "Clear all" for My count + admin Counters panel (per-staff wipe)
+
+**User ask:** a staffer mid-count who wants to start fresh should be able to wipe ALL their inputs in
+one tap (behind a confirm popup — nothing clears silently), per-item clear should also exist (it
+already did), and the admin should be able to wipe any particular counter's entire count, including
+their own. All client code in `app/reconciliation/page.tsx`; **no SQL** (drafts RLS is already
+own-or-admin for writes, done RLS already lets admins reset others — both proven by the existing
+per-item clear + resetStaleDoneFlags).
+
+- **`clearAllForUser(userId)`** — bulk-wipes every draft row one counter holds. Same tombstone
+  discipline as `deleteDraft` but applied to ALL the user's keys BEFORE the single
+  `delete().eq("user_id")`: each key goes into `deletingRef` (poll can't re-adopt mid-flight),
+  its `dirtyRef` entry is dropped and its debounced save timer cancelled (a pending `persistDraft`
+  can't resurrect the row — it no-ops once the key is out of `draftsRef`). On server failure:
+  toast + tombstones off, the next poll re-adopts whatever survived (deleteDraft's self-heal).
+  **If the counter was marked done, the freeze is lifted too** (`reconciliation_done` → done=false
+  + `refreshDone`) — a wiped-but-still-done user's blanks would read as "found none" and fabricate
+  a conflict on every item teammates counted.
+- **My count → "Clear all"** toolbar button (Eraser icon, rose hover): staff + admin, only when
+  ≥1 of my items has entries, hidden while frozen (resume first) and for viewers. Danger confirm
+  popup states the exact item count ("Your entries on N items are deleted so you can start
+  fresh. This can't be undone.") with the confirm button labelled **Clear all**; cancel leaves
+  everything untouched. Success toast.
+- **Admin Counters panel** — the "N users counting" chip is now a BUTTON for admins (passive chip
+  for staff) in both modes, opening a modal that lists every counter with saved entries this cycle
+  (name + "(you)" marker, items-entered count, done badge) each with a per-counter **Clear all**
+  (same danger confirm, worded "they'd have to recount from scratch", notes when the done freeze
+  will be lifted). Clearing your own count from here works too. Per-user busy spinner; buttons
+  disabled while a commit / per-item apply is running (their delete would race makeAdjustments'
+  own end-of-commit draft wipe). Confirm dialog (z-[70]) layers above the panel (z-50).
+  Past "marked done" snapshots + commit history are untouched by a wipe (immutable audit) — the
+  panel says so.
+- Per-item clear already existed (My count row reset + Reviewer per-counter clear, both
+  confirm-gated) — unchanged.
+- Verified in demo mode (`?demo=1`, mock DB) via dev server: button appears after first entry,
+  cancel path intact, confirm wipes inputs + "0 users counting", frozen counter cleared from the
+  panel lifts the banner, toast "Your count is cleared — start fresh.", zero console errors.
+  `tsc` + `next build` clean (`/reconciliation` 28.3 kB).
+
 ### 2026-07-12 — Profile-picker login SHIPPED (built ~06-11, sat uncommitted until now)
 - Deployed the profile-picker login that had been sitting uncommitted in the working tree since mid-June: login screen lists every sign-in-able profile as tappable name cards (no email typing), password → PIN flow unchanged, master-password owner override bypasses PIN, "Switch account" entries in sidebar + More page hop accounts while keeping the session, signup passes display name via user_metadata.
 - Applied `db/2026-06-11-login-directory.sql` to Supabase via the Management API (PAT from nexvia-books vault; note: urllib needs a User-Agent header or Cloudflare blocks with error 1010). Verification returned view_present=1, anon_can_read=1, signin_able_accounts=6.

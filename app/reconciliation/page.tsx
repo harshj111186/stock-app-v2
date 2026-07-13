@@ -4,7 +4,7 @@ import {
   Printer, ClipboardCheck, CheckCircle2, AlertCircle,
   RotateCcw, Loader2, Filter, Eye, EyeOff, Users, ShieldCheck,
   UserCircle2, Clock, Lock, LockOpen, CheckCheck, AlertTriangle, UserPlus,
-  Minus, Plus, History, Download, X,
+  Minus, Plus, History, Download, X, Eraser,
 } from "lucide-react";
 import { Shell } from "@/components/shell";
 import { sb, fetchAllRows, type Item } from "@/lib/supabase";
@@ -703,6 +703,75 @@ export default function ReconciliationPage() {
       deletingRef.current.delete(k);
     }
   }, [writeDrafts]);
+
+  // Wipe EVERY draft row one counter holds — the "start fresh" action (self
+  // from My count's Clear all, any counter from the admin's Counters panel).
+  // Same tombstone discipline as deleteDraft, applied to all of the user's
+  // keys BEFORE the bulk server delete, so neither the poll nor a pending
+  // save timer can resurrect a row mid-wipe. If the counter was marked done,
+  // the freeze is lifted too — a done user's blanks read as "found none" and
+  // a wiped-but-still-done count would fabricate a conflict on every item
+  // their teammates counted.
+  const clearAllForUser = useCallback(async (userId: string): Promise<boolean> => {
+    const keys: DraftKey[] = [];
+    for (const [k, d] of draftsRef.current) if (d.user_id === userId) keys.push(k);
+    for (const k of keys) {
+      deletingRef.current.add(k);
+      dirtyRef.current.delete(k);
+      const t = saveTimers.current.get(k);
+      if (t) { clearTimeout(t); saveTimers.current.delete(k); }
+    }
+    if (keys.length > 0) {
+      const next = new Map(draftsRef.current);
+      for (const k of keys) next.delete(k);
+      writeDrafts(next);
+    }
+    let ok = true;
+    try {
+      const { error } = await sb().from("reconciliation_drafts").delete().eq("user_id", userId);
+      if (error) {
+        ok = false;
+        showToast("bad", `Couldn't clear the count: ${error.message}`);
+      }
+    } catch (e) {
+      ok = false;
+      showToast("bad", `Couldn't clear the count: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      // Tombstones off. On failure the next poll re-adopts whatever survived
+      // server-side — the same self-heal deleteDraft relies on.
+      for (const k of keys) deletingRef.current.delete(k);
+    }
+    if (ok && doneByUser.get(userId)?.done) {
+      const { error } = await sb().from("reconciliation_done")
+        .update({ done: false, done_at: null }).eq("user_id", userId);
+      if (!error) await refreshDone();
+    }
+    return ok;
+  }, [writeDrafts, doneByUser, refreshDone]);
+
+  // My count's Clear all — every one of MY entries, behind an explicit
+  // danger popup (nothing wipes on a stray tap). Hidden while frozen: resume
+  // first, then clear.
+  const clearMyCount = useCallback(async () => {
+    if (!profile?.id || myDone) return;
+    const uid = profile.id;
+    let rows = 0, itemsN = 0;
+    for (const [, d] of draftsRef.current) {
+      if (d.user_id !== uid) continue;
+      rows++;
+      if (!isDraftEmpty(d)) itemsN++;
+    }
+    if (rows === 0) return;
+    const n = itemsN || rows;
+    const ok = await confirm({
+      title: "Clear your entire count?",
+      body: <>Your entries on <strong>{fmtN(n)} item{n === 1 ? "" : "s"}</strong> are deleted so you can start fresh. This can&apos;t be undone.</>,
+      danger: true,
+      confirmLabel: "Clear all",
+    });
+    if (!ok) return;
+    if (await clearAllForUser(uid)) showToast("ok", "Your count is cleared — start fresh.");
+  }, [profile?.id, myDone, confirm, clearAllForUser]);
 
   // ─── case-size rollover normalization ────────────────────────────────────
   // If loose >= the effective case size, roll the excess up into cases:
@@ -1728,6 +1797,54 @@ export default function ReconciliationPage() {
     URL.revokeObjectURL(url);
   };
 
+  // ─── counters panel (admin): everyone's progress + per-counter Clear all ──
+  // Opened from the "N users counting" chip. Lists every counter with saved
+  // entries this cycle; "Clear all" wipes that counter's whole count so they
+  // can start fresh. Includes the admin themself — clearing your own count
+  // works from the same place.
+  const [countersOpen, setCountersOpen] = useState(false);
+  useEscape(countersOpen, () => setCountersOpen(false));
+  // Per-user busy flag so a slow wipe can't be double-tapped (or two wipes
+  // interleaved) while the first one's delete is in flight.
+  const [clearingUid, setClearingUid] = useState<string | null>(null);
+  const counterSummary = useMemo(() => {
+    const m = new Map<string, { name: string; items: number; rows: number }>();
+    drafts.forEach(d => {
+      const cur = m.get(d.user_id) ?? { name: displayUser(d), items: 0, rows: 0 };
+      cur.rows++;
+      if (!isDraftEmpty(d)) cur.items++;
+      m.set(d.user_id, cur);
+    });
+    return [...m.entries()]
+      .map(([id, v]) => ({ id, ...v, done: doneByUser.get(id)?.done ?? false }))
+      .sort((a, b) =>
+        (a.id === profile?.id ? 0 : 1) - (b.id === profile?.id ? 0 : 1) ||
+        a.name.localeCompare(b.name));
+  }, [drafts, doneByUser, profile?.id]);
+
+  const clearCounterAll = useCallback(async (uid: string, name: string, itemsN: number) => {
+    // Not while a commit / per-item apply is running — makeAdjustments wipes
+    // drafts itself at the end, and racing the two deletes could strand rows.
+    if (clearingUid || processing || applyingItemId) return;
+    const isMe = uid === profile?.id;
+    const wasDone = doneByUser.get(uid)?.done ?? false;
+    const who = isMe ? "Your" : `${name}'s`;
+    const ok = await confirm({
+      title: isMe ? "Clear your entire count?" : `Clear ${name}'s entire count?`,
+      body: <>
+        {who} entries on <strong>{fmtN(itemsN)} item{itemsN === 1 ? "" : "s"}</strong> are deleted — {isMe ? "you" : "they"}&apos;d have to recount from scratch.
+        {wasDone && <> The &ldquo;done&rdquo; freeze is lifted too.</>} This can&apos;t be undone.
+      </>,
+      danger: true,
+      confirmLabel: "Clear all",
+    });
+    if (!ok) return;
+    setClearingUid(uid);
+    const success = await clearAllForUser(uid);
+    setClearingUid(null);
+    if (success) showToast("ok", isMe ? "Your count is cleared." : `${name}'s count is cleared${wasDone ? " and unfrozen" : ""}.`);
+  }, [clearingUid, processing, applyingItemId, profile?.id, doneByUser, confirm, clearAllForUser]);
+
   // ─── render ────────────────────────────────────────────────────────────
   return (
     <Shell title="Reconciliation">
@@ -1756,6 +1873,9 @@ export default function ReconciliationPage() {
           canCount={canCount}
           onToggleDone={toggleDone}
           doneSaving={doneSaving}
+          myStaged={stats.myStaged}
+          onClearMine={() => void clearMyCount()}
+          onCounters={() => setCountersOpen(true)}
           onPrint={() => window.print()}
           onHistory={() => void openHistory()}
           onCommit={openCommitConfirm}
@@ -1981,6 +2101,64 @@ export default function ReconciliationPage() {
           </div>
         )}
 
+        {/* Counters panel (admin) — everyone's progress, with a per-counter
+            "Clear all" that wipes that counter's whole count. The confirm
+            dialog (z-[70]) layers above this modal (z-50). */}
+        {countersOpen && (
+          <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center p-4 bg-black/50 dark:bg-black/70" role="dialog" aria-modal="true" aria-label="Counters"
+            onMouseDown={(e) => { if (e.target === e.currentTarget) setCountersOpen(false); }}>
+            <div className="w-full max-w-md max-h-[85vh] flex flex-col bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-2xl shadow-xl overflow-hidden">
+              <div className="flex items-center gap-2 px-4 sm:px-5 py-3 border-b border-zinc-200 dark:border-zinc-800">
+                <Users className="w-4 h-4 text-violet-600 dark:text-violet-400 flex-shrink-0" />
+                <h2 className="text-base font-semibold flex-1 truncate">Counters</h2>
+                <button type="button" onClick={() => setCountersOpen(false)} className="min-w-11 min-h-11 -m-2 inline-flex items-center justify-center text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-200" aria-label="Close">
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+              <div className="flex-1 overflow-y-auto p-4 sm:p-5">
+                {counterSummary.length === 0 ? (
+                  <div className="py-8 text-center text-sm text-zinc-500">Nobody has entered a count yet.</div>
+                ) : (
+                  <>
+                    <p className="text-xs text-zinc-500 mb-3">
+                      Everyone with saved entries this cycle. <strong>Clear all</strong> deletes that counter&apos;s entries on every item so they can start fresh — their past &ldquo;marked done&rdquo; snapshots and committed history stay in Count history.
+                    </p>
+                    <ul className="space-y-2">
+                      {counterSummary.map(c => (
+                        <li key={c.id} className="flex items-center gap-3 rounded-lg border border-zinc-200 dark:border-zinc-800 px-3.5 py-2.5">
+                          <div className="flex-1 min-w-0">
+                            <div className="text-sm font-medium truncate">
+                              {c.name}{c.id === profile?.id && <span className="text-zinc-400 font-normal"> (you)</span>}
+                            </div>
+                            <div className="text-xs text-zinc-500 flex items-center gap-2 tabular-nums">
+                              {fmtN(c.items)} item{c.items === 1 ? "" : "s"} entered
+                              {c.done && (
+                                <span className="inline-flex items-center gap-1 text-emerald-600 dark:text-emerald-400">
+                                  <Lock className="w-3 h-3" /> done
+                                </span>
+                              )}
+                            </div>
+                          </div>
+                          <button
+                            type="button"
+                            disabled={clearingUid !== null || processing || applyingItemId !== null}
+                            onClick={() => void clearCounterAll(c.id, c.name, c.items)}
+                            className="inline-flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-xs font-medium border border-rose-300/60 dark:border-rose-500/30 text-rose-600 dark:text-rose-400 hover:bg-rose-500/10 hover:border-rose-400 disabled:opacity-40 flex-shrink-0"
+                            title={`Delete every entry ${c.id === profile?.id ? "you have" : `${c.name} has`} made`}
+                          >
+                            {clearingUid === c.id ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Eraser className="w-3.5 h-3.5" />}
+                            Clear all
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                  </>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* Pre-commit confirmation — nothing writes until Commit is tapped. */}
         {commitConfirm && (
           <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center p-4 bg-black/50 dark:bg-black/70" role="dialog" aria-modal="true" aria-label="Confirm make adjustments">
@@ -2171,6 +2349,7 @@ function Toolbar({
   brands, cats, shownCount,
   mode, setMode, isAdmin, reviewerStep, usersWithDrafts,
   myDone, canCount, onToggleDone, doneSaving,
+  myStaged, onClearMine, onCounters,
   onPrint, onHistory, onCommit, canCommit, processing, progress,
 }: {
   q: string; setQ: (s: string) => void;
@@ -2183,6 +2362,7 @@ function Toolbar({
   mode: "my" | "reviewer"; setMode: (m: "my" | "reviewer") => void;
   isAdmin: boolean; reviewerStep: 1 | 2; usersWithDrafts: number;
   myDone: boolean; canCount: boolean; onToggleDone: () => void; doneSaving: boolean;
+  myStaged: number; onClearMine: () => void; onCounters: () => void;
   onPrint: () => void; onHistory: () => void; onCommit: () => void;
   canCommit: boolean; processing: boolean;
   progress: { done: number; total: number };
@@ -2317,10 +2497,38 @@ function Toolbar({
           </button>
         )}
 
-        <div className="inline-flex items-center gap-1.5 text-[11px] text-zinc-500 px-2 py-1.5 rounded-md bg-zinc-50 dark:bg-zinc-800/50 border border-zinc-200 dark:border-zinc-800">
-          <Users className="w-3 h-3" />
-          {usersWithDrafts} {usersWithDrafts === 1 ? "user counting" : "users counting"}
-        </div>
+        {/* Start fresh: delete every entry I've made. A confirm popup is the
+            real gate — nothing wipes on a stray tap. Hidden while frozen
+            (resume first) and with nothing entered. */}
+        {mode === "my" && canCount && !myDone && myStaged > 0 && (
+          <button
+            type="button"
+            onClick={onClearMine}
+            className="inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm border bg-white dark:bg-zinc-900 border-zinc-200 dark:border-zinc-800 text-zinc-700 dark:text-zinc-200 hover:border-rose-400 hover:text-rose-600 dark:hover:border-rose-500/40 dark:hover:text-rose-400 transition-colors"
+            title="Delete all your entered counts and start fresh"
+          >
+            <Eraser className="w-3.5 h-3.5" /> Clear all
+          </button>
+        )}
+
+        {/* Admins: the chip opens the Counters panel (per-counter progress +
+            Clear all). For staff it stays a passive count. */}
+        {isAdmin ? (
+          <button
+            type="button"
+            onClick={onCounters}
+            className="inline-flex items-center gap-1.5 text-[11px] text-zinc-500 px-2 py-1.5 rounded-md bg-zinc-50 dark:bg-zinc-800/50 border border-zinc-200 dark:border-zinc-800 hover:border-zinc-300 dark:hover:border-zinc-600 hover:text-zinc-700 dark:hover:text-zinc-300 transition-colors"
+            title="Every counter's progress — view or clear a counter's entries"
+          >
+            <Users className="w-3 h-3" />
+            {usersWithDrafts} {usersWithDrafts === 1 ? "user counting" : "users counting"}
+          </button>
+        ) : (
+          <div className="inline-flex items-center gap-1.5 text-[11px] text-zinc-500 px-2 py-1.5 rounded-md bg-zinc-50 dark:bg-zinc-800/50 border border-zinc-200 dark:border-zinc-800">
+            <Users className="w-3 h-3" />
+            {usersWithDrafts} {usersWithDrafts === 1 ? "user counting" : "users counting"}
+          </div>
+        )}
 
         <button
           type="button"
