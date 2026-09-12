@@ -1967,3 +1967,10 @@ limit 20;
 ---
 
 *End of PROGRESS.md. If you're an AI session and you've read this, you're ready to work. Update the Changelog when you're done.*
+
+
+<!-- WORKTREE-AUDIT-2026-09-12 -->
+### 12 September 2026 — local build recovery
+
+The C-drive audit found the local npm dependencies missing. Ran npm ci from the existing lockfile, then npm run build. Static export completed. No application code or database change. Saved build output in the workspace audit. The existing Next.js dependency warning is still open. Full inventory, retained work and recovery records: `C:\Users\USER\Documents\Claude\_qa-tools\worktree-audit-2026-09-12\REPORT.md`.
+
