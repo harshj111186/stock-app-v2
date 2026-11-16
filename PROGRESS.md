@@ -329,6 +329,10 @@ the Adjustment row like the SQL.
 production build in demo mode; `tsc` clean; `next build` OK. Not proven on a real phone in the godown, and
 drag-and-drop is computer-only.
 
+**Shipped:** commit `71d29dd`, Actions run 43859317294 green (~11:38 UTC / 17:08 IST). Live check on
+https://harshj111186.github.io/stock-app-v2 in demo mode: 77/77 (`redesign.mjs` 39, `recon.mjs` 16,
+`recon2.mjs` 12, `txn.mjs` 10; shots in the QA folder's `live\`). Real data not opened (PIN login).
+
 
 ### 2026-11-16 — Ease-of-use pass: stock count made faster to do and to review; plain words elsewhere
 
