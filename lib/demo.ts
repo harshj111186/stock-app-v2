@@ -272,6 +272,13 @@ function demoRpc(fn: string, a: Row): { data: any; error: { message: string } | 
       if (!arch && clash(r.parent_id ?? null, r.name, r.id)) return bad('duplicate key value violates unique constraint "categories_parent_name_uq"');
       r.archived = arch; return ok();
     }
+    case "category_reorder": {
+      const ids: string[] = a.p_ids || [];
+      const parent = a.p_parent_id ?? null;
+      if (cats.some(r => ids.includes(r.id) && (r.parent_id ?? null) !== parent)) return bad("All categories being re-ordered must sit under the same parent.");
+      ids.forEach((id, i) => { const r = cats.find(x => x.id === id); if (r) r.sort_order = i + 1; });
+      return ok(ids.length);
+    }
     case "set_items_category": {
       const ids = new Set<string>(a.p_item_ids || []); const target = a.p_category_id ?? null;
       const c = target ? cats.find(x => x.id === target) : null;

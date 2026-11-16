@@ -17,7 +17,7 @@
 // apply_reconciliation calls) and the add-item form's optional opening count.
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  Plus, AlertCircle, ListChecks, X, FolderTree, ChevronRight, Folder, FolderInput, Search, Check, Package, SlidersHorizontal, Undo2,
+  Plus, AlertCircle, ListChecks, X, FolderTree, ChevronRight, Folder, FolderInput, Search, Check, Package, SlidersHorizontal, Undo2, Tag,
 } from "lucide-react";
 import { Shell } from "@/components/shell";
 import { useAuth } from "@/app/providers";
@@ -27,6 +27,7 @@ import {
   buildCategoryTree, flattenTree, pathById, descendantIds, rollupCounts, ancestorChain, toCatRow, type CatRow,
 } from "@/lib/categories";
 import { CategoryTree, ALL, NONE, ITEM_DRAG } from "@/components/category-tree";
+import { BrandTree, NO_BRAND, type BrandStat } from "@/components/brand-tree";
 import { CategoryPickerSheet } from "@/components/category-picker";
 import { ItemFormModal, type ItemPreset } from "@/components/item-form-modal";
 import { EditStockModal } from "@/components/edit-stock-modal";
@@ -36,6 +37,7 @@ import { useEscape, useMediaQuery } from "@/lib/hooks";
 type Godown = "A" | "B";
 type GView = "both" | Godown;
 type Status = "" | "stock" | "low" | "out" | "archived";
+type Browse = "category" | "brand";
 type Row = Item & {
   casesA: number; looseA: number; casesB: number; looseB: number;
   totalA: number; totalB: number; hasA: boolean; hasB: boolean;
@@ -43,6 +45,17 @@ type Row = Item & {
 };
 
 const collator = new Intl.Collator("en", { numeric: true, sensitivity: "base" });
+// Tie-break for names that differ only in case ("Havells" / "HAVELLS"), so a
+// sort never interleaves them (that split one heading into many).
+const exact = (a?: string | null, b?: string | null) => { const x = a || "", y = b || ""; return x < y ? -1 : x > y ? 1 : 0; };
+// Brand writes in slices: ids travel in the request address, which has a size limit.
+async function writeBrand(ids: string[], brand: string | null): Promise<string | null> {
+  for (let i = 0; i < ids.length; i += 100) {
+    const { error } = await sb().from("items").update({ brand }).in("id", ids.slice(i, i + 100));
+    if (error) return error.message || "Could not change the brand.";
+  }
+  return null;
+}
 
 export function ItemsView({ godown: fixedGodown }: { godown?: Godown }) {
   const { profile } = useAuth();
@@ -57,6 +70,9 @@ export function ItemsView({ godown: fixedGodown }: { godown?: Godown }) {
   const [loadError, setLoadError] = useState<string | null>(null);
 
   const [selCat, setSelCat] = useState<string>(ALL);
+  // Browse by category (the tree) or by brand (brand → its categories → …).
+  const [browse, setBrowse] = useState<Browse>("category");
+  const [selBrand, setSelBrand] = useState<string | null>(null); // brand mode: null = all brands
   const [q, setQ] = useState("");
   const [brand, setBrand] = useState("");
   const [status, setStatus] = useState<Status>("");
@@ -91,10 +107,14 @@ export function ItemsView({ godown: fixedGodown }: { godown?: Godown }) {
       const c = p.get("cat");
       if (s && ["stock", "out", "low"].includes(s)) setStatus(s as Status);
       if (query) setQ(query);
+      const bm = localStorage.getItem(`${pageKey}.browse`);
+      if (bm === "brand" || bm === "category") setBrowse(bm);
       if (c) setSelCat(c);
       else if (!s && !query) {
         const saved = localStorage.getItem(`${pageKey}.cat`);
         if (saved) setSelCat(saved);
+        const savedBrand = localStorage.getItem(`${pageKey}.brand`);
+        if (savedBrand && bm === "brand") setSelBrand(savedBrand);
       }
       if (!fixedGodown) {
         const g = localStorage.getItem("items.gview");
@@ -104,6 +124,7 @@ export function ItemsView({ godown: fixedGodown }: { godown?: Godown }) {
     restored.current = true;
   }, [pageKey, fixedGodown]);
   useEffect(() => { if (restored.current) try { localStorage.setItem(`${pageKey}.cat`, selCat); } catch { /* ignore */ } }, [selCat, pageKey]);
+  useEffect(() => { if (restored.current) try { localStorage.setItem(`${pageKey}.browse`, browse); localStorage.setItem(`${pageKey}.brand`, selBrand ?? ""); } catch { /* ignore */ } }, [browse, selBrand, pageKey]);
   useEffect(() => { if (restored.current && !fixedGodown) try { localStorage.setItem("items.gview", gview); } catch { /* ignore */ } }, [gview, fixedGodown]);
   useEffect(() => {
     try { if (new URLSearchParams(window.location.search).get("new") === "1" && isAdmin) setCreating({}); } catch { /* ignore */ }
@@ -158,6 +179,12 @@ export function ItemsView({ godown: fixedGodown }: { godown?: Godown }) {
     if (!cats.some(c => c.id === selCat && !c.archived)) setSelCat(ALL);
   }, [loaded, loadError, cats, selCat]);
 
+  useEffect(() => {
+    if (!loaded || loadError || browse !== "brand" || !selBrand) return;
+    const has = selBrand === NO_BRAND ? rows.some(r => !r.archived && !r.brand) : rows.some(r => !r.archived && r.brand === selBrand);
+    if (!has) setSelBrand(null);
+  }, [loaded, loadError, browse, selBrand, rows]);
+
   // ─── status (the ONE shared rule — lib/utils) ─────────────────────────
   const totalOf = useCallback((r: Row) => gview === "A" ? r.totalA : gview === "B" ? r.totalB : r.totalA + r.totalB, [gview]);
   const statusOf = useCallback((r: Row): "never" | "out" | "low" | "ok" => {
@@ -175,16 +202,33 @@ export function ItemsView({ godown: fixedGodown }: { godown?: Godown }) {
     return [...n.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).map(([b]) => b);
   }, [rows]);
 
-  // Everything except the category filter — drives the tree's counts.
-  const preCat = useMemo(() => rows.filter(r => {
+  // Status + search only — the brand view counts per brand from this.
+  const base = useMemo(() => rows.filter(r => {
     if (status === "archived" ? !r.archived : r.archived) return false;
-    if (brand && r.brand !== brand) return false;
     if (status === "stock" && totalOf(r) <= 0) return false;
     if (status === "low" && statusOf(r) !== "low") return false;
     if (status === "out" && statusOf(r) !== "out") return false;
     if (q && !matchesQuery(`${r.brand || ""} ${r.model} ${r.size} ${r.colour} ${r.catPath || ""} ${r.item_code}`, q)) return false;
     return true;
-  }), [rows, status, brand, q, totalOf, statusOf]);
+  }), [rows, status, q, totalOf, statusOf]);
+  // Brand test: the tree's brand in "By brand", the toolbar's brand otherwise.
+  const brandOk = useCallback((r: Row) => browse === "brand"
+    ? selBrand === null || (selBrand === NO_BRAND ? !r.brand : r.brand === selBrand)
+    : !brand || r.brand === brand, [browse, selBrand, brand]);
+  // Everything except the category filter — drives the category tree's counts.
+  const preCat = useMemo(() => base.filter(brandOk), [base, brandOk]);
+  const brandStats = useMemo(() => {
+    const m = new Map<string, BrandStat>();
+    for (const r of base) {
+      const k = r.brand || NO_BRAND;
+      const st = m.get(k) ?? { total: 0, none: 0, direct: new Map<string, number>() };
+      st.total++;
+      if (r.catLive && r.category_id) st.direct.set(r.category_id, (st.direct.get(r.category_id) ?? 0) + 1);
+      else st.none++;
+      m.set(k, st);
+    }
+    return m;
+  }, [base]);
 
   const inCat = useMemo(() => {
     if (selCat === ALL) return null;
@@ -194,13 +238,16 @@ export function ItemsView({ godown: fixedGodown }: { godown?: Godown }) {
 
   const visible = useMemo(() => {
     const list = preCat.filter(r => inCat === null ? true : inCat === "none" ? !r.catLive : r.catLive && inCat.has(r.category_id!));
+    // By brand: brand first (no brand last), then the category tree order.
+    const byBrand = browse === "brand";
     return list.sort((a, b) =>
-      a.order - b.order
+      (byBrand ? (!a.brand ? 1 : 0) - (!b.brand ? 1 : 0) || collator.compare(a.brand || "", b.brand || "") || exact(a.brand, b.brand) : 0)
+      || a.order - b.order
       || collator.compare(a.brand || "", b.brand || "")
       || collator.compare(a.model, b.model)
       || collator.compare(a.size || "", b.size || "")
       || collator.compare(a.colour || "", b.colour || ""));
-  }, [preCat, inCat]);
+  }, [preCat, inCat, browse]);
 
   const directCounts = useMemo(() => {
     const m = new Map<string, number>();
@@ -211,16 +258,16 @@ export function ItemsView({ godown: fixedGodown }: { godown?: Godown }) {
   const uncategorised = useMemo(() => preCat.filter(r => !r.catLive).length, [preCat]);
 
   const statusCounts = useMemo(() => {
-    const base = rows.filter(r => !r.archived && (!brand || r.brand === brand)
+    const inView = rows.filter(r => !r.archived && brandOk(r)
       && (inCat === null ? true : inCat === "none" ? !r.catLive : r.catLive && inCat.has(r.category_id!)));
     return {
-      all: base.length,
-      stock: base.filter(r => totalOf(r) > 0).length,
-      low: base.filter(r => statusOf(r) === "low").length,
-      out: base.filter(r => statusOf(r) === "out").length,
+      all: inView.length,
+      stock: inView.filter(r => totalOf(r) > 0).length,
+      low: inView.filter(r => statusOf(r) === "low").length,
+      out: inView.filter(r => statusOf(r) === "out").length,
       archived: rows.filter(r => r.archived).length,
     };
-  }, [rows, brand, inCat, totalOf, statusOf]);
+  }, [rows, brandOk, inCat, totalOf, statusOf]);
 
   // Selections never outlive the list that showed them.
   useEffect(() => {
@@ -237,25 +284,34 @@ export function ItemsView({ godown: fixedGodown }: { godown?: Godown }) {
   const sections = useMemo(() => {
     const out: { key: string; label: string[]; rows: Row[] }[] = [];
     const depth = selChain.length;
+    // By brand with no brand chosen: one heading per brand + category ("Goldmedal › ceiling fan").
+    const withBrand = browse === "brand" && !selBrand;
     for (const r of visible) {
-      const key = r.catLive ? r.category_id! : "__none";
+      const catKey = r.catLive ? r.category_id! : "__none";
+      const key = withBrand ? `${r.brand || ""}|${catKey}` : catKey;
       let sec = out[out.length - 1];
       if (!sec || sec.key !== key) {
         const segs = r.catLive && r.catPath ? r.catPath.split(" › ") : ["No category"];
-        sec = { key, label: depth && r.catLive ? segs.slice(depth - 1) : segs, rows: [] };
+        const label = depth && r.catLive ? segs.slice(depth - 1) : segs;
+        sec = { key, label: withBrand ? [r.brand || "No brand", ...label] : label, rows: [] };
         out.push(sec);
       }
       sec.rows.push(r);
     }
     return out;
-  }, [visible, selChain]);
+  }, [visible, selChain, browse, selBrand]);
 
   const children = useMemo(() => {
     const parent = selCat === ALL ? null : selCat === NONE ? undefined : selCat;
     if (parent === undefined) return [];
-    return cats.filter(c => !c.archived && (c.parent_id ?? null) === parent)
+    const kids = cats.filter(c => !c.archived && (c.parent_id ?? null) === parent)
       .sort((a, b) => (a.sort_order ?? 0) - (b.sort_order ?? 0) || collator.compare(a.name, b.name));
-  }, [cats, selCat]);
+    // By brand: only the categories that hold that brand's items.
+    return browse === "brand" ? kids.filter(c => (counts.get(c.id) ?? 0) > 0) : kids;
+  }, [cats, selCat, counts, browse]);
+  const brandChips = useMemo(() => [...brandStats.entries()]
+    .sort((a, b) => a[0] === NO_BRAND ? 1 : b[0] === NO_BRAND ? -1 : a[0].localeCompare(b[0], "en", { sensitivity: "base" }) || exact(a[0], b[0])),
+  [brandStats]);
 
   const headline = useMemo(() => {
     const live = rows.filter(r => !r.archived);
@@ -267,44 +323,112 @@ export function ItemsView({ godown: fixedGodown }: { godown?: Godown }) {
   const byId = useMemo(() => new Map(rows.map(r => [r.id, r])), [rows]);
   const paths = useMemo(() => pathById(cats), [cats]);
 
-  const moveItems = useCallback(async (ids: string[], target: string | null) => {
-    const before = new Map<string | null, string[]>();
+  // Move items to a category and/or give them a brand (undefined = leave as
+  // is). Brand goes through a plain items update (admins may write items —
+  // RLS items_admin_write), category through set_items_category. Undo puts
+  // every item back exactly where (and under the brand) it was.
+  const relabel = useCallback(async (ids: string[], to: { cat?: string | null; brand?: string | null }) => {
+    const prevCat = new Map<string | null, string[]>(), prevBrand = new Map<string | null, string[]>();
     for (const id of ids) {
       const r = byId.get(id);
-      const k = r?.category_id ?? null;
-      before.set(k, [...(before.get(k) ?? []), id]);
+      const c = r?.category_id ?? null, b = r?.brand ?? null;
+      prevCat.set(c, [...(prevCat.get(c) ?? []), id]);
+      prevBrand.set(b, [...(prevBrand.get(b) ?? []), id]);
     }
-    const { error } = await sb().rpc("set_items_category", { p_item_ids: ids, p_category_id: target });
-    if (error) { notify("bad", error.message || "Could not move the items."); return; }
+    const brandIds = to.brand === undefined ? [] : ids.filter(id => (byId.get(id)?.brand ?? null) !== to.brand);
+    if (to.cat !== undefined) {
+      const { error } = await sb().rpc("set_items_category", { p_item_ids: ids, p_category_id: to.cat });
+      if (error) { notify("bad", error.message || "Could not move the items."); return; }
+    }
+    if (brandIds.length) {
+      const err = await writeBrand(brandIds, to.brand ?? null);
+      if (err) {
+        // Don't leave a half-done move: put the categories back too.
+        if (to.cat !== undefined) for (const [cat, list] of prevCat) await sb().rpc("set_items_category", { p_item_ids: list, p_category_id: cat });
+        await loadData();
+        notify("bad", `Nothing was changed — the brand could not be set (${err}).`);
+        return;
+      }
+    }
     await loadData();
     setSelected(new Set());
-    const where = target ? paths.get(target) ?? "the category" : "No category";
-    notify("ok", `Moved ${ids.length} item${ids.length === 1 ? "" : "s"} to ${where}.`, async () => {
-      for (const [cat, list] of before) {
+    const n = `${ids.length} item${ids.length === 1 ? "" : "s"}`;
+    const where = to.cat === undefined ? "" : to.cat ? paths.get(to.cat) ?? "the category" : "No category";
+    const text = to.cat !== undefined && brandIds.length ? `Moved ${n} to ${where} as ${to.brand ?? "no brand"}.`
+      : to.cat !== undefined ? `Moved ${n} to ${where}.`
+      : brandIds.length ? `${n} now under brand ${to.brand ?? "(none)"}.` : `Already under ${to.brand ?? "no brand"}.`;
+    const changed = to.cat !== undefined || brandIds.length > 0;
+    notify("ok", text, changed ? async () => {
+      if (to.cat !== undefined) for (const [cat, list] of prevCat) {
         const { error: e } = await sb().rpc("set_items_category", { p_item_ids: list, p_category_id: cat });
         if (e) { await loadData(); notify("bad", `Could not move them all back: ${e.message}`); return; }
       }
+      if (brandIds.length) for (const [b, list] of prevBrand) {
+        const back = list.filter(id => brandIds.includes(id));
+        if (!back.length) continue;
+        const e = await writeBrand(back, b);
+        if (e) { await loadData(); notify("bad", `Could not put the brand back: ${e}`); return; }
+      }
       await loadData();
       notify("ok", "Moved back.");
-    });
+    } : undefined);
   }, [byId, loadData, notify, paths]);
+  const moveItems = useCallback((ids: string[], target: string | null) => relabel(ids, { cat: target }), [relabel]);
+
+  // Rename a brand on every item that has it; typing an existing brand's name
+  // merges the two (its spelling is kept). Undo restores the old name.
+  const renameBrand = useCallback(async (oldB: string, next: string): Promise<boolean> => {
+    // Every item with this brand (archived ones too, so the name stays consistent);
+    // an existing brand of the same name in any case — live or archived — is merged into.
+    const allBrands = [...new Set(rows.map(r => r.brand).filter((b): b is string => !!b))];
+    const existing = allBrands.find(b => b.toLowerCase() === next.trim().toLowerCase() && b !== oldB);
+    const final = existing ?? next.trim();
+    const ids = rows.filter(r => r.brand === oldB).map(r => r.id);
+    if (!ids.length) return true;
+    const err = await writeBrand(ids, final);
+    if (err) { await loadData(); notify("bad", `Could not rename the brand: ${err}`); return false; }
+    await loadData();
+    if (selBrand === oldB) setSelBrand(final);
+    notify("ok", existing ? `Merged ${oldB} into ${final} (${ids.length} item${ids.length === 1 ? "" : "s"}).` : `Renamed ${oldB} to ${final}.`, async () => {
+      const e = await writeBrand(ids, oldB);
+      await loadData();
+      notify(e ? "bad" : "ok", e ? `Could not undo: ${e}` : "Brand put back.");
+    });
+    return true;
+  }, [rows, loadData, notify, selBrand]);
 
   const toggleSel = (id: string) => setSelected(prev => { const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n; });
   const exitSelect = () => { setSelectMode(false); setSelected(new Set()); };
   const pickCat = (id: string) => { setSelCat(id); setTreeOpen(false); };
+  const pickBrand = (b: string | null, c: string) => { setSelBrand(b); setSelCat(c); setTreeOpen(false); };
+  const switchBrowse = (m: Browse) => { setBrowse(m); setSelCat(ALL); setSelBrand(null); };
   const clearFilters = () => { setQ(""); setBrand(""); setStatus(""); };
 
   const drawerRow = drawerId ? byId.get(drawerId) : undefined;
   const correctingRow = correctingId ? byId.get(correctingId) : undefined;
   const editingRow = editingId ? byId.get(editingId) : undefined;
   const presetCat = selCat !== ALL && selCat !== NONE ? selCat : null;
+  const presetBrand = browse === "brand" && selBrand && selBrand !== NO_BRAND ? selBrand : undefined;
+  const brandLabel = selBrand === NO_BRAND ? "No brand" : selBrand;
 
   const title = fixedGodown ? `Godown ${fixedGodown}` : "Items";
-  const filterCount = (brand ? 1 : 0) + (status ? 1 : 0) + (!fixedGodown && gview !== "both" ? 1 : 0);
+  const filterCount = (brand && browse === "category" ? 1 : 0) + (status ? 1 : 0) + (!fixedGodown && gview !== "both" ? 1 : 0);
   const crumbs = selChain;
-  const here = selCat === ALL ? "All items" : selCat === NONE ? "No category" : crumbs[crumbs.length - 1]?.name ?? "…";
+  const catHere = selCat === ALL ? null : selCat === NONE ? "No category" : crumbs[crumbs.length - 1]?.name ?? "…";
+  const here = browse === "brand" && brandLabel
+    ? (catHere ? `${brandLabel} · ${catHere}` : brandLabel)
+    : catHere ?? "All items";
 
-  const tree = (
+  const browseSwitch = (
+    <Segmented className="w-full !h-9 [&>button]:flex-1" value={browse} onChange={(v) => switchBrowse(v as Browse)}
+      options={[{ v: "category", l: "By category" }, { v: "brand", l: "By brand" }]} />
+  );
+  const tree = browse === "brand" ? (
+    <BrandTree rows={cats} stats={brandStats} totalCount={base.length} selBrand={selBrand} selCat={selCat}
+      onSelect={pickBrand} isAdmin={isAdmin} storageKey={`${pageKey}.brandtree`}
+      onDropItems={(b, cat, ids) => void relabel(ids, { brand: b === NO_BRAND ? null : b, ...(cat === undefined ? {} : { cat }) })}
+      onRenameBrand={renameBrand} />
+  ) : (
     <CategoryTree mode="browse" rows={cats} counts={counts} totalCount={preCat.length} uncategorisedCount={uncategorised}
       selected={selCat} onSelect={pickCat} isAdmin={isAdmin} onChanged={loadData} notify={notify}
       onDropItems={(cat, ids) => void moveItems(ids, cat)} storageKey={`${pageKey}.tree`} />
@@ -313,12 +437,11 @@ export function ItemsView({ godown: fixedGodown }: { godown?: Godown }) {
   // ─── render ───────────────────────────────────────────────────────────
   return (
     <Shell title={title}>
-      <div className="lg:grid lg:grid-cols-[264px_minmax(0,1fr)] lg:gap-7">
-        {/* Category tree (computer) */}
-        <aside className="hidden lg:block sticky top-0 self-start max-h-[calc(100vh-7rem)] overflow-y-auto -ml-2 pr-1 pb-6">
-          <div className="flex items-center justify-between px-2 pb-2">
-            <h2 className="text-[11px] font-semibold uppercase tracking-wider text-zinc-500">Categories</h2>
-          </div>
+      <div className="lg:grid lg:grid-cols-[288px_minmax(0,1fr)] lg:gap-7">
+        {/* Category / brand tree (computer) */}
+        <aside className="hidden lg:block sticky top-0 self-start max-h-[calc(100vh-7rem)] overflow-y-auto -ml-2 pr-1 pb-6" aria-label="Browse">
+          <h2 className="sr-only">{browse === "brand" ? "Brands" : "Categories"}</h2>
+          <div className="px-1 pb-3">{browseSwitch}</div>
           {loaded ? tree : <TreeSkeleton />}
         </aside>
 
@@ -342,7 +465,7 @@ export function ItemsView({ godown: fixedGodown }: { godown?: Godown }) {
                 </button>
               )}
               {isAdmin && (
-                <button type="button" onClick={() => setCreating({ category_id: presetCat })}
+                <button type="button" onClick={() => setCreating({ category_id: presetCat, brand: presetBrand })}
                   className="hidden sm:inline-flex h-9 px-3.5 rounded-md bg-cyan-500 hover:bg-cyan-400 text-white text-sm font-medium items-center gap-1.5">
                   <Plus className="w-4 h-4" /> Add item
                 </button>
@@ -371,7 +494,7 @@ export function ItemsView({ godown: fixedGodown }: { godown?: Godown }) {
               </div>
               {/* Desktop filters */}
               <select value={brand} onChange={(e) => setBrand(e.target.value)} aria-label="Brand"
-                className="hidden md:block h-10 bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg px-3 text-sm focus:outline-none focus:border-cyan-500 max-w-[180px]">
+                className={cn("hidden h-10 bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg px-3 text-sm focus:outline-none focus:border-cyan-500 max-w-[180px]", browse === "category" && "md:block")}>
                 <option value="">All brands</option>
                 {brands.map(b => <option key={b} value={b}>{b}</option>)}
               </select>
@@ -404,10 +527,16 @@ export function ItemsView({ godown: fixedGodown }: { godown?: Godown }) {
             <div className="flex items-center gap-2">
               <button type="button" onClick={() => setTreeOpen(true)}
                 className="h-9 px-3 rounded-lg border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 text-sm inline-flex items-center gap-1.5 flex-shrink-0">
-                <FolderTree className="w-4 h-4 text-cyan-600" /> Categories
+                {browse === "brand" ? <Tag className="w-4 h-4 text-cyan-600" /> : <FolderTree className="w-4 h-4 text-cyan-600" />} {browse === "brand" ? "Brands" : "Categories"}
               </button>
               <nav aria-label="Category path" className="flex items-center gap-1 min-w-0 overflow-x-auto no-scrollbar text-sm">
-                <button type="button" onClick={() => setSelCat(ALL)} className={cn("flex-shrink-0 px-1 py-1", selCat === ALL ? "font-semibold" : "text-cyan-700 dark:text-cyan-300")}>All</button>
+                <button type="button" onClick={() => { setSelCat(ALL); setSelBrand(null); }} className={cn("flex-shrink-0 px-1 py-1", selCat === ALL && !selBrand ? "font-semibold" : "text-cyan-700 dark:text-cyan-300")}>All</button>
+                {browse === "brand" && brandLabel && (
+                  <>
+                    <ChevronRight className="w-3.5 h-3.5 text-zinc-400 flex-shrink-0" />
+                    <button type="button" onClick={() => setSelCat(ALL)} className={cn("flex-shrink-0 px-1 py-1 whitespace-nowrap", selCat === ALL ? "font-semibold" : "text-cyan-700 dark:text-cyan-300")}>{brandLabel}</button>
+                  </>
+                )}
                 {selCat === NONE && <><ChevronRight className="w-3.5 h-3.5 text-zinc-400 flex-shrink-0" /><span className="font-semibold flex-shrink-0">No category</span></>}
                 {crumbs.map((c, i) => (
                   <Fragment key={c.id}>
@@ -417,7 +546,17 @@ export function ItemsView({ godown: fixedGodown }: { godown?: Godown }) {
                 ))}
               </nav>
             </div>
-            {children.length > 0 && (
+            {browse === "brand" && !selBrand && (
+              <div className="mt-2.5 flex gap-1.5 overflow-x-auto no-scrollbar -mx-1 px-1 pb-0.5">
+                {brandChips.map(([b, st]) => (
+                  <button key={b} type="button" onClick={() => { setSelBrand(b); setSelCat(ALL); }}
+                    className="flex-shrink-0 h-9 pl-2.5 pr-3 rounded-lg bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 text-sm inline-flex items-center gap-1.5">
+                    <Tag className="w-4 h-4 text-cyan-500/80" /> {b === NO_BRAND ? "No brand" : b} <span className="text-[11px] text-zinc-400 tabular-nums">{fmtN(st.total)}</span>
+                  </button>
+                ))}
+              </div>
+            )}
+            {(browse === "category" || selBrand) && children.length > 0 && (
               <div className="mt-2.5 flex gap-1.5 overflow-x-auto no-scrollbar -mx-1 px-1 pb-0.5">
                 {children.map(c => (
                   <button key={c.id} type="button" onClick={() => setSelCat(c.id)}
@@ -433,14 +572,15 @@ export function ItemsView({ godown: fixedGodown }: { godown?: Godown }) {
           <div className="hidden lg:flex items-baseline gap-2 mb-3 min-w-0">
             <h2 className="text-base font-semibold truncate">{here}</h2>
             {crumbs.length > 1 && <span className="text-xs text-zinc-500 truncate">in {crumbs.slice(0, -1).map(c => c.name).join(" › ")}</span>}
+            {browse === "brand" && !selBrand && <span className="text-xs text-zinc-500">· all brands</span>}
             <span className="text-xs text-zinc-400 tabular-nums flex-shrink-0">· {fmtN(visible.length)} shown</span>
           </div>
 
-          {q && selCat !== ALL && (
+          {q && (selCat !== ALL || (browse === "brand" && selBrand)) && (
             <div className="mb-3 text-[13px] text-zinc-600 dark:text-zinc-300 bg-cyan-500/5 border border-cyan-500/20 rounded-lg px-3 py-2 flex items-center gap-2">
               <Search className="w-4 h-4 text-cyan-600 flex-shrink-0" />
               <span className="flex-1 min-w-0">Searching only in <b>{here}</b>.</span>
-              <button type="button" onClick={() => setSelCat(ALL)} className="text-cyan-700 dark:text-cyan-300 font-medium flex-shrink-0">Search all items</button>
+              <button type="button" onClick={() => { setSelCat(ALL); setSelBrand(null); }} className="text-cyan-700 dark:text-cyan-300 font-medium flex-shrink-0">Search all items</button>
             </div>
           )}
 
@@ -453,7 +593,7 @@ export function ItemsView({ godown: fixedGodown }: { godown?: Godown }) {
               <div className="text-sm text-zinc-600 dark:text-zinc-300">{q || brand || status ? "Nothing matches these filters." : selCat === ALL ? "No items yet." : `Nothing in ${here} yet.`}</div>
               <div className="mt-3 flex items-center justify-center gap-4 text-sm">
                 {(q || brand || status) && <button type="button" onClick={clearFilters} className="text-cyan-700 dark:text-cyan-300 font-medium">Clear filters</button>}
-                {isAdmin && !(q || brand || status) && <button type="button" onClick={() => setCreating({ category_id: presetCat })} className="text-cyan-700 dark:text-cyan-300 font-medium inline-flex items-center gap-1"><Plus className="w-4 h-4" /> Add an item here</button>}
+                {isAdmin && !(q || brand || status) && <button type="button" onClick={() => setCreating({ category_id: presetCat, brand: presetBrand })} className="text-cyan-700 dark:text-cyan-300 font-medium inline-flex items-center gap-1"><Plus className="w-4 h-4" /> Add an item here</button>}
               </div>
             </div>
           ) : (
@@ -462,7 +602,7 @@ export function ItemsView({ godown: fixedGodown }: { godown?: Godown }) {
                 onSelectAll={() => setSelected(prev => visible.every(r => prev.has(r.id)) ? new Set() : new Set(visible.map(r => r.id)))} />
               {sections.map((sec) => (
                 <section key={sec.key} aria-label={sec.label.join(" › ")}>
-                  {(sections.length > 1 || selCat === ALL || sec.key !== selCat) && (
+                  {(sections.length > 1 || selCat === ALL || (browse === "category" && sec.key !== selCat)) && (
                     <div className="flex items-center gap-2 px-4 py-2 bg-zinc-50 dark:bg-zinc-900/60 border-t first:border-t-0 border-zinc-200 dark:border-zinc-800 text-[12px]">
                       <Folder className="w-3.5 h-3.5 text-cyan-500/80 flex-shrink-0" />
                       <span className="truncate text-zinc-500">
@@ -495,7 +635,7 @@ export function ItemsView({ godown: fixedGodown }: { godown?: Godown }) {
 
       {/* Phone: add button */}
       {isAdmin && !selectMode && (
-        <button type="button" onClick={() => setCreating({ category_id: presetCat })} aria-label="Add item"
+        <button type="button" onClick={() => setCreating({ category_id: presetCat, brand: presetBrand })} aria-label="Add item"
           className="sm:hidden fixed right-4 z-30 h-12 pl-4 pr-5 rounded-full bg-cyan-500 active:bg-cyan-600 text-white shadow-lg inline-flex items-center gap-1.5 text-sm font-semibold"
           style={{ bottom: "calc(4.75rem + env(safe-area-inset-bottom))" }}>
           <Plus className="w-5 h-5" /> Add item
@@ -519,7 +659,10 @@ export function ItemsView({ godown: fixedGodown }: { godown?: Godown }) {
 
       {/* Phone: category tree sheet */}
       {treeOpen && (
-        <Sheet title="Categories" onClose={() => setTreeOpen(false)}>{tree}</Sheet>
+        <Sheet title={browse === "brand" ? "Brands" : "Categories"} onClose={() => setTreeOpen(false)}>
+          <div className="px-1 pb-2">{browseSwitch}</div>
+          {tree}
+        </Sheet>
       )}
 
       {/* Phone: filters sheet */}
@@ -527,7 +670,7 @@ export function ItemsView({ godown: fixedGodown }: { godown?: Godown }) {
         <Sheet title="Filters" onClose={() => setFiltersOpen(false)}
           footer={<button type="button" onClick={() => setFiltersOpen(false)} className="w-full h-11 rounded-lg bg-cyan-500 text-white text-sm font-medium">Show {fmtN(visible.length)} items</button>}>
           <div className="space-y-5 p-1">
-            <div>
+            <div className={browse === "brand" ? "hidden" : undefined}>
               <div className="text-[13px] font-medium mb-2">Brand</div>
               <div className="flex flex-wrap gap-1.5">
                 <Chip active={!brand} onClick={() => setBrand("")}>All brands</Chip>

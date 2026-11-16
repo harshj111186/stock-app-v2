@@ -230,6 +230,61 @@ If you must touch one of these files: **read first, edit surgically, never repla
 
 ## 11. Changelog (latest first — add new entries at the top)
 
+### 2026-11-16 (night) — Browse by brand, drag-and-drop re-ordering / nesting, Merge, brand rename
+
+**User ask (Harsh), after the redesign:** "if we select by brand then brand name should show, when clicked on
+them the categories in which fans are there for that brand should show, and also category wise … when clicked
+on them the sub category or fans and products should show — nesting as deep as we want … make the shuffling
+easy … the setup before made things clutter which I will have to resolve now, so from desktop view we should be
+able to hold and drop them properly and have all the option to shuffle them with drag drop and make it
+structured easily."
+
+**SQL (applied live 16 Nov via the Management API, rehearsed first in a rolled-back transaction as Harsh's
+admin id):** `db/2026-11-16-category-reorder.sql` → `category_reorder(p_parent_id uuid, p_ids uuid[])`: sets
+`sort_order` = 1-based position for siblings of one parent; refuses ids under another parent; admin-gated
+(`_require_active_admin`); `revoke … from public, anon`, `grant … to authenticated, service_role`. Verified: anon
+cannot execute, authenticated can; 0 rows changed by the apply itself. (`categories` has no UPDATE policy, so
+`sort_order` was never writable before — every tree was A–Z.)
+
+**Items (`components/items-view.tsx`)** — a **By category / By brand** switch above the tree (phone: inside the
+Categories/Brands sheet).
+- **By brand** (`components/brand-tree.tsx`): All items → each brand (A–Z, "No brand" last) → only the categories
+  holding that brand's items, at every depth, counted for that brand → "No category" for that brand. Tap a brand
+  = all its items, grouped by category; tap a category under it = that brand's items there and below. "All
+  items" in this view is grouped Brand › Category. Phone: brand chips → then that brand's category chips;
+  breadcrumb All › Brand › Category. Add item inside a brand starts with that brand.
+- Drag (admin, computer) in By brand: items onto a **brand** → they get that brand; onto a **category under a
+  brand** → moved there AND given that brand. ⋯ on a brand → **Rename / merge brand**: renames it on every item
+  that has it (incl. archived ones); typing an existing brand's name (any case) merges into it, keeping that
+  spelling. All with Undo. Brand writes = `items.update({ brand }).in("id", …)` (RLS `items_admin_write`).
+- `relabel(ids, { cat?, brand? })` replaces moveItems (category via `set_items_category`, brand via the update);
+  Undo groups ids by their previous category / brand and puts each back.
+
+**Category tree (`components/category-tree.tsx`)** — drag-and-drop for admins on a computer, in Items AND on the
+Categories page: drop on a row's **top edge** = just above it, **bottom edge** = just below (same level, saved with
+`category_reorder`), **middle** = inside it; a dashed **"Drop here to make it a main category"** zone appears while
+a sub-category is dragged; holding over a closed category for ~0.65 s opens it; a blue line / ring shows where
+it will land; the dragged row fades; grip icon on hover. One `place(node, parent, beforeId)` does every move
+(drag, Move into…, Move up/down, Make it a main category) with the cycle + name-clash checks and **Undo** (moves
+back and restores the old sibling order). ⋯ menu adds **Move up / Move down / Make it a main category / Merge
+into…** (phones). **Merge into…** = pick a category → the delete dialog in merge wording (its items + direct
+sub-categories move into the target, then it is archived). Tapping a category also opens it in the tree.
+
+**Demo:** `demoRpc` gains `category_reorder` (same refusal as the SQL).
+
+**Independent review before publishing → fixes:** (1) a drop on the bottom edge of an OPEN category now lands
+first inside it — exactly where the line is drawn (it used to land after the whole branch); (2) brands that differ
+only in case ("Havells"/"HAVELLS") get an exact tie-break in every sort, so headings/keys never interleave;
+(3) if a brand write fails after a category move, the category move is put back ("Nothing was changed");
+(4) brand writes go in slices of 100 ids (the request address has a size limit); (5) brand rename/merge looks
+for an existing spelling across ALL items, archived included; plus a remembered brand with no items left falls
+back to all brands.
+
+**Checks:** new `organise.mjs` 23/23 (+ the open-category drop) (top/bottom/middle drops, Undo, drop zone, hover-to-open, Move up, Merge,
+brand tree + brand-only categories, item → brand drop + Undo, brand merge, Add item preset brand, phone brand
+chips); `redesign.mjs` 39/39 (one wording expectation updated), `recon.mjs` 16, `recon2.mjs` 12, `txn.mjs` 10 —
+100/100 on the production build in demo mode. HTML drag-and-drop is computer-only; phones use the ⋯ menu.
+
 ### 2026-11-16 (evening) — Redesign: Items + categories rebuilt, system count beside every count box
 
 **User ask (Harsh):** "look into each and every screen … far easier to use, with an easy way to add items …

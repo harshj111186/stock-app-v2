@@ -1,19 +1,29 @@
 "use client";
 // The category tree — one component for both places it lives:
 //   • "browse" (left side of Items): tap a category to see its items; admins
-//     get a ⋯ menu per row, can drag items onto a category to move them, and
-//     drag a category onto another to nest it.
+//     get a ⋯ menu per row and can drag items onto a category to move them.
 //   • "manage" (the Categories page): the same tree, full width, with the
 //     actions written out as buttons instead of hidden behind ⋯.
 //
-// Every change goes through the existing admin-gated RPCs
-// (category_create / _rename / _move / _archive, set_items_category). Name
-// clashes are checked first and explained in words — the database would
-// otherwise answer "duplicate key value violates unique constraint".
+// Drag and drop (computer, admins — 2026-11-16 second pass, Harsh: "hold and
+// drop them properly … all the option to shuffle them with drag drop"):
+//   • drop a category on the TOP or BOTTOM edge of another → it goes just
+//     above / below it (same level, saved order via category_reorder)
+//   • drop it in the MIDDLE of another → it goes inside it
+//   • drop it on "Drop here to make it a main category" → top level
+//   • hovering over a closed category for a moment opens it, so you can
+//     drop deep; every move has Undo.
+// Phones get the same moves from the ⋯ menu (Move up / Move down / Move
+// into… / Merge into…).
+//
+// Every change goes through admin-gated RPCs (category_create / _rename /
+// _move / _archive / _reorder, set_items_category). Name clashes are checked
+// first and explained in words — the database would otherwise answer
+// "duplicate key value violates unique constraint".
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ChevronDown, ChevronRight, Folder, FolderOpen, FolderPlus, MoreHorizontal, Pencil, MoveRight,
-  Trash2, ArchiveRestore, Check, X, Loader2, Layers, Inbox, AlertCircle,
+  Trash2, ArchiveRestore, Check, X, Loader2, Layers, Inbox, AlertCircle, ArrowUp, ArrowDown, Merge, GripVertical, CornerLeftUp,
 } from "lucide-react";
 import { sb } from "@/lib/supabase";
 import {
@@ -30,6 +40,9 @@ export const NONE = "__none";
 export const ITEM_DRAG = "application/x-stock-items";
 const CAT_DRAG = "application/x-stock-category";
 
+export type Notify = (kind: "ok" | "bad", text: string, undo?: () => void) => void;
+type DropPos = "before" | "inside" | "after";
+
 type Props = {
   mode: "browse" | "manage";
   rows: CatRow[];
@@ -45,12 +58,19 @@ type Props = {
   /** Items dropped on a category (browse mode, desktop). */
   onDropItems?: (categoryId: string | null, itemIds: string[]) => void;
   showArchived?: boolean;
-  /** Say what happened ("Moved 3 items to Fans"). */
-  notify: (kind: "ok" | "bad", text: string) => void;
+  /** Say what happened ("Moved 3 items to Fans"), optionally with Undo. */
+  notify: Notify;
   storageKey?: string;
 };
 
 type Editor = { kind: "add"; parentId: string | null } | { kind: "rename"; id: string } | null;
+
+// Children of `parent` (null = main categories) in the order the tree shows them.
+export function liveKids(rows: CatRow[], parent: string | null): CatRow[] {
+  return rows
+    .filter(r => !r.archived && (r.parent_id ?? null) === parent)
+    .sort((a, b) => (a.sort_order ?? 0) - (b.sort_order ?? 0) || a.name.localeCompare(b.name));
+}
 
 export function CategoryTree({
   mode, rows, counts, totalCount, uncategorisedCount, selected, onSelect, isAdmin, onChanged,
@@ -63,11 +83,13 @@ export function CategoryTree({
   const [busy, setBusy] = useState(false);
   const [menuFor, setMenuFor] = useState<string | null>(null);
   const [moving, setMoving] = useState<CatNode | null>(null);
-  const [deleting, setDeleting] = useState<CatNode | null>(null);
-  const [dropTarget, setDropTarget] = useState<string | null>(null);
+  const [merging, setMerging] = useState<CatNode | null>(null);
+  const [deleting, setDeleting] = useState<{ node: CatNode; mergeInto?: string } | null>(null);
+  const [drop, setDrop] = useState<{ id: string; pos: DropPos } | null>(null);
+  const [dragCat, setDragCat] = useState<string | null>(null);
+  const hover = useRef<{ id: string; t: number } | null>(null);
   // A category just made or moved: once the reloaded rows contain it, open
-  // every level above it so it is on screen (a new "A / B / C" path used to
-  // stay folded away under A).
+  // every level above it so it is on screen.
   const [reveal, setReveal] = useState<string | null>(null);
   const loadedOpen = useRef(false);
 
@@ -83,28 +105,24 @@ export function CategoryTree({
     if (!loadedOpen.current) return;
     try { localStorage.setItem(storageKey, JSON.stringify([...expanded])); } catch { /* ignore */ }
   }, [expanded, storageKey]);
-  // The selected category's branch is always open.
-  useEffect(() => {
-    if (!selected || selected === ALL || selected === NONE) return;
+  const openAbove = useCallback((id: string, includeSelf = false) => {
     const byId = new Map(rows.map(r => [r.id, r]));
-    const add: string[] = [];
-    let cur = byId.get(selected)?.parent_id;
+    const add: string[] = includeSelf ? [id] : [];
+    let cur = byId.get(id)?.parent_id;
     const seen = new Set<string>();
     while (cur && !seen.has(cur)) { seen.add(cur); add.push(cur); cur = byId.get(cur)?.parent_id ?? null; }
     if (add.length) setExpanded(prev => { const n = new Set(prev); add.forEach(a => n.add(a)); return n; });
-  }, [selected, rows]);
-
+  }, [rows]);
+  // The selected category's branch is always open.
   useEffect(() => {
-    if (!reveal) return;
-    const byId = new Map(rows.map(r => [r.id, r]));
-    if (!byId.has(reveal)) return;
-    const add: string[] = [];
-    let cur = byId.get(reveal)?.parent_id;
-    const seen = new Set<string>();
-    while (cur && !seen.has(cur)) { seen.add(cur); add.push(cur); cur = byId.get(cur)?.parent_id ?? null; }
-    setExpanded(prev => { const n = new Set(prev); add.forEach(a => n.add(a)); return n; });
+    if (!selected || selected === ALL || selected === NONE) return;
+    openAbove(selected);
+  }, [selected, openAbove]);
+  useEffect(() => {
+    if (!reveal || !rows.some(r => r.id === reveal)) return;
+    openAbove(reveal);
     setReveal(null);
-  }, [reveal, rows]);
+  }, [reveal, rows, openAbove]);
 
   const toggle = (id: string) => setExpanded(prev => { const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n; });
 
@@ -149,16 +167,51 @@ export function CategoryTree({
     const ok = await run(() => rpc("category_rename", { p_id: node.id, p_name: name }), `Renamed to ${name}.`);
     if (ok) { setEditor(null); setDraft(""); }
   };
-  const doMove = async (node: CatNode, target: string | null) => {
-    const parentId = target === TOP_LEVEL ? null : target;
-    if ((node.parent_id ?? null) === parentId) return;
-    if (siblingWithName(rows, parentId, node.name, node.id)) {
-      notify("bad", `There is already a “${node.name}” there. Rename one of them first.`);
+
+  // Put `node` under `parent` (null = main categories), just before
+  // `beforeId` (null = at the end). One function for every kind of move —
+  // drag, Move into…, Move up / down — so they all get the same checks + Undo.
+  const place = async (node: CatNode, parent: string | null, beforeId: string | null) => {
+    if (parent !== null && descendantIds(rows, node.id).has(parent)) { notify("bad", "A category can't go inside itself."); return; }
+    const prevParent = node.parent_id ?? null;
+    const prevOrder = liveKids(rows, prevParent).map(r => r.id);
+    if (parent !== prevParent && siblingWithName(rows, parent, node.name, node.id)) {
+      notify("bad", `There is already a “${node.name}” there. Rename one of them first, or use Merge into….`);
       return;
     }
-    const dest = parentId ? pathById(rows).get(parentId) : "the top level";
-    const ok = await run(() => rpc("category_move", { p_id: node.id, p_parent_id: parentId }), `Moved ${node.name} into ${dest}.`);
-    if (ok) setReveal(node.id);
+    const sibs = liveKids(rows, parent).map(r => r.id).filter(id => id !== node.id);
+    const at = beforeId ? sibs.indexOf(beforeId) : -1;
+    const order = at >= 0 ? [...sibs.slice(0, at), node.id, ...sibs.slice(at)] : [...sibs, node.id];
+    if (parent === prevParent && order.join() === prevOrder.join()) return; // dropped where it already is
+    const where = parent ? `into ${pathById(rows).get(parent)}` : "to the main categories";
+    setBusy(true);
+    try {
+      if (parent !== prevParent) await rpc("category_move", { p_id: node.id, p_parent_id: parent });
+      await rpc("category_reorder", { p_parent_id: parent, p_ids: order });
+      await onChanged();
+      setReveal(node.id);
+      notify("ok", parent !== prevParent ? `Moved ${node.name} ${where}.` : `Moved ${node.name}.`, async () => {
+        try {
+          if (parent !== prevParent) await rpc("category_move", { p_id: node.id, p_parent_id: prevParent });
+          await rpc("category_reorder", { p_parent_id: prevParent, p_ids: prevOrder });
+          await onChanged();
+          setReveal(node.id);
+          notify("ok", "Put back.");
+        } catch (e) { await onChanged(); notify("bad", friendlyCatError(e)); }
+      });
+    } catch (e) {
+      await onChanged();
+      notify("bad", friendlyCatError(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const nudge = (node: CatNode, dir: -1 | 1) => {
+    const parent = node.parent_id ?? null;
+    const sibs = liveKids(rows, parent).map(r => r.id);
+    const i = sibs.indexOf(node.id);
+    if (i < 0 || i + dir < 0 || i + dir >= sibs.length) return;
+    void place(node, parent, dir < 0 ? sibs[i - 1] : sibs[i + 2] ?? null);
   };
   const restore = async (node: CatNode) => {
     if (siblingWithName(rows, node.parent_id ?? null, node.name, node.id)) {
@@ -168,44 +221,100 @@ export function CategoryTree({
     await run(() => rpc("category_archive", { p_id: node.id, p_archived: false }), `Restored ${node.name}.`);
   };
 
-  // ── drag & drop (desktop) ────────────────────────────────────────────
-  const canDnD = isAdmin && mode === "browse";
-  const onDragOver = (e: React.DragEvent, target: string) => {
-    if (!canDnD) return;
-    const types = Array.from(e.dataTransfer.types);
-    if (!types.includes(ITEM_DRAG) && !types.includes(CAT_DRAG)) return;
+  // ── drag & drop (computer — phones never fire HTML drag events) ──────
+  const canDnD = isAdmin;
+  const kinds = (e: React.DragEvent) => {
+    const t = Array.from(e.dataTransfer.types);
+    return { cat: t.includes(CAT_DRAG), items: t.includes(ITEM_DRAG) && mode === "browse" };
+  };
+  const endDrag = () => { setDragCat(null); setDrop(null); hover.current = null; };
+  const onRowDragOver = (e: React.DragEvent, node: CatNode) => {
+    if (!canDnD || node.archived) return;
+    const k = kinds(e);
+    if (!k.cat && !k.items) return;
+    let pos: DropPos = "inside";
+    if (k.cat) {
+      if (!dragCat || dragCat === node.id || descendantIds(rows, dragCat).has(node.id)) return; // not into itself
+      const r = e.currentTarget.getBoundingClientRect();
+      const y = e.clientY - r.top;
+      pos = y < r.height * 0.3 ? "before" : y > r.height * 0.7 ? "after" : "inside";
+    }
     e.preventDefault();
     e.dataTransfer.dropEffect = "move";
-    if (dropTarget !== target) setDropTarget(target);
+    if (drop?.id !== node.id || drop.pos !== pos) setDrop({ id: node.id, pos });
+    // Hold over a closed category for a moment → it opens, so you can go deeper.
+    if (pos === "inside" && node.children.length && !expanded.has(node.id)) {
+      if (hover.current?.id !== node.id) hover.current = { id: node.id, t: Date.now() };
+      else if (Date.now() - hover.current.t > 650) setExpanded(p => new Set(p).add(node.id));
+    } else if (hover.current?.id === node.id) hover.current = null;
   };
-  const onDrop = (e: React.DragEvent, target: string) => {
+  const onRowDrop = (e: React.DragEvent, node: CatNode) => {
     if (!canDnD) return;
     e.preventDefault();
-    setDropTarget(null);
+    const d = drop;
+    endDrag();
     const items = e.dataTransfer.getData(ITEM_DRAG);
     if (items) {
-      try {
-        const ids = JSON.parse(items) as string[];
-        if (ids.length && target !== ALL) onDropItems?.(target === NONE ? null : target, ids);
-      } catch { /* ignore */ }
+      try { const ids = JSON.parse(items) as string[]; if (ids.length) onDropItems?.(node.id, ids); } catch { /* ignore */ }
       return;
     }
     const catId = e.dataTransfer.getData(CAT_DRAG);
-    if (catId) {
-      const node = findNode(tree, catId);
-      if (!node || target === NONE) return;
-      const parent = target === ALL ? TOP_LEVEL : target;
-      if (parent !== TOP_LEVEL && descendantIds(rows, catId).has(parent)) {
-        notify("bad", "A category can't go inside itself.");
-        return;
-      }
-      void doMove(node, parent);
+    const dragged = catId ? findNode(tree, catId) : null;
+    if (!dragged || dragged.id === node.id) return;
+    const pos = d?.id === node.id ? d.pos : "inside";
+    const parent = node.parent_id ?? null;
+    // The bottom edge of an OPEN category sits right above its first
+    // sub-category, so that is where the line is drawn — and where it lands.
+    const openKids = expanded.has(node.id) ? liveKids(rows, node.id).map(r => r.id).filter(id => id !== dragged.id) : [];
+    if (pos === "after" && openKids.length) { void place(dragged, node.id, openKids[0]); return; }
+    if (pos === "inside") void place(dragged, node.id, null);
+    else if (pos === "before") void place(dragged, parent, node.id);
+    else {
+      const sibs = liveKids(rows, parent).map(r => r.id).filter(id => id !== dragged.id);
+      void place(dragged, parent, sibs[sibs.indexOf(node.id) + 1] ?? null);
     }
+  };
+  const onSpecialDragOver = (e: React.DragEvent, id: string) => {
+    if (!canDnD) return;
+    const k = kinds(e);
+    const ok = (id === NONE && k.items) || (id === TOP_LEVEL && k.cat);
+    if (!ok) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "move";
+    if (drop?.id !== id) setDrop({ id, pos: "inside" });
+  };
+  const onSpecialDrop = (e: React.DragEvent, id: string) => {
+    if (!canDnD) return;
+    e.preventDefault();
+    endDrag();
+    const items = e.dataTransfer.getData(ITEM_DRAG);
+    if (items && id === NONE) {
+      try { const ids = JSON.parse(items) as string[]; if (ids.length) onDropItems?.(null, ids); } catch { /* ignore */ }
+      return;
+    }
+    const catId = e.dataTransfer.getData(CAT_DRAG);
+    const dragged = catId ? findNode(tree, catId) : null;
+    if (dragged && id === TOP_LEVEL) void place(dragged, null, null);
   };
 
   // ── rendering ────────────────────────────────────────────────────────
   const manage = mode === "manage";
   const rowPad = manage ? 20 : 16;
+
+  const menuItems = (node: CatNode) => {
+    const sibs = liveKids(rows, node.parent_id ?? null);
+    const i = sibs.findIndex(r => r.id === node.id);
+    return [
+      ...(manage ? [] : [{ icon: FolderPlus, label: "Add sub-category", onClick: () => { setEditor({ kind: "add", parentId: node.id }); setDraft(""); setExpanded(p => new Set(p).add(node.id)); } }]),
+      { icon: Pencil, label: "Rename", onClick: () => { setEditor({ kind: "rename", id: node.id }); setDraft(node.name); } },
+      ...(i > 0 ? [{ icon: ArrowUp, label: "Move up", onClick: () => nudge(node, -1) }] : []),
+      ...(i >= 0 && i < sibs.length - 1 ? [{ icon: ArrowDown, label: "Move down", onClick: () => nudge(node, 1) }] : []),
+      { icon: MoveRight, label: "Move into…", onClick: () => setMoving(node) },
+      ...(node.parent_id ? [{ icon: CornerLeftUp, label: "Make it a main category", onClick: () => void place(node, null, null) }] : []),
+      { icon: Merge, label: "Merge into…", onClick: () => setMerging(node) },
+      { icon: Trash2, label: "Delete", onClick: () => setDeleting({ node }), danger: true },
+    ];
+  };
 
   const renderNode = (node: CatNode): React.ReactNode => {
     const hasKids = node.children.length > 0;
@@ -214,7 +323,8 @@ export function CategoryTree({
     const count = counts.get(node.id) ?? 0;
     const renaming = editor?.kind === "rename" && editor.id === node.id;
     const addingHere = editor?.kind === "add" && editor.parentId === node.id;
-    const isDrop = dropTarget === node.id;
+    const isDrop = drop?.id === node.id;
+    const draggable = canDnD && !renaming && !node.archived;
     return (
       <Fragment key={node.id}>
         <div
@@ -222,15 +332,25 @@ export function CategoryTree({
             "group relative flex items-center gap-1 rounded-lg pr-1 transition-colors",
             manage ? "min-h-11" : "min-h-9",
             isSel ? "bg-cyan-500/10 text-cyan-800 dark:text-cyan-200" : "hover:bg-zinc-100 dark:hover:bg-zinc-800/60",
-            isDrop && "ring-2 ring-cyan-500 bg-cyan-500/10",
+            isDrop && drop!.pos === "inside" && "ring-2 ring-cyan-500 bg-cyan-500/10",
+            dragCat === node.id && "opacity-40",
+            draggable && "lg:cursor-grab lg:active:cursor-grabbing",
           )}
           style={{ paddingLeft: node.depth * rowPad }}
-          draggable={canDnD && !renaming && !node.archived}
-          onDragStart={(e) => { e.dataTransfer.setData(CAT_DRAG, node.id); e.dataTransfer.effectAllowed = "move"; }}
-          onDragOver={(e) => onDragOver(e, node.id)}
-          onDragLeave={() => setDropTarget(t => (t === node.id ? null : t))}
-          onDrop={(e) => onDrop(e, node.id)}
+          draggable={draggable}
+          onDragStart={(e) => { e.stopPropagation(); e.dataTransfer.setData(CAT_DRAG, node.id); e.dataTransfer.effectAllowed = "move"; setDragCat(node.id); setMenuFor(null); }}
+          onDragEnd={endDrag}
+          onDragOver={(e) => onRowDragOver(e, node)}
+          onDragLeave={(e) => { if (!e.currentTarget.contains(e.relatedTarget as Node)) setDrop(t => (t?.id === node.id ? null : t)); }}
+          onDrop={(e) => onRowDrop(e, node)}
         >
+          {isDrop && drop!.pos !== "inside" && (
+            <span aria-hidden className={cn("pointer-events-none absolute right-1 h-[3px] rounded-full bg-cyan-500 z-10", drop!.pos === "before" ? "-top-[2px]" : "-bottom-[2px]")}
+              style={{ left: (drop!.pos === "after" && open && hasKids ? node.depth + 1 : node.depth) * rowPad + 6 }} />
+          )}
+          {draggable && (
+            <GripVertical aria-hidden className={cn("hidden lg:block w-3.5 h-3.5 -mr-1.5 flex-shrink-0 text-zinc-300 dark:text-zinc-600", !manage && "opacity-0 group-hover:opacity-100")} />
+          )}
           <button type="button" onClick={() => hasKids && toggle(node.id)}
             aria-label={hasKids ? (open ? `Close ${node.name}` : `Open ${node.name}`) : undefined}
             tabIndex={hasKids ? 0 : -1}
@@ -242,7 +362,11 @@ export function CategoryTree({
           ) : (
             <>
               <button type="button"
-                onClick={() => (onSelect ? onSelect(node.id) : hasKids && toggle(node.id))}
+                onClick={() => {
+                  // Tapping a category shows what is inside it — in the list AND in the tree.
+                  if (onSelect) { onSelect(node.id); if (hasKids) setExpanded(p => new Set(p).add(node.id)); }
+                  else if (hasKids) toggle(node.id);
+                }}
                 className={cn("flex-1 min-w-0 flex items-center gap-2 text-left", manage ? "h-11 text-[15px]" : "h-9 text-sm")}>
                 {open && hasKids
                   ? <FolderOpen className={cn("w-4 h-4 flex-shrink-0", node.archived ? "text-zinc-400" : "text-cyan-500")} />
@@ -257,21 +381,15 @@ export function CategoryTree({
                 ) : manage ? (
                   <div className="flex items-center gap-0.5 flex-shrink-0">
                     <TextBtn label={`Add a sub-category in ${node.name}`} onClick={() => { setEditor({ kind: "add", parentId: node.id }); setDraft(""); setExpanded(p => new Set(p).add(node.id)); }} disabled={busy}><FolderPlus className="w-4 h-4" /><span className="hidden sm:inline">Sub-category</span></TextBtn>
-                    {/* Computer: every action as a button. Phone: a ⋯ menu, so names keep their room. */}
+                    {/* Computer: the common actions as buttons + ⋯ for the rest. Phone: everything in ⋯. */}
                     <span className="hidden sm:contents">
                       <IconBtn label={`Rename ${node.name}`} onClick={() => { setEditor({ kind: "rename", id: node.id }); setDraft(node.name); }} disabled={busy}><Pencil className="w-4 h-4" /></IconBtn>
                       <IconBtn label={`Move ${node.name}`} onClick={() => setMoving(node)} disabled={busy}><MoveRight className="w-4 h-4" /></IconBtn>
-                      <IconBtn label={`Delete ${node.name}`} onClick={() => setDeleting(node)} disabled={busy} danger><Trash2 className="w-4 h-4" /></IconBtn>
+                      <IconBtn label={`Delete ${node.name}`} onClick={() => setDeleting({ node })} disabled={busy} danger><Trash2 className="w-4 h-4" /></IconBtn>
                     </span>
-                    <span className="relative sm:hidden">
+                    <span className="relative">
                       <IconBtn label={`Options for ${node.name}`} onClick={() => setMenuFor(m => (m === node.id ? null : node.id))} disabled={busy}><MoreHorizontal className="w-4 h-4" /></IconBtn>
-                      {menuFor === node.id && (
-                        <RowMenu onClose={() => setMenuFor(null)} items={[
-                          { icon: Pencil, label: "Rename", onClick: () => { setEditor({ kind: "rename", id: node.id }); setDraft(node.name); } },
-                          { icon: MoveRight, label: "Move into…", onClick: () => setMoving(node) },
-                          { icon: Trash2, label: "Delete", onClick: () => setDeleting(node), danger: true },
-                        ]} />
-                      )}
+                      {menuFor === node.id && <RowMenu onClose={() => setMenuFor(null)} items={menuItems(node)} />}
                     </span>
                   </div>
                 ) : (
@@ -280,14 +398,7 @@ export function CategoryTree({
                       className={cn("md:opacity-0 md:group-hover:opacity-100 md:focus-visible:opacity-100", menuFor === node.id && "md:opacity-100")}>
                       <MoreHorizontal className="w-4 h-4" />
                     </IconBtn>
-                    {menuFor === node.id && (
-                      <RowMenu onClose={() => setMenuFor(null)} items={[
-                        { icon: FolderPlus, label: "Add sub-category", onClick: () => { setEditor({ kind: "add", parentId: node.id }); setDraft(""); setExpanded(p => new Set(p).add(node.id)); } },
-                        { icon: Pencil, label: "Rename", onClick: () => { setEditor({ kind: "rename", id: node.id }); setDraft(node.name); } },
-                        { icon: MoveRight, label: "Move into…", onClick: () => setMoving(node) },
-                        { icon: Trash2, label: "Delete", onClick: () => setDeleting(node), danger: true },
-                      ]} />
-                    )}
+                    {menuFor === node.id && <RowMenu onClose={() => setMenuFor(null)} items={menuItems(node)} />}
                   </div>
                 )
               )}
@@ -311,11 +422,11 @@ export function CategoryTree({
         "flex items-center gap-2 rounded-lg px-2 transition-colors",
         manage ? "min-h-11" : "min-h-9",
         selected === id ? "bg-cyan-500/10 text-cyan-800 dark:text-cyan-200 font-semibold" : "hover:bg-zinc-100 dark:hover:bg-zinc-800/60",
-        dropTarget === id && "ring-2 ring-cyan-500 bg-cyan-500/10",
+        drop?.id === id && "ring-2 ring-cyan-500 bg-cyan-500/10",
       )}
-      onDragOver={(e) => onDragOver(e, id)}
-      onDragLeave={() => setDropTarget(t => (t === id ? null : t))}
-      onDrop={(e) => onDrop(e, id)}
+      onDragOver={(e) => onSpecialDragOver(e, id)}
+      onDragLeave={(e) => { if (!e.currentTarget.contains(e.relatedTarget as Node)) setDrop(t => (t?.id === id ? null : t)); }}
+      onDrop={(e) => onSpecialDrop(e, id)}
     >
       <button type="button" onClick={() => onSelect?.(id)} className="flex-1 min-w-0 flex items-center gap-2 h-9 text-left text-sm">
         <Icon className="w-4 h-4 flex-shrink-0 text-zinc-500" />
@@ -330,6 +441,17 @@ export function CategoryTree({
       {mode === "browse" && specialRow(ALL, "All items", totalCount, Layers)}
       {tree.map(renderNode)}
       {mode === "browse" && uncategorisedCount > 0 && specialRow(NONE, "No category", uncategorisedCount, Inbox)}
+      {/* While a category is being dragged: a clear place to make it a main category. */}
+      {dragCat && rows.find(r => r.id === dragCat)?.parent_id && (
+        <div
+          onDragOver={(e) => onSpecialDragOver(e, TOP_LEVEL)}
+          onDragLeave={(e) => { if (!e.currentTarget.contains(e.relatedTarget as Node)) setDrop(t => (t?.id === TOP_LEVEL ? null : t)); }}
+          onDrop={(e) => onSpecialDrop(e, TOP_LEVEL)}
+          className={cn("mt-2 flex items-center justify-center gap-2 h-11 rounded-lg border-2 border-dashed text-sm transition-colors",
+            drop?.id === TOP_LEVEL ? "border-cyan-500 bg-cyan-500/10 text-cyan-800 dark:text-cyan-200" : "border-zinc-300 dark:border-zinc-700 text-zinc-500")}>
+          <CornerLeftUp className="w-4 h-4" /> Drop here to make it a main category
+        </div>
+      )}
       {isAdmin && (
         editor?.kind === "add" && editor.parentId === null ? (
           <div className="py-1 pl-2">
@@ -345,7 +467,9 @@ export function CategoryTree({
       )}
       {canDnD && (
         <p className="hidden lg:block mt-3 px-2 text-[11px] leading-relaxed text-zinc-400">
-          Tip: drag items (or a category) onto a category to move them.
+          {mode === "browse"
+            ? "Drag items onto a category to move them. Drag a category onto the top or bottom edge of another to re-order, onto its middle to put it inside."
+            : "Drag a category onto the top or bottom edge of another to re-order it, onto its middle to put it inside. Hold over a closed one to open it."}
         </p>
       )}
 
@@ -358,10 +482,20 @@ export function CategoryTree({
         topLevelLabel="Top level (a main category)"
         excludeIds={moving ? descendantIds(rows, moving.id) : undefined}
         counts={counts}
-        onPick={(target) => { const n = moving; setMoving(null); if (n) void doMove(n, target); }}
+        onPick={(target) => { const n = moving; setMoving(null); if (n) void place(n, target === TOP_LEVEL ? null : target, null); }}
+      />
+      <CategoryPickerSheet
+        open={!!merging}
+        onClose={() => setMerging(null)}
+        rows={rows}
+        value={null}
+        title={merging ? `Merge “${merging.name}” into…` : ""}
+        excludeIds={merging ? descendantIds(rows, merging.id) : undefined}
+        counts={counts}
+        onPick={(target) => { const n = merging; setMerging(null); if (n && target && target !== TOP_LEVEL) setDeleting({ node: n, mergeInto: target }); }}
       />
       {deleting && (
-        <DeleteCategoryDialog node={deleting} rows={rows} counts={counts}
+        <DeleteCategoryDialog node={deleting.node} mergeInto={deleting.mergeInto} rows={rows} counts={counts}
           onClose={() => setDeleting(null)}
           onDone={async (msg) => { setDeleting(null); await onChanged(); notify("ok", msg); }}
           onError={(m) => { notify("bad", m); void onChanged(); }} />
@@ -379,15 +513,17 @@ function findNode(nodes: CatNode[], id: string): CatNode | null {
   return null;
 }
 
-// ─── delete = move its contents somewhere, then archive ──────────────────
+// ─── delete / merge = move its contents somewhere, then archive ───────────
 // Nothing is ever lost: the category's own items and its direct
-// sub-categories move to the chosen place (its parent by default), then the
-// empty category is archived (restorable from "Show archived").
-function DeleteCategoryDialog({ node, rows, counts, onClose, onDone, onError }: {
-  node: CatNode; rows: CatRow[]; counts: Map<string, number>;
+// sub-categories move to the chosen place (its parent by default, or the
+// category picked in "Merge into…"), then the empty category is archived
+// (restorable from "Show deleted").
+function DeleteCategoryDialog({ node, mergeInto, rows, counts, onClose, onDone, onError }: {
+  node: CatNode; mergeInto?: string; rows: CatRow[]; counts: Map<string, number>;
   onClose: () => void; onDone: (msg: string) => void | Promise<void>; onError: (m: string) => void;
 }) {
-  const [dest, setDest] = useState<string | null>(node.parent_id ?? null);
+  const merge = !!mergeInto;
+  const [dest, setDest] = useState<string | null>(mergeInto ?? node.parent_id ?? null);
   const [picking, setPicking] = useState(false);
   const [busy, setBusy] = useState(false);
   const [directItems, setDirectItems] = useState<string[] | null>(null);
@@ -429,7 +565,9 @@ function DeleteCategoryDialog({ node, rows, counts, onClose, onDone, onError }: 
       }
       const { error } = await c.rpc("category_archive", { p_id: node.id, p_archived: true });
       if (error) throw error;
-      await onDone(empty ? `Deleted ${node.name}.` : `Deleted ${node.name}; its contents are now in ${destLabel ?? (kids.length ? "the top level" : "No category")}.`);
+      await onDone(merge
+        ? `Merged ${node.name} into ${destLabel}.`
+        : empty ? `Deleted ${node.name}.` : `Deleted ${node.name}; its contents are now in ${destLabel ?? (kids.length ? "the top level" : "No category")}.`);
     } catch (e) {
       const m = friendlyCatError(e);
       setErr(m); onError(m);
@@ -439,14 +577,16 @@ function DeleteCategoryDialog({ node, rows, counts, onClose, onDone, onError }: 
 
   return (
     <div className="fixed inset-0 z-50 bg-black/50 dark:bg-black/70 flex items-end sm:items-center justify-center sm:p-4 animate-fade-in"
-      role="dialog" aria-modal="true" aria-label={`Delete ${node.name}`} onClick={() => !busy && onClose()}>
+      role="dialog" aria-modal="true" aria-label={merge ? `Merge ${node.name}` : `Delete ${node.name}`} onClick={() => !busy && onClose()}>
       <div className="bg-white dark:bg-zinc-900 w-full sm:max-w-md rounded-t-2xl sm:rounded-2xl shadow-lg border border-zinc-200 dark:border-zinc-800 animate-slide-up" onClick={(e) => e.stopPropagation()}>
         <div className="px-5 pt-5 pb-4">
-          <h2 className="text-base font-semibold">Delete “{node.name}”?</h2>
+          <h2 className="text-base font-semibold">{merge ? <>Merge “{node.name}” into “{destLabel?.split(" › ").pop()}”?</> : <>Delete “{node.name}”?</>}</h2>
           {directItems === null ? (
             !err && <p className="mt-2 text-sm text-zinc-500 flex items-center gap-2"><Loader2 className="w-4 h-4 animate-spin" /> Checking what is inside…</p>
+          ) : empty && !merge ? (
+            <p className="mt-2 text-sm text-zinc-600 dark:text-zinc-300">It is empty. It will be removed from the list (you can bring it back from “Show deleted” on the Categories page).</p>
           ) : empty ? (
-            <p className="mt-2 text-sm text-zinc-600 dark:text-zinc-300">It is empty. It will be removed from the list (you can bring it back from “Show archived”).</p>
+            <p className="mt-2 text-sm text-zinc-600 dark:text-zinc-300">It is empty, so nothing moves. “{node.name}” will be removed from the list.</p>
           ) : (
             <>
               <p className="mt-2 text-sm text-zinc-600 dark:text-zinc-300">
@@ -454,7 +594,7 @@ function DeleteCategoryDialog({ node, rows, counts, onClose, onDone, onError }: 
                 {nItems > 0 && <b>{fmtN(nItems)} item{nItems === 1 ? "" : "s"}</b>}
                 {nItems > 0 && kids.length > 0 && " and "}
                 {kids.length > 0 && <b>{kids.length} sub-categor{kids.length === 1 ? "y" : "ies"}</b>}
-                {" "}move to:
+                {" "}move {merge ? "into" : "to"}:
               </p>
               <button type="button" onClick={() => setPicking(true)}
                 className="mt-3 w-full flex items-center gap-2 border border-zinc-200 dark:border-zinc-700 rounded-lg px-3 py-2.5 text-left text-sm hover:border-cyan-500/60">
@@ -478,8 +618,8 @@ function DeleteCategoryDialog({ node, rows, counts, onClose, onDone, onError }: 
           style={{ paddingBottom: "calc(0.75rem + env(safe-area-inset-bottom))" }}>
           <button type="button" onClick={onClose} disabled={busy} className="px-3 py-2 text-sm text-zinc-600 dark:text-zinc-300 hover:bg-zinc-200 dark:hover:bg-zinc-800 rounded-md">Cancel</button>
           <button type="button" onClick={go} disabled={busy || directItems === null || clashes.length > 0}
-            className="bg-rose-600 hover:bg-rose-500 disabled:opacity-40 text-white px-3.5 py-2 rounded-md text-sm font-medium inline-flex items-center gap-1.5">
-            {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Trash2 className="w-4 h-4" />} Delete category
+            className={cn("disabled:opacity-40 text-white px-3.5 py-2 rounded-md text-sm font-medium inline-flex items-center gap-1.5", merge ? "bg-cyan-500 hover:bg-cyan-400" : "bg-rose-600 hover:bg-rose-500")}>
+            {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : merge ? <Merge className="w-4 h-4" /> : <Trash2 className="w-4 h-4" />} {merge ? "Merge" : "Delete category"}
           </button>
         </div>
       </div>

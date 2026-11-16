@@ -6,7 +6,7 @@
 // category's items and sub-categories move to a place you choose first.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
-import { ShieldAlert, Eye, EyeOff, AlertCircle, Check, FolderTree, ArrowRight } from "lucide-react";
+import { ShieldAlert, Eye, EyeOff, AlertCircle, Check, FolderTree, ArrowRight, Undo2 } from "lucide-react";
 import { Shell } from "@/components/shell";
 import { useAuth } from "@/app/providers";
 import { sb, fetchAllRows } from "@/lib/supabase";
@@ -22,13 +22,13 @@ export default function CategoriesPage() {
   const [loaded, setLoaded] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [showArchived, setShowArchived] = useState(false);
-  const [toast, setToast] = useState<{ kind: "ok" | "bad"; text: string } | null>(null);
+  const [toast, setToast] = useState<{ kind: "ok" | "bad"; text: string; undo?: () => void } | null>(null);
   const timer = useRef<number | null>(null);
 
-  const notify = useCallback((kind: "ok" | "bad", text: string) => {
-    setToast({ kind, text });
+  const notify = useCallback((kind: "ok" | "bad", text: string, undo?: () => void) => {
+    setToast({ kind, text, undo });
     if (timer.current) clearTimeout(timer.current);
-    timer.current = window.setTimeout(() => setToast(null), 4500);
+    timer.current = window.setTimeout(() => setToast(null), undo ? 8000 : 4500);
   }, []);
 
   const load = useCallback(async () => {
@@ -76,9 +76,9 @@ export default function CategoriesPage() {
 
         <p className="sm:hidden mb-3 text-[13px] text-zinc-600 dark:text-zinc-300">Tip: type “Fans / Ceiling / BLDC” to make every level at once. Deleting moves what is inside somewhere first.</p>
         <div className="mb-4 hidden sm:grid sm:grid-cols-3 gap-2 text-[13px]">
-          <Tip n="1" text="Sub-category puts a new category inside this one — as deep as you like." />
+          <Tip n="1" text="Drag a category onto the top or bottom edge of another to re-order it, onto its middle to put it inside." />
           <Tip n="2" text="Type “Fans / Ceiling / BLDC” to make every level in one go." />
-          <Tip n="3" text="Delete moves its items and sub-categories somewhere first. Nothing is lost." />
+          <Tip n="3" text="Merge into… or Delete moves its items and sub-categories first. Nothing is lost." />
         </div>
 
         <div className="flex items-center gap-2 mb-3">
@@ -124,7 +124,13 @@ export default function CategoriesPage() {
         <div role="status" aria-live="polite"
           className="fixed left-1/2 -translate-x-1/2 z-[70] max-w-[92vw] flex items-center gap-2.5 px-4 py-2.5 rounded-xl shadow-lg text-sm bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900 animate-slide-up bottom-[calc(5rem_+_env(safe-area-inset-bottom))] md:bottom-6">
           {toast.kind === "ok" ? <Check className="w-4 h-4 text-emerald-400 dark:text-emerald-600" /> : <AlertCircle className="w-4 h-4 text-rose-400 dark:text-rose-600" />}
-          {toast.text}
+          <span className="min-w-0">{toast.text}</span>
+          {toast.undo && (
+            <button type="button" onClick={() => { const u = toast.undo; setToast(null); u?.(); }}
+              className="inline-flex items-center gap-1 px-2.5 py-1 -my-1 rounded-md font-medium text-cyan-300 dark:text-cyan-700 hover:bg-white/10">
+              <Undo2 className="w-4 h-4" /> Undo
+            </button>
+          )}
         </div>
       )}
     </Shell>
