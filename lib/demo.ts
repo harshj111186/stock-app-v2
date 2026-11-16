@@ -216,10 +216,124 @@ function makeBuilder(table: string) {
   return proxy;
 }
 
+// ── Catalogue RPCs, mirrored in memory (demo only — no network) ─────────────
+// Category / item edits change DEMO_TABLES for this tab so the demo shows the
+// result (and the redesign's checks can drive the real flows). Each mirrors
+// the guard of its SQL twin (db/2026-06-02-category-redo.sql etc.). Any other
+// RPC keeps the old behaviour: "ok", no data.
+const NIL = "00000000-0000-0000-0000-000000000000";
+const ok = (data: any = null) => ({ data, error: null });
+const bad = (message: string) => ({ data: null, error: { message } });
+function demoRpc(fn: string, a: Row): { data: any; error: { message: string } | null } {
+  const cats = DEMO_TABLES["categories"] as Row[];
+  const items = DEMO_TABLES["items"] as Row[];
+  const stock = DEMO_TABLES["godown_stock"] as Row[];
+  const sameParent = (r: Row, p: string | null) => (r.parent_id ?? NIL) === (p ?? NIL);
+  const clash = (p: string | null, name: string, except?: string) =>
+    cats.some(r => !r.archived && sameParent(r, p) && r.id !== except && String(r.name).toLowerCase() === name.toLowerCase());
+  switch (fn) {
+    case "category_create": {
+      const name = String(a.p_name ?? "").trim();
+      if (!name) return bad("Category name is required.");
+      const parent = a.p_parent_id ?? null;
+      if (parent && !cats.some(r => r.id === parent)) return bad("Parent category not found.");
+      const hit = cats.filter(r => sameParent(r, parent) && String(r.name).toLowerCase() === name.toLowerCase())
+        .sort((x, y) => Number(!!x.archived) - Number(!!y.archived))[0];
+      if (hit) { hit.archived = false; return ok(hit.id); }
+      const id = genId();
+      cats.push({ id, name, parent_id: parent, archived: false, sort_order: 0 });
+      return ok(id);
+    }
+    case "category_rename": {
+      const r = cats.find(x => x.id === a.p_id); const name = String(a.p_name ?? "").trim();
+      if (!r) return bad("Category not found.");
+      if (!name) return bad("Category name is required.");
+      if (clash(r.parent_id ?? null, name, r.id)) return bad('duplicate key value violates unique constraint "categories_parent_name_uq"');
+      r.name = name; return ok();
+    }
+    case "category_move": {
+      const r = cats.find(x => x.id === a.p_id); const parent = a.p_parent_id ?? null;
+      if (!r) return bad("Category not found.");
+      if (parent === r.id) return bad("A category cannot be its own parent.");
+      if (parent && !cats.some(x => x.id === parent)) return bad("Parent category not found.");
+      let cur = parent ? cats.find(x => x.id === parent) : null;
+      const seen = new Set<string>();
+      while (cur && !seen.has(cur.id)) {
+        if (cur.id === r.id) return bad("Cannot move a category under itself or one of its own subcategories.");
+        seen.add(cur.id); cur = cur.parent_id ? cats.find(x => x.id === cur!.parent_id) : null;
+      }
+      if (!r.archived && clash(parent, r.name, r.id)) return bad('duplicate key value violates unique constraint "categories_parent_name_uq"');
+      r.parent_id = parent; return ok();
+    }
+    case "category_archive": {
+      const r = cats.find(x => x.id === a.p_id); const arch = a.p_archived !== false;
+      if (!r) return bad("Category not found.");
+      if (arch && cats.some(x => x.parent_id === r.id && !x.archived)) return bad("This category has subcategories — move or archive them first.");
+      if (!arch && clash(r.parent_id ?? null, r.name, r.id)) return bad('duplicate key value violates unique constraint "categories_parent_name_uq"');
+      r.archived = arch; return ok();
+    }
+    case "set_items_category": {
+      const ids = new Set<string>(a.p_item_ids || []); const target = a.p_category_id ?? null;
+      const c = target ? cats.find(x => x.id === target) : null;
+      if (target && !c) return bad("Target category not found.");
+      let n = 0;
+      for (const it of items) if (ids.has(it.id)) { it.category_id = target; it.category = c?.name ?? null; it.subcategory = null; n++; }
+      return ok(n);
+    }
+    case "create_item":
+    case "update_item": {
+      const model = String(a.p_model ?? "").trim();
+      if (!model) return bad("Model is required.");
+      const c = a.p_category_id ? cats.find(x => x.id === a.p_category_id) : null;
+      const t = (v: any) => (v == null ? "" : String(v).trim());
+      const fields = {
+        brand: t(a.p_brand) || null, category_id: a.p_category_id ?? null, category: c?.name ?? null,
+        model, size: t(a.p_size), colour: t(a.p_colour), case_size: Math.max(0, Number(a.p_case_size) || 0),
+        hsn_code: t(a.p_hsn_code) || null, gst_rate: a.p_gst_rate ?? null,
+        reorder_point_a: Math.max(0, Number(a.p_reorder_point_a) || 0), reorder_point_b: Math.max(0, Number(a.p_reorder_point_b) || 0),
+      };
+      if (fn === "update_item") {
+        const it = items.find(x => x.id === a.p_item_id); if (!it) return bad("Item not found.");
+        Object.assign(it, fields, { updated_at: new Date().toISOString() }); return ok();
+      }
+      const id = genId();
+      items.push({ id, item_code: "IT-" + id.slice(5, 13).toUpperCase(), subcategory: null, image_url: null,
+        archived: false, archived_at: null, created_at: new Date().toISOString(), ...fields });
+      return ok(id);
+    }
+    case "set_item_archived": {
+      const it = items.find(x => x.id === a.p_item_id); if (!it) return bad("Item not found.");
+      it.archived = a.p_archived !== false; it.archived_at = it.archived ? new Date().toISOString() : null; return ok();
+    }
+    case "apply_reconciliation": {
+      const it = items.find(x => x.id === a.p_item_id); if (!it) return bad("Item not found.");
+      const cases = Math.max(0, Number(a.p_target_cases) || 0), loose = Math.max(0, Number(a.p_target_loose) || 0);
+      const row = stock.find(x => x.item_id === it.id && x.godown === a.p_godown);
+      const cs = it.case_size || 0;
+      const before = row ? (cs > 0 ? row.cases * cs + row.loose : row.loose) : 0;
+      if (row) { row.cases = cases; row.loose = loose; } else stock.push({ item_id: it.id, godown: a.p_godown, cases, loose });
+      const delta = (cs > 0 ? cases * cs + loose : loose) - before;
+      if (delta !== 0) {
+        // Like the SQL: one Adjustment row whenever the piece total moved.
+        const now = new Date();
+        const d = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+        (DEMO_TABLES["transactions"] as Row[]).push({
+          id: genId(), item_id: it.id, txn_date: d, action: "Adjustment", godown: a.p_godown,
+          qty: Math.abs(delta), direction: delta > 0 ? 1 : -1, status: "OK", reverses_id: null, party_id: null,
+          invoice_no: null, reason: null, note: String(a.p_reason || "Adjustment"), rate: null,
+          created_by: "demo-user", created_at: now.toISOString(),
+        });
+      }
+      return ok(delta);
+    }
+    default: return ok();
+  }
+}
+
 export function createDemoClient(): SupabaseClient {
   const client: any = {
     from: (table: string) => makeBuilder(table),
-    rpc: async () => ({ data: null, error: null }),
+    rpc: async (fn: string, args: Row = {}) => demoRpc(fn, args),
     auth: {
       getSession: async () => ({ data: { session: demoSession() }, error: null }),
       getUser: async () => ({ data: { user: demoSession().user }, error: null }),

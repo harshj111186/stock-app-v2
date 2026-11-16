@@ -1,20 +1,35 @@
 "use client";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
-// Close-on-Escape for modals/sheets. Active only while `active` is true so
-// stacked dialogs don't all close at once (mount the hook in the top one).
+// Close-on-Escape for modals/sheets. Active only while `active` is true.
+// Stacked layers: ONLY the most recently opened active layer reacts. Every
+// layer listens on window, and stopPropagation can't stop sibling window
+// listeners — so before this, Escape in the category picker also closed the
+// Add-item form underneath it and lost everything typed (review, 16 Nov 2026).
+// The callback lives in a ref so re-renders don't re-register the listener
+// (which would re-order the stack and put the parent back on top).
+const escStack: number[] = [];
+let escSeq = 0;
 export function useEscape(active: boolean, onClose: () => void) {
+  const cb = useRef(onClose);
+  useEffect(() => { cb.current = onClose; });
   useEffect(() => {
     if (!active) return;
+    const id = ++escSeq;
+    escStack.push(id);
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        e.stopPropagation();
-        onClose();
-      }
+      if (e.key !== "Escape") return;
+      if (escStack[escStack.length - 1] !== id) return;
+      e.stopPropagation();
+      cb.current();
     };
     window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [active, onClose]);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      const i = escStack.indexOf(id);
+      if (i >= 0) escStack.splice(i, 1);
+    };
+  }, [active]);
 }
 
 // Reactive dark-mode flag for places that can't use Tailwind classes

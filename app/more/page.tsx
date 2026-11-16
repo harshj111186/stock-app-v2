@@ -2,7 +2,7 @@
 import Link from "next/link";
 import {
   Warehouse, Receipt, ShieldCheck, Users, Settings, LogOut,
-  ChevronRight, Download, ClipboardCheck, FolderTree, UserCog,
+  ChevronRight, Download, FolderTree, UserCog, BarChart3, TrendingUp, AlertOctagon,
 } from "lucide-react";
 import { Shell } from "@/components/shell";
 import { useAuth } from "@/app/providers";
@@ -21,11 +21,13 @@ type Row = {
 
 const ROWS: Row[] = [
   // The stock count is done on a phone, in the godown — keep it first.
-  { href: "/reconciliation", label: "Reconciliation", sub: "Count the shelf and compare with the system", icon: ClipboardCheck },
-  { href: "/godown-a", label: "Godown A", sub: "Stock at warehouse A", icon: Warehouse },
+    { href: "/godown-a", label: "Godown A", sub: "Stock at warehouse A", icon: Warehouse },
   { href: "/godown-b", label: "Godown B", sub: "Stock at warehouse B", icon: Warehouse },
   { href: "/pricing",  label: "Pricing",  sub: "List price, discounts, GST", icon: Receipt },
-  { href: "/categories", label: "Categories", sub: "Groups your items sit in", icon: FolderTree, adminOnly: true },
+  { href: "/reports/sales", label: "Sales register", sub: "What sold, day by day", icon: BarChart3 },
+  { href: "/reports/abc", label: "ABC analysis", sub: "Which items bring the most value", icon: TrendingUp },
+  { href: "/reports/dead-stock", label: "Dead stock", sub: "Items that have not moved", icon: AlertOctagon },
+  { href: "/categories", label: "Categories", sub: "Make, rename, nest and move categories", icon: FolderTree, adminOnly: true },
   { href: "/audit",    label: "Audit log", sub: "Who changed what, and when", icon: ShieldCheck, adminOnly: true },
   { href: "/users",    label: "Users",    sub: "Manage staff and roles", icon: Users, adminOnly: true },
   { href: "/settings", label: "Settings", sub: "Account and preferences", icon: Settings },

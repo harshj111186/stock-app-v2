@@ -877,6 +877,7 @@ Add each entry to the list, then save them together — stock only changes when 
             <Label>Item</Label>
             <ItemPicker
               items={activeItems}
+              stockOf={(it) => ({ a: stockTotalFor(it, stock, "A"), b: stockTotalFor(it, stock, "B") })}
               value={f.item_id}
               onChange={(id) => setF((x) => ({ ...x, item_id: id }))}
             />
@@ -1630,11 +1631,13 @@ function ActionBadge({ action, reversal }: { action: string; reversal?: boolean 
 }
 
 function ItemPicker({
-  items, value, onChange,
+  items, value, onChange, stockOf,
 }: {
   items: Item[];
   value: string;
   onChange: (id: string) => void;
+  /** Pieces in each godown — shown on every result so the right one is obvious. */
+  stockOf?: (i: Item) => { a: number; b: number };
 }) {
   const [q, setQ] = useState("");
   const [open, setOpen] = useState(false);
@@ -1698,9 +1701,16 @@ function ItemPicker({
                 <div className="truncate">{i.brand && <span className="text-zinc-400">{i.brand} · </span>}{i.model}</div>
                 <div className="text-[11px] text-zinc-500 truncate">{[i.size, i.colour].filter(Boolean).join(" · ")}</div>
               </div>
-              {i.case_size > 0
-                ? <span className="text-[10px] text-zinc-400 tnum whitespace-nowrap">case×{i.case_size}</span>
-                : <span className="text-[10px] text-amber-500 tnum whitespace-nowrap" title="No case size set yet">no case</span>}
+              <span className="flex flex-col items-end gap-0.5 flex-shrink-0">
+                {stockOf && (() => { const s = stockOf(i); return (
+                  <span className="text-[11px] tnum whitespace-nowrap text-zinc-600 dark:text-zinc-300">
+                    <span className="text-cyan-700 dark:text-cyan-300">A</span> {s.a} · <span className="text-teal-700 dark:text-teal-300">B</span> {s.b}
+                  </span>
+                ); })()}
+                {i.case_size > 0
+                  ? <span className="text-[10px] text-zinc-400 tnum whitespace-nowrap">case of {i.case_size}</span>
+                  : <span className="text-[10px] text-amber-500 tnum whitespace-nowrap" title="No case size set yet">no case size</span>}
+              </span>
             </button>
           ))}
         </div>

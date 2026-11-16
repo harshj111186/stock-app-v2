@@ -35,7 +35,7 @@ const COMMANDS: Cmd[] = [
   { id: "godown-a", label: "Godown A", icon: Warehouse, href: "/godown-a", group: "Go to", keywords: "warehouse stock" },
   { id: "godown-b", label: "Godown B", icon: Warehouse, href: "/godown-b", group: "Go to", keywords: "warehouse stock" },
   { id: "transactions", label: "Transactions", icon: ArrowLeftRight, href: "/transactions", group: "Go to", keywords: "purchase sale transfer adjustment return log" },
-  { id: "reconciliation", label: "Reconciliation", icon: ClipboardCheck, href: "/reconciliation", group: "Go to", keywords: "stock take count physical" },
+  { id: "reconciliation", label: "Stock count", icon: ClipboardCheck, href: "/reconciliation", group: "Go to", keywords: "stock take count physical reconciliation reconcile" },
   { id: "pricing", label: "Pricing", icon: Receipt, href: "/pricing", group: "Go to", keywords: "lp discount gst rate" },
   { id: "sales", label: "Sales register", icon: BarChart3, href: "/reports/sales", group: "Go to", keywords: "report revenue" },
   { id: "abc", label: "ABC analysis", icon: TrendingUp, href: "/reports/abc", group: "Go to", keywords: "report pareto" },
@@ -47,7 +47,7 @@ const COMMANDS: Cmd[] = [
   // Quick actions
   { id: "new-item", label: "Add a new item", hint: "Items", icon: Plus, href: "/items?new=1", group: "Actions", keywords: "create product sku" },
   { id: "new-txn", label: "Log a transaction", hint: "Transactions", icon: Plus, href: "/transactions", group: "Actions", keywords: "purchase sale entry" },
-  { id: "start-recon", label: "Start a stock count", hint: "Reconciliation", icon: Plus, href: "/reconciliation", group: "Actions", keywords: "reconcile physical" },
+  { id: "start-recon", label: "Start a stock count", hint: "Stock count", icon: Plus, href: "/reconciliation", group: "Actions", keywords: "reconcile physical" },
 ];
 
 export function CommandPalette() {

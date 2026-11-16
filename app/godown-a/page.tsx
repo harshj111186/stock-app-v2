@@ -1,6 +1,7 @@
 "use client";
-import { GodownView } from "@/components/godown-view";
+// Godown A = the Items screen showing only Godown A's stock (cases, loose, pieces).
+import { ItemsView } from "@/components/items-view";
 
 export default function Page() {
-  return <GodownView godown="A" />;
+  return <ItemsView godown="A" />;
 }

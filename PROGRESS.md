@@ -230,6 +230,106 @@ If you must touch one of these files: **read first, edit surgically, never repla
 
 ## 11. Changelog (latest first — add new entries at the top)
 
+### 2026-11-16 (evening) — Redesign: Items + categories rebuilt, system count beside every count box
+
+**User ask (Harsh):** "look into each and every screen … far easier to use, with an easy way to add items …
+less cluttered … better to reconcile … a salesman adding his own count should see the actual current count
+in the system very easily … easy to move any items from one category to another … make the nested options
+much better … create as many nested items as needed … a full redesign if we can."
+Before/after screenshots + checks: `Documents\Claude\_qa-tools\stock-app-redesign-2026-11-16\` (README there).
+**Client code only — no SQL, no Edge Function, no new RPC.** Every write goes through RPCs that already
+existed (category_create/_rename/_move/_archive, set_items_category, create_item, update_item,
+set_item_archived, apply_reconciliation). The stock-count commit / apply / draft logic is untouched.
+
+**Live data looked at first (read-only):** 186 items, 18 categories, only 3 nested ("ceiling fan › Havells
+bldc fan", "ceiling fan › orient fan", "Lightning › Goldmedal lighting") — the old picker was an indented
+`<select>`, actions in the tree were hover-only, a rename/move onto an existing name failed with the raw
+"duplicate key … categories_parent_name_uq", and a category with sub-categories could not be removed.
+
+**Items (`components/items-view.tsx`, used by /items, /godown-a, /godown-b)**
+- Left (≥1024 px): the **category tree** (`components/category-tree.tsx`, browse mode) — All items, every
+  category with its count INCLUDING everything below it (`rollupCounts`), "No category" when any. Tapping a
+  category lists it and everything under it, with a heading per sub-category. Admin ⋯ menu per row: Add
+  sub-category · Rename · Move into… · Delete. **Drag items (or a selection) onto a category to move them;
+  drag a category onto another to nest it** (desktop, admin).
+- Phone: "Categories" button opens the same tree in a sheet; a breadcrumb (All › Fans › Ceiling) and
+  one-tap chips for the sub-categories of where you are.
+- **One compact row per item** (no more cards): colour strip · name · brand · size · colour · Low/Out word ·
+  Godown A · Godown B · Total (cases×size + loose underneath on a computer). Phone: name may wrap to two
+  lines, total + "A n · B n" on the right — ~8 items per screen (was 2). Grid/table toggle and the
+  Brand/Category grouping select are gone (the tree is the grouping).
+- Toolbar: search, brand, Both / Godown A / Godown B switch (/items only), status chips. Searching inside a
+  category says so and offers "Search all items".
+- Tap a row → **item panel** (`components/item-drawer.tsx`; side panel / bottom sheet): big stock per godown
+  (pieces + "N cases + M loose"), total, Correct the count · Edit details · Move to category · Add similar
+  item, details, last 8 movements.
+- **Select → Move to…** opens the new picker; the toast says where they went and has **Undo** (puts each
+  item back in its own previous category).
+- Godown A / B pages are now this same screen showing Cases · Loose · Pieces for that godown
+  (`components/godown-view.tsx` deleted). Status rules unchanged (`lowThresholdCombined` /
+  `lowThresholdGodown` from lib/utils).
+- The count-correction modal moved verbatim to `components/edit-stock-modal.tsx` (labels now "Godown A/B",
+  "Correct the count", "Save count").
+
+**Category picker (`components/category-picker.tsx`, replaces `category-tree-picker.tsx`)** — searchable
+tree in a sheet/dialog; "+" on any row adds a sub-category right there; typing **"Fans / Ceiling / BLDC"**
+(also › > \) offers "Create Fans › Ceiling › BLDC" and makes every missing level (category_create is
+get-or-create, so existing levels are reused). Used by Add/Edit item, Move items, Move category, Delete.
+A new category's whole branch opens itself so it is on screen (`reveal` in category-tree).
+
+**Categories page** — same tree in manage mode: Sub-category / Rename / Move / Delete as buttons on a
+computer, "+" and ⋯ on a phone. **Delete = move what is inside, then archive**: a dialog shows the
+category's own items and direct sub-categories and where they go (its parent by default, changeable), then
+`set_items_category` + `category_move` per child + `category_archive`. Name clashes are checked first
+(`siblingWithName`) and explained in words; `friendlyCatError` maps any duplicate-key error. "Show deleted"
+lists archived categories with Restore.
+
+**Add item (`components/item-form-modal.tsx`, rewritten)** — Category (picker, starts at the category you are
+looking at) → Brand (+ one-tap chips of the six most used) → Name → Size + Pieces in one case → **Colours:
+add several and it makes one item per colour** → **Stock you have now (optional, one colour)**: Godown A/B
+cases + loose, saved with `apply_reconciliation(…, "Opening stock")` right after `create_item` (same RPC and
+logging as a count correction) → More details (GST, HSN, "warn when A/B is at"). **Save & add another** keeps
+category / brand / size / case size. Warns when the same brand+name+size+colour exists. "Add similar item"
+from the item panel pre-fills everything but the colour.
+
+**Stock count (`app/reconciliation/page.tsx`)**
+- `GodownPanel` rebuilt: the **system numbers sit right beside the boxes** — computer: a mini table
+  (System row: cases · loose · pcs; You row: the two boxes + your pieces), phone: each row is
+  `Cases | system 15 | [− box +]`, `Loose | 12 | [− box +]`, `Pieces | 312 | yours`. The difference pill
+  (Matches / N short / N extra) moved to the panel header. The count boxes still never pre-fill;
+  "Same as system" is still the deliberate one-tap way.
+- Categories carry their full path; the list is in **category tree order** (then brand, name, size,
+  colour) with a heading row whenever the category changes; the category filter lists parents too and is
+  subtree-aware ("Fans" includes Fans › Ceiling › BLDC). Rows no longer repeat the category.
+- Page renamed **Stock count** (nav, palette, title). `MyItem`/`myItemPropsEqual` untouched (no new prop).
+
+**Navigation** — phone tabs: Home · Items · **Count** · Sale / buy · More (Stock count was hidden under More;
+Reports moved into More). Sidebar Daily: Dashboard · Items · Sale / purchase · Stock count · Godown A ·
+Godown B · Pricing. Sale/purchase item search shows **A n · B n** stock on every result.
+
+**Demo mode** — `lib/demo.ts` `demoRpc` mirrors the catalogue RPCs + apply_reconciliation in memory (same
+guards as the SQL: get-or-create, cycle check, live-children check, per-parent unique names). The demo Fans
+items now sit in Ceiling / Ceiling › BLDC / Exhaust so nesting demos.
+
+**Independent code review (before publishing) → 8 fixes:** (1) `useEscape` (lib/hooks) now has a STACK —
+only the most recently opened layer reacts; Escape in the category picker used to close the Add-item form
+under it and lose everything typed. The callback sits in a ref so a re-render never re-orders the stack.
+(2) A multi-colour add that fails part-way drops the colours already created (a retry can't duplicate them);
+if only the opening stock failed, the name is cleared. (3) Items in a deleted category sort and show as ONE
+"No category" group (were scattered, with duplicate React keys); a category view lists only live-category
+items. (4) Undo of a bulk move checks each RPC and says so if it couldn't. (5) The item panel re-reads "Last
+movements" when its stock changes. (6) Delete-category: if "what is inside" can't be read, Delete stays off
+(it used to say "empty"); a mid-way failure reloads the tree. (7) Count correction: if Godown A saved and B
+failed, the page refreshes behind the modal (`onPartial`). (8) A failed first load no longer resets the
+remembered category. Demo `category_move` now checks the parent exists and demo `apply_reconciliation` writes
+the Adjustment row like the SQL.
+
+**Checks:** `redesign.mjs` 39/39 (incl. Escape-stacking + movements-after-correction), `recon.mjs` 16/16,
+`recon2.mjs` 12/12 (now finds items by name — the list order changed), `txn.mjs` 10/10 = 77, all against the
+production build in demo mode; `tsc` clean; `next build` OK. Not proven on a real phone in the godown, and
+drag-and-drop is computer-only.
+
+
 ### 2026-11-16 — Ease-of-use pass: stock count made faster to do and to review; plain words elsewhere
 
 **User ask (Harsh):** "make the stock manager a bit easy to use and user friendly … easy to reconcile for

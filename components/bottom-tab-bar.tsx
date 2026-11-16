@@ -2,50 +2,24 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import {
-  LayoutDashboard, Boxes, ArrowLeftRight, BarChart3, MoreHorizontal,
+  LayoutDashboard, Boxes, ArrowLeftRight, ClipboardCheck, MoreHorizontal,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
-// Fixed bottom navigation, mobile-only. Five tabs covers most-used routes;
-// secondary routes (Godown A/B, Pricing, Audit, Users, Settings) live behind
-// the "More" tab as a list.
+// Fixed bottom navigation, mobile-only. The four daily jobs get a tab —
+// look up stock, count it, record a sale/purchase — everything else
+// (Godown A/B, Pricing, Reports, Categories, Users, Settings) is under More.
+// 2026-11-16: Stock count moved here from More (it is done on a phone).
 const TABS = [
+  { href: "/", label: "Home", icon: LayoutDashboard, match: (p: string) => p === "/" || p === "" },
+  { href: "/items", label: "Items", icon: Boxes, match: (p: string) => p.startsWith("/items") || p.startsWith("/godown") || p.startsWith("/categories") },
+  { href: "/reconciliation", label: "Count", icon: ClipboardCheck, match: (p: string) => p.startsWith("/reconciliation") },
+  { href: "/transactions", label: "Sale / buy", icon: ArrowLeftRight, match: (p: string) => p.startsWith("/transactions") },
   {
-    href: "/",
-    label: "Home",
-    icon: LayoutDashboard,
-    match: (p: string) => p === "/" || p === "",
-  },
-  {
-    href: "/items",
-    label: "Items",
-    icon: Boxes,
-    match: (p: string) => p.startsWith("/items"),
-  },
-  {
-    href: "/transactions",
-    label: "Txn",
-    icon: ArrowLeftRight,
-    match: (p: string) => p.startsWith("/transactions"),
-  },
-  {
-    href: "/reports/sales",
-    label: "Reports",
-    icon: BarChart3,
-    match: (p: string) => p.startsWith("/reports"),
-  },
-  {
-    href: "/more",
-    label: "More",
-    icon: MoreHorizontal,
+    href: "/more", label: "More", icon: MoreHorizontal,
     match: (p: string) =>
-      p.startsWith("/more") ||
-      p.startsWith("/godown") ||
-      p.startsWith("/reconciliation") ||
-      p.startsWith("/pricing") ||
-      p.startsWith("/audit") ||
-      p.startsWith("/users") ||
-      p.startsWith("/settings"),
+      p.startsWith("/more") || p.startsWith("/reports") || p.startsWith("/pricing") ||
+      p.startsWith("/audit") || p.startsWith("/users") || p.startsWith("/settings"),
   },
 ];
 

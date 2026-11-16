@@ -16,10 +16,10 @@ const NAV: { group: string; items: NavItem[] }[] = [
   { group: "Daily", items: [
     { href: "/", label: "Dashboard", icon: LayoutDashboard },
     { href: "/items", label: "Items", icon: Boxes },
+    { href: "/transactions", label: "Sale / purchase", icon: ArrowLeftRight },
+    { href: "/reconciliation", label: "Stock count", icon: ClipboardCheck },
     { href: "/godown-a", label: "Godown A", icon: Warehouse },
     { href: "/godown-b", label: "Godown B", icon: Warehouse },
-    { href: "/transactions", label: "Transactions", icon: ArrowLeftRight },
-    { href: "/reconciliation", label: "Reconciliation", icon: ClipboardCheck },
     { href: "/pricing", label: "Pricing", icon: Receipt },
   ]},
   { group: "Reports", items: [

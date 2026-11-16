@@ -83,3 +83,93 @@ export function pathById(rows: CatRow[]): Map<string, string> {
   }
   return m;
 }
+
+// ─── 2026-11-16 redesign helpers ─────────────────────────────────────────
+
+// Normalise a CatRow-ish DB row (the select("*") shape) into a CatRow.
+export function toCatRow(x: any): CatRow {
+  return {
+    id: x.id, name: x.name, parent_id: x.parent_id ?? null,
+    sort_order: x.sort_order ?? 0, archived: x.archived ?? false,
+  };
+}
+
+// Every id at or under `id`, walking the RAW parent links (archived rows
+// included) — so a real descendant under an archived middle node still
+// counts as a descendant (the move RPC would reject it as a cycle).
+export function descendantIds(rows: CatRow[], id: string): Set<string> {
+  const byParent = new Map<string, string[]>();
+  for (const r of rows) {
+    if (!r.parent_id) continue;
+    const list = byParent.get(r.parent_id) ?? [];
+    list.push(r.id);
+    byParent.set(r.parent_id, list);
+  }
+  const ids = new Set<string>([id]);
+  const stack = [id];
+  while (stack.length) {
+    const cur = stack.pop()!;
+    for (const kid of byParent.get(cur) ?? []) {
+      if (!ids.has(kid)) { ids.add(kid); stack.push(kid); }
+    }
+  }
+  return ids;
+}
+
+// Items per category INCLUDING everything below it ("Fans" counts the items
+// in Fans › Ceiling › BLDC too). `direct` = item count per category id.
+export function rollupCounts(rows: CatRow[], direct: Map<string, number>): Map<string, number> {
+  const out = new Map<string, number>();
+  const nodes = flattenTree(buildCategoryTree(rows, true));
+  const byId = new Map(rows.map(r => [r.id, r]));
+  for (const n of nodes) out.set(n.id, 0);
+  for (const [catId, n] of direct) {
+    // Walk up the parent chain, adding n to every ancestor (cycle-guarded).
+    let cur: string | null | undefined = catId;
+    const seen = new Set<string>();
+    while (cur && !seen.has(cur)) {
+      seen.add(cur);
+      out.set(cur, (out.get(cur) ?? 0) + n);
+      cur = byId.get(cur)?.parent_id ?? null;
+    }
+  }
+  return out;
+}
+
+// Path ids root → … → id (inclusive), for breadcrumbs.
+export function ancestorChain(rows: CatRow[], id: string | null): CatRow[] {
+  if (!id) return [];
+  const byId = new Map(rows.map(r => [r.id, r]));
+  const chain: CatRow[] = [];
+  const seen = new Set<string>();
+  let cur: CatRow | undefined = byId.get(id);
+  while (cur && !seen.has(cur.id)) {
+    seen.add(cur.id);
+    chain.unshift(cur);
+    cur = cur.parent_id ? byId.get(cur.parent_id) : undefined;
+  }
+  return chain;
+}
+
+// A live (non-archived) sibling with the same name (case-insensitive) under
+// `parentId` — the database refuses that pair, so check it first and say so
+// in plain words instead of a raw "duplicate key" error.
+export function siblingWithName(rows: CatRow[], parentId: string | null, name: string, exceptId?: string): CatRow | undefined {
+  const n = name.trim().toLowerCase();
+  return rows.find(r => !r.archived && (r.parent_id ?? null) === (parentId ?? null) && r.id !== exceptId && r.name.trim().toLowerCase() === n);
+}
+
+// Split "Fans / Ceiling / Premium" (also › > \) into clean segments.
+export function splitPath(text: string): string[] {
+  return text.split(/\s*(?:\/|›|>|\\)\s*/).map(s => s.trim()).filter(Boolean);
+}
+
+// Turn database errors into words a shop counter understands.
+export function friendlyCatError(e: any): string {
+  const msg: string = e?.message || String(e || "");
+  if (/duplicate key|categories_parent_name_uq|unique/i.test(msg)) {
+    return "A category with that name is already there. Pick another name, or use the existing one.";
+  }
+  if (/only an active admin/i.test(msg)) return "Only an admin can change categories.";
+  return msg || "That didn't work. Please try again.";
+}

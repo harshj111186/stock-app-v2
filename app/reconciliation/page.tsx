@@ -4,12 +4,13 @@ import {
   Printer, ClipboardCheck, CheckCircle2, AlertCircle,
   RotateCcw, Loader2, Filter, Eye, Users, ShieldCheck,
   UserCircle2, Clock, Lock, LockOpen, CheckCheck, AlertTriangle, UserPlus,
-  Minus, Plus, History, Download, X, Eraser, Equal, Pencil, ChevronDown, ListChecks,
+  Minus, Plus, History, Download, X, Eraser, Equal, Pencil, ChevronDown, ListChecks, Folder,
 } from "lucide-react";
 import { Shell } from "@/components/shell";
 import { sb, fetchAllRows, type Item } from "@/lib/supabase";
 import { useAuth } from "@/app/providers";
 import { fmtN, cn, matchesQuery, todayISO } from "@/lib/utils";
+import { buildCategoryTree, flattenTree, pathById, toCatRow } from "@/lib/categories";
 import { useEscape, useMediaQuery } from "@/lib/hooks";
 import { useConfirm } from "@/components/confirm-dialog";
 import { FilterSheet, SheetField, FilterButton } from "@/components/filter-sheet";
@@ -246,6 +247,7 @@ export default function ReconciliationPage() {
   const [items, setItems] = useState<Item[]>([]);
   const [appStock, setAppStock] = useState<Map<string, { A: AppStock; B: AppStock }>>(new Map());
   const [catNameById, setCatNameById] = useState<Map<string, string>>(new Map());
+  const [catOrder, setCatOrder] = useState<Map<string, number>>(new Map());
   const [drafts, setDrafts] = useState<Map<DraftKey, DBDraft>>(new Map());
   // Mirror of `drafts` that survives component unmount. persistDraft reads
   // from this ref so a pending save fired by a timer (or by the
@@ -346,7 +348,7 @@ export default function ReconciliationPage() {
     ] = await Promise.all([
       c.from("items").select("*").eq("archived", false).order("item_code"),
       c.from("godown_stock").select("*"),
-      c.from("categories").select("id, name"),
+      c.from("categories").select("id, name, parent_id, archived, sort_order"),
       c.from("reconciliation_drafts_with_user").select("*"),
       // Latest reconciliation per item — paginated (PostgREST clamps any
       // .limit() to 1,000 server-side) and deduped client-side.
@@ -425,7 +427,14 @@ export default function ReconciliationPage() {
 
     setItems((rows || []) as Item[]);
     setAppStock(stockMap);
-    setCatNameById(new Map((cats || []).map((c: any) => [c.id, c.name])));
+    // Full path ("Fans › Ceiling › BLDC") + tree position, so the count list
+    // walks the shelves category by category and a parent filter includes
+    // everything under it (2026-11-16).
+    {
+      const catRows = (cats || []).map(toCatRow);
+      setCatNameById(pathById(catRows));
+      setCatOrder(new Map(flattenTree(buildCategoryTree(catRows, true)).map((n, idx) => [n.id, idx])));
+    }
     // Same in-flight protection as refreshDrafts: a post-commit load() must
     // not roll back a keystroke typed during the commit whose save hasn't
     // acked yet (the pending persist would then re-save a stale snapshot).
@@ -1144,24 +1153,35 @@ export default function ReconciliationPage() {
   }, [doneByUser]);
 
   // ─── derived: enriched items + filter list ─────────────────────────────
-  const itemsEnriched = useMemo(() => items.map(i => ({
-    ...i,
-    categoryName: i.category_id ? (catNameById.get(i.category_id) ?? i.category ?? null) : (i.category ?? null),
-  })), [items, catNameById]);
+  const itemsEnriched = useMemo(() => {
+    const coll = new Intl.Collator("en", { numeric: true, sensitivity: "base" });
+    return items.map(i => ({
+      ...i,
+      categoryName: i.category_id ? (catNameById.get(i.category_id) ?? i.category ?? null) : (i.category ?? null),
+      _ord: i.category_id ? (catOrder.get(i.category_id) ?? 1e6) : 1e7,
+    })).sort((a, b) => a._ord - b._ord
+      || coll.compare(a.brand || "", b.brand || "") || coll.compare(a.model, b.model)
+      || coll.compare(a.size || "", b.size || "") || coll.compare(a.colour || "", b.colour || ""));
+  }, [items, catNameById, catOrder]);
 
   const brands = useMemo(
     () => [...new Set(itemsEnriched.map(i => i.brand || "").filter(Boolean))].sort(),
     [itemsEnriched]
   );
-  const cats = useMemo(
-    () => [...new Set(itemsEnriched.map(i => i.categoryName || "").filter(Boolean))].sort(),
-    [itemsEnriched]
-  );
+  // Every level that holds items, parents included ("Fans", "Fans › Ceiling").
+  const cats = useMemo(() => {
+    const out = new Set<string>();
+    for (const i of itemsEnriched) {
+      const segs = (i.categoryName || "").split(" › ").filter(Boolean);
+      for (let k = 1; k <= segs.length; k++) out.add(segs.slice(0, k).join(" › "));
+    }
+    return [...out].sort((a, b) => a.localeCompare(b));
+  }, [itemsEnriched]);
 
   const filtered = useMemo(() => {
     return itemsEnriched.filter(i => {
       if (brand && i.brand !== brand) return false;
-      if (cat && i.categoryName !== cat) return false;
+      if (cat && !(i.categoryName === cat || (i.categoryName ?? "").startsWith(cat + " › "))) return false;
       // The chips are My-count only: the Reviewer's two-step wizard drives its
       // own list (its step memos derive from `filtered`), so a chip left on
       // must never silently empty Step 1 / Step 2.
@@ -1943,7 +1963,7 @@ export default function ReconciliationPage() {
 
   // ─── render ────────────────────────────────────────────────────────────
   return (
-    <Shell title="Reconciliation">
+    <Shell title="Stock count">
       <div className="no-print recon-page">
         <Header
           loaded={loaded}
@@ -2445,7 +2465,7 @@ function Header({
   return (
     <div className="mb-4">
       <div className="flex flex-wrap items-center gap-x-3 gap-y-2 mb-1.5">
-        <h1 className="text-xl sm:text-2xl font-semibold tracking-tight">Reconciliation</h1>
+        <h1 className="text-xl sm:text-2xl font-semibold tracking-tight">Stock count</h1>
         {isAdmin ? (
           <div className="inline-flex bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-md overflow-hidden">
             <button
@@ -2486,7 +2506,8 @@ function Header({
       <p className="text-sm text-zinc-500 tabular-nums">
         {!loaded ? "Loading…" : mode === "my" ? (
           <>
-            Count what is physically on the shelf — the app compares it with the system for you.
+            <span className="hidden sm:inline">Count what is physically on the shelf — the system's number is shown beside every box.</span>
+            <span className="sm:hidden">Type what you find on the shelf.</span>
             {stats.invalid > 0 && (
               <> · <span className="text-rose-600 dark:text-rose-400 font-medium" title="an entry isn't a valid number yet">{fmtN(stats.invalid)} need{stats.invalid === 1 ? "s" : ""} fixing</span></>
             )}
@@ -2966,10 +2987,29 @@ type MyViewProps = {
 function MyView(props: MyViewProps) {
   const isDesktop = useMediaQuery("(min-width: 768px)");
   const { items, appStock, drafts, lastRecon, currentUserId, errorsByItem, otherUsersByItem, conflictByItem } = props;
-  const rows = items.map(i => {
+  // A heading row each time the category changes (the list is in tree
+  // order), so the counter can walk the godown shelf by shelf.
+  let lastCat: string | null | undefined = undefined;
+  const rows = items.flatMap(i => {
     const app = appStock.get(i.id);
-    if (!app) return null;
-    return (
+    if (!app) return [];
+    const out: React.ReactNode[] = [];
+    if (i.categoryName !== lastCat) {
+      lastCat = i.categoryName;
+      const segs = (i.categoryName || "No category").split(" › ");
+      const label = (
+        <span className="flex items-center gap-1.5 min-w-0 text-[12px]">
+          <Folder className="w-3.5 h-3.5 text-cyan-500/80 flex-shrink-0" />
+          <span className="truncate text-zinc-500">
+            {segs.slice(0, -1).map(x => x + " › ")}<b className="font-semibold text-zinc-800 dark:text-zinc-200">{segs[segs.length - 1]}</b>
+          </span>
+        </span>
+      );
+      out.push(isDesktop
+        ? <tr key={`h-${i.id}`} className="bg-zinc-50 dark:bg-zinc-900/60 border-t border-zinc-200 dark:border-zinc-800"><td colSpan={5} className="px-3 py-1.5">{label}</td></tr>
+        : <div key={`h-${i.id}`} className="pt-2 px-1">{label}</div>);
+    }
+    out.push(
       <MyItem
         key={i.id}
         desktop={isDesktop}
@@ -2989,6 +3029,7 @@ function MyView(props: MyViewProps) {
         errors={errorsByItem.get(i.id)}
       />
     );
+    return out;
   });
   if (!isDesktop) return <div className="space-y-3">{rows}</div>;
   return (
@@ -3102,15 +3143,12 @@ function GodownPanel({
       className={cn(
         "inline-flex items-center gap-1.5 text-zinc-600 dark:text-zinc-300 transition-colors",
         compact
-          ? "text-[11px] rounded px-1 -mx-1 hover:text-emerald-700 dark:hover:text-emerald-300 hover:bg-emerald-500/10"
+          ? "text-[12px] rounded-md px-1.5 py-0.5 -mr-1 hover:text-emerald-700 dark:hover:text-emerald-300 hover:bg-emerald-500/10"
           : "w-full justify-center min-h-10 rounded-lg border border-dashed border-zinc-300 dark:border-zinc-700 text-[13px] active:bg-emerald-500/10 active:border-emerald-500/60"
       )}
     >
-      <Equal className={compact ? "w-3 h-3" : "w-3.5 h-3.5"} /> Same as system
+      <Equal className={compact ? "w-3.5 h-3.5" : "w-4 h-4"} /> Same as system
     </button>
-  );
-  const casesNote = csNew <= 0 && cRaw.trim() === "" && !frozen && (
-    <span className="block text-[9px] text-amber-600 dark:text-amber-400 mt-0.5">no case size — count loose</span>
   );
   const casesInput = (
     <ExprInput value={cRaw} onChange={onCases} onBlur={onBlur} stepper={stepper && !casesDisabled} compact={compact} disabled={casesDisabled}
@@ -3120,63 +3158,91 @@ function GodownPanel({
     <ExprInput value={lRaw} onChange={onLoose} onBlur={onBlur} stepper={stepper} compact={compact} disabled={frozen}
       tone={tone} ariaLabel={`${ariaPrefix} godown ${g} loose`} />
   );
+  // 2026-11-16 redesign: the SYSTEM numbers sit right beside / above the box
+  // you type in — cases next to cases, loose next to loose, pieces next to
+  // pieces — so a counter compares at a glance instead of reading a grey
+  // header line. (The count boxes themselves never pre-fill with system
+  // numbers: "Same as system" is the deliberate one-tap way to do that.)
+  const noCases = csNew <= 0;
+  const sysCases = noCases ? "—" : fmtN(appSide.cases);
+  const sysLoose = fmtN(noCases ? sysPcs : appSide.loose);
+  const youPcs = touched && side.valid ? fmtN(side.physPieces) : "—";
+  const sysNum = "tabular-nums font-semibold text-zinc-800 dark:text-zinc-100";
+  const lbl = "text-[11px] text-zinc-500";
+  const header = (
+    <div className="flex items-center justify-between gap-2 mb-2 min-h-6">
+      <span className={cn("text-[11px] font-semibold uppercase tracking-wider flex-shrink-0", head)}>Godown {g}</span>
+      {touched && side.valid ? <DiffPill diff={side.diff} /> : compact ? sameBtn : null}
+    </div>
+  );
+  const extras = (
+    <>
+      {touched && !side.valid && (
+        <div className="text-[11px] text-rose-600 dark:text-rose-400">Numbers only — for example 5, or 5+1 to add as you find more.</div>
+      )}
+      {!touched && frozen && <div className="text-[11px] italic text-zinc-400">not counted</div>}
+      {touched && side.valid && (onlyCases || onlyLoose) && (
+        <div className="text-[10px] text-zinc-500">{onlyCases ? "loose: 0 — none counted" : "cases: 0 — none counted"}</div>
+      )}
+      {noCases && !frozen && cRaw.trim() === "" && <div className="text-[10px] text-amber-600 dark:text-amber-400">No case size — count every piece in Loose</div>}
+      {csEdited && <div className="text-[10px] text-amber-600 dark:text-amber-400">New case size — system was {fmtN(side.appPieces)} pcs</div>}
+      {peers.map((p, idx) => <PeerLine key={idx} {...p} />)}
+    </>
+  );
+  const hasExtras = (touched && (!side.valid || onlyCases || onlyLoose)) || (!touched && frozen) || csEdited || peers.length > 0 || (noCases && !frozen && cRaw.trim() === "");
+
+  if (compact) {
+    // Computer: a 3-column mini table. Row 1 = system, row 2 = your boxes.
+    return (
+      <div className={cn("rounded-xl border-l-4 bg-zinc-50/70 dark:bg-zinc-800/40 p-2.5", rail)}>
+        {header}
+        <div className="grid grid-cols-[50px_1fr_1fr_44px] items-center gap-x-1.5 gap-y-1">
+          <span />
+          <span className={cn(lbl, "text-center")}>Cases</span>
+          <span className={cn(lbl, "text-center")}>Loose</span>
+          <span className={cn(lbl, "text-right")}>Pcs</span>
+
+          <span className={lbl}>System</span>
+          <span className={cn(sysNum, "text-center text-[14px]")}>{sysCases}</span>
+          <span className={cn(sysNum, "text-center text-[14px]")}>{sysLoose}</span>
+          <span className={cn(sysNum, "text-right text-[14px]")}>{fmtN(sysPcs)}</span>
+
+          <span className={cn(lbl, "font-medium text-zinc-700 dark:text-zinc-300")}>You</span>
+          <span className="min-w-0">{casesInput}</span>
+          <span className="min-w-0">{looseInput}</span>
+          <span className={cn("text-right tabular-nums text-[13px]", touched && side.valid ? "font-semibold" : "text-zinc-400")}>{youPcs}</span>
+        </div>
+        {hasExtras && <div className="mt-1.5 space-y-1">{extras}</div>}
+      </div>
+    );
+  }
+
+  // Phone: each row = label · SYSTEM number · your stepper, so the number to
+  // match is right next to the box you are filling.
   return (
     <div className={cn("rounded-xl border-l-4 bg-zinc-50/70 dark:bg-zinc-800/40 p-2.5", rail)}>
-      <div className="flex items-baseline justify-between gap-2 mb-2">
-        <span className={cn("text-[11px] font-semibold uppercase tracking-wider flex-shrink-0", head)}>Godown {g}</span>
-        <span className="text-[11px] tabular-nums text-zinc-500 dark:text-zinc-400 text-right min-w-0 truncate">
-          System{" "}
-          <span className="font-semibold text-zinc-700 dark:text-zinc-200">{fmtN(sysPcs)} pcs</span>
-          {csEdited
-            ? <span className="text-zinc-400 dark:text-zinc-500"> · was {fmtN(side.appPieces)}</span>
-            : csOld > 0 && <span className="text-zinc-400 dark:text-zinc-500"> · {fmtN(appSide.cases)}×{csOld} + {fmtN(appSide.loose)}</span>}
-        </span>
+      {header}
+      <div className="grid grid-cols-[44px_46px_minmax(0,1fr)] items-center gap-x-2 gap-y-1.5">
+        <span />
+        <span className={cn(lbl, "text-center leading-tight")}>System</span>
+        <span className={cn(lbl, "text-center")}>Your count</span>
+
+        <span className={lbl}>Cases</span>
+        <span className={cn(sysNum, "text-center text-[17px]")}>{sysCases}</span>
+        <div className="min-w-0">{casesInput}</div>
+
+        <span className={lbl}>Loose</span>
+        <span className={cn(sysNum, "text-center text-[17px]")}>{sysLoose}</span>
+        <div className="min-w-0">{looseInput}</div>
+
+        <span className={lbl}>Pieces</span>
+        <span className={cn(sysNum, "text-center text-[15px]")}>{fmtN(sysPcs)}</span>
+        <span className={cn("text-center tabular-nums text-[15px]", touched && side.valid ? "font-semibold" : "text-zinc-400")}>{youPcs}</span>
       </div>
-      {compact ? (
-        // Desktop: "Cases [ ] Loose [ ]" on ONE line — the label sits beside
-        // its box, so a row is roughly half the height it used to be.
-        <div className="grid grid-cols-2 gap-2">
-          <label className="flex items-start gap-1.5 min-w-0">
-            <span className="flex-shrink-0 text-[10px] uppercase tracking-wide text-zinc-500 leading-9">Cases</span>
-            <span className="flex-1 min-w-0">{casesInput}{casesNote}</span>
-          </label>
-          <label className="flex items-start gap-1.5 min-w-0">
-            <span className="flex-shrink-0 text-[10px] uppercase tracking-wide text-zinc-500 leading-9">Loose</span>
-            <span className="flex-1 min-w-0">{looseInput}</span>
-          </label>
-        </div>
-      ) : (
-        // Phone: label beside the stepper (not above it) — one row per box.
-        <div className="space-y-1.5">
-          <div className="flex items-center gap-2">
-            <span className="w-11 flex-shrink-0 text-[10px] uppercase tracking-wide text-zinc-500">Cases</span>
-            <div className="flex-1 min-w-0">{casesInput}{casesNote}</div>
-          </div>
-          <div className="flex items-center gap-2">
-            <span className="w-11 flex-shrink-0 text-[10px] uppercase tracking-wide text-zinc-500">Loose</span>
-            <div className="flex-1 min-w-0">{looseInput}</div>
-          </div>
-        </div>
-      )}
-      {(touched || canSame || frozen || peers.length > 0) && (
-        <div className={cn("space-y-1", compact ? "mt-1.5" : "mt-2")}>
+      {(canSame || hasExtras) && (
+        <div className="mt-2 space-y-1.5">
           {sameBtn}
-          {touched && side.valid && (
-            <LedgerRow
-              label="Counted"
-              tone="you"
-              value={breakupStr(csNew, side.physCases, side.physLoose)}
-              trailing={<DiffPill diff={side.diff} />}
-            />
-          )}
-          {touched && !side.valid && (
-            <div className="text-[11px] text-rose-600 dark:text-rose-400">Numbers only — for example 5, or 5+1 to add as you find more.</div>
-          )}
-          {!touched && frozen && <div className="text-[11px] italic text-zinc-400">not counted</div>}
-          {touched && side.valid && (onlyCases || onlyLoose) && (
-            <div className="text-[10px] text-zinc-500">{onlyCases ? "loose: 0 — none counted" : "cases: 0 — none counted"}</div>
-          )}
-          {peers.map((p, idx) => <PeerLine key={idx} {...p} />)}
+          {extras}
         </div>
       )}
     </div>
@@ -3280,7 +3346,7 @@ const MyItem = memo(function MyItem({
               <div className="min-w-0">
                 <div className="text-sm font-medium truncate">{i.model}</div>
                 <div className="text-[11px] text-zinc-500 truncate">
-                  {[i.size, i.colour, i.categoryName].filter(Boolean).join(" · ")}
+                  {[i.size, i.colour].filter(Boolean).join(" · ")}
                 </div>
                 <div className="mt-1 empty:hidden"><StatusChip rd={rd} conflict={conflict} /></div>
                 <RowMeta last={last} others={others} conflict={conflict} doneByUser={doneByUser} />
@@ -3340,7 +3406,7 @@ const MyItem = memo(function MyItem({
             {frozen && <DoneBadge />}
           </div>
           <div className="text-xs text-zinc-500 truncate">
-            {[i.size, i.colour, i.categoryName].filter(Boolean).join(" · ")}
+            {[i.size, i.colour].filter(Boolean).join(" · ")}
           </div>
           <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
             {/* Case size — a quiet chip; tap to change it (rare). */}
@@ -3631,7 +3697,7 @@ function ReviewerView({
                   <div className="min-w-0">
                     <div className="text-sm font-medium truncate">{i.model}</div>
                     <div className="text-[11px] text-zinc-500 truncate">
-                      {[i.size, i.colour, i.categoryName].filter(Boolean).join(" · ")}
+                      {[i.size, i.colour].filter(Boolean).join(" · ")}
                     </div>
                   </div>
                 </div>
