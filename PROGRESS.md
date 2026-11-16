@@ -285,6 +285,10 @@ brand tree + brand-only categories, item → brand drop + Undo, brand merge, Add
 chips); `redesign.mjs` 39/39 (one wording expectation updated), `recon.mjs` 16, `recon2.mjs` 12, `txn.mjs` 10 —
 100/100 on the production build in demo mode. HTML drag-and-drop is computer-only; phones use the ⋯ menu.
 
+**Shipped:** commit `c81f5c9`, Actions run 43869602907 green. Live check on the published site in demo mode:
+100/100 (`organise.mjs` 23, `redesign.mjs` 39, `recon.mjs` 16, `recon2.mjs` 12, `txn.mjs` 10). The SQL function was
+applied before the push (the UI calls it only on a re-order).
+
 ### 2026-11-16 (evening) — Redesign: Items + categories rebuilt, system count beside every count box
 
 **User ask (Harsh):** "look into each and every screen … far easier to use, with an easy way to add items …
