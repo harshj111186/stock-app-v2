@@ -8,7 +8,7 @@ import {
 import { Shell } from "@/components/shell";
 import { useAuth } from "@/app/providers";
 import { sb, fetchAllRows, type Item, type Stock, type Txn } from "@/lib/supabase";
-import { fmtN, fmtMoney, matchesQuery, todayISO, csvSafe } from "@/lib/utils";
+import { fmtN, fmtMoney, fmtDate, matchesQuery, todayISO, csvSafe } from "@/lib/utils";
 import { SearchBox } from "@/components/search-box";
 import { useConfirm } from "@/components/confirm-dialog";
 
@@ -220,7 +220,9 @@ export default function TransactionsPage() {
 
   useEffect(() => {
     try {
-      const last = localStorage.getItem("txn.lastAction");
+      // A dashboard quick action (?action=Sale) wins over the remembered tab.
+      const fromUrl = new URLSearchParams(window.location.search).get("action");
+      const last = fromUrl || localStorage.getItem("txn.lastAction");
       if (last && (ALL_ACTIONS as string[]).includes(last)) {
         setF((x) => ({ ...x, action: last as ActionKind }));
       }
@@ -798,6 +800,12 @@ export default function TransactionsPage() {
   };
 
   const queueCount = queue.length;
+  // Ids that already have a reversing entry — looked up per log row.
+  const reversedIds = useMemo(() => {
+    const s = new Set<string>();
+    for (const x of txns) if (x.reverses_id) s.add(x.reverses_id);
+    return s;
+  }, [txns]);
   const errorMap = useMemo(() => {
     const m = new Map<string, string>();
     processErrors.forEach((e) => m.set(e.rowUid, e.message));
@@ -810,7 +818,7 @@ export default function TransactionsPage() {
         <div>
           <h1 className="text-xl sm:text-2xl font-semibold tracking-tight">Transactions</h1>
           <p className="text-sm text-zinc-500 mt-1">
-            {loaded ? `${txns.length} recent entries` : "Loading…"} — batch entry: queue first, then process in safe order so a Sale never fails before its Purchase has landed.
+Add each entry to the list, then save them together — stock only changes when you save.
           </p>
         </div>
       </div>
@@ -850,7 +858,8 @@ export default function TransactionsPage() {
                 title={a}
                 aria-label={a}
                 className={[
-                  "flex-1 flex items-center justify-center gap-1.5 sm:gap-2 py-3 text-xs sm:text-sm border-b-2 transition-colors",
+                  // Phone: icon above the word so all five fit without overlapping.
+                  "flex-1 min-w-0 flex flex-col sm:flex-row items-center justify-center gap-1 sm:gap-2 py-2.5 sm:py-3 text-[11px] sm:text-sm border-b-2 transition-colors",
                   active
                     ? "text-cyan-600 dark:text-cyan-400 border-cyan-500 bg-cyan-500/5"
                     : "text-zinc-600 dark:text-zinc-400 border-transparent hover:bg-zinc-50 dark:hover:bg-zinc-800/40",
@@ -887,13 +896,13 @@ export default function TransactionsPage() {
               <SegBtn
                 value={f.godown}
                 onChange={(v) => setF((x) => ({ ...x, godown: v as "A" | "B" }))}
-                options={[{ v: "A", l: "A" }, { v: "B", l: "B" }]}
+                options={[{ v: "A", l: "Godown A" }, { v: "B", l: "Godown B" }]}
               />
             </div>
           ) : (
             <Fragment>
               <div>
-                <Label>From</Label>
+                <Label>From godown</Label>
                 <SegBtn
                   value={f.godown}
                   onChange={(v) => setF((x) => ({ ...x, godown: v as "A" | "B", to_godown: v === "A" ? "B" : "A" }))}
@@ -901,7 +910,7 @@ export default function TransactionsPage() {
                 />
               </div>
               <div>
-                <Label>To</Label>
+                <Label>To godown</Label>
                 <SegBtn
                   value={f.to_godown}
                   // Picking the same godown as From auto-flips From — a
@@ -957,7 +966,7 @@ export default function TransactionsPage() {
                 placeholder="0"
               />
               <div className="text-xs text-zinc-500 mt-1">
-                Item sold loose only — no case size set.
+                {selectedItem ? "This item is counted in single pieces — no case size is set." : "Pick an item first."}
               </div>
             </div>
           )}
@@ -1080,13 +1089,19 @@ export default function TransactionsPage() {
             </Fragment>
           )}
 
-          <div className="md:col-span-2 flex items-center justify-between pt-2 border-t border-zinc-100 dark:border-zinc-800">
-            <div className="text-xs text-zinc-500">
+          <div className="md:col-span-2 flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-zinc-100 dark:border-zinc-800">
+            <div className="text-xs text-zinc-500 min-w-0">
               {!canWrite
                 ? <span className="text-amber-500">Your role is read-only.</span>
-                : formDirection
-                ? <>All stock math runs in Postgres atomically. <span className="text-zinc-400">Direction:</span> <b className={formDirection === 1 ? "text-emerald-500" : "text-rose-500"}>{formDirection === 1 ? "+1 (in)" : "−1 (out)"}</b></>
-                : "Pick a reason / direction to see the direction."}
+                : !formDirection
+                ? "Pick a reason to see what this will do."
+                : totalQty <= 0
+                ? "Enter a quantity."
+                : f.action === "Transfer"
+                ? <>Moves <b className="text-zinc-700 dark:text-zinc-200 tnum">{fmtN(totalQty)}</b> unit{totalQty === 1 ? "" : "s"} from Godown {f.godown} to Godown {f.to_godown}.</>
+                : formDirection === 1
+                ? <><b className="text-emerald-600 dark:text-emerald-400">Adds</b> <b className="tnum">{fmtN(totalQty)}</b> unit{totalQty === 1 ? "" : "s"} to Godown {f.godown}.</>
+                : <><b className="text-rose-600 dark:text-rose-400">Takes</b> <b className="tnum">{fmtN(totalQty)}</b> unit{totalQty === 1 ? "" : "s"} out of Godown {f.godown}.</>}
             </div>
             <button
               type="button"
@@ -1095,7 +1110,7 @@ export default function TransactionsPage() {
               className="bg-cyan-500 hover:bg-cyan-400 disabled:opacity-40 disabled:cursor-not-allowed text-white px-3.5 py-2 rounded-md text-sm font-medium flex items-center gap-2"
             >
               {adding ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />}
-              Add {f.action} to queue
+              Add {f.action} to list
             </button>
           </div>
         </div>
@@ -1107,9 +1122,9 @@ export default function TransactionsPage() {
           <div className="flex flex-wrap items-center gap-3 px-5 py-3 border-b border-zinc-200 dark:border-zinc-800">
             <ListChecks className="w-4 h-4 text-cyan-500" />
             <div className="flex-1 min-w-[140px]">
-              <div className="text-sm font-medium">Queue · {queueCount} {queueCount === 1 ? "entry" : "entries"}</div>
+              <div className="text-sm font-medium">Not saved yet · {queueCount} {queueCount === 1 ? "entry" : "entries"}</div>
               <div className="text-[11px] text-zinc-500 hidden md:block">
-                Order: <b>Purchase → Adj UP → Customer return → Transfer → Adj DOWN → Sale → Supplier return.</b>
+                Saved in a safe order — stock coming in first, stock going out last.
               </div>
             </div>
             <button
@@ -1126,11 +1141,11 @@ export default function TransactionsPage() {
               onClick={processQueue}
               disabled={processing || !preflight.ok || !canWrite}
               className="bg-emerald-500 hover:bg-emerald-400 disabled:opacity-40 disabled:cursor-not-allowed text-white px-4 py-2 rounded-md text-sm font-medium flex items-center gap-2"
-              title={!preflight.ok ? "Fix pre-flight error first" : "Process all queued entries"}
+              title={!preflight.ok ? "Fix the stock problem shown below first" : "Save every entry in the list to stock"}
             >
               {processing
-                ? <><Loader2 className="w-4 h-4 animate-spin" /> Processing {processIdx + 1}/{queueCount}…</>
-                : <><Play className="w-4 h-4" /> Process queue ({queueCount})</>}
+                ? <><Loader2 className="w-4 h-4 animate-spin" /> Saving {processIdx + 1}/{queueCount}…</>
+                : <><Play className="w-4 h-4" /> Save {queueCount} to stock</>}
             </button>
           </div>
 
@@ -1138,19 +1153,19 @@ export default function TransactionsPage() {
           {!preflight.ok && !processing && (
             <div className="px-5 py-2 bg-rose-500/10 text-rose-700 dark:text-rose-300 text-xs flex items-center gap-2 border-b border-rose-500/20">
               <AlertCircle className="w-3.5 h-3.5 flex-shrink-0" />
-              <span><b>Stock check failed:</b> {preflight.firstError}. Add more stock above this row in the queue, or remove the offending entry.</span>
+              <span><b>Not enough stock:</b> {preflight.firstError}. Add the purchase that brings it in, or remove that entry.</span>
             </div>
           )}
           {preflight.ok && !processing && processErrors.length === 0 && (
             <div className="px-5 py-2 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300 text-xs flex items-center gap-2 border-b border-emerald-500/20">
               <CheckCircle2 className="w-3.5 h-3.5 flex-shrink-0" />
-              <span>All clear. Process will run {queueCount} {queueCount === 1 ? "entry" : "entries"} in the order shown below.</span>
+              <span>Ready. Stock has <b>not</b> changed yet — press <b>Save {queueCount} to stock</b> to record {queueCount === 1 ? "this entry" : "these entries"}.</span>
             </div>
           )}
           {processErrors.length > 0 && !processing && (
             <div className="px-5 py-2 bg-rose-500/10 text-rose-700 dark:text-rose-300 text-xs flex items-center gap-2 border-b border-rose-500/20">
               <AlertCircle className="w-3.5 h-3.5 flex-shrink-0" />
-              <span><b>{processErrors.length} {processErrors.length === 1 ? "entry" : "entries"} failed.</b> Survivors stay in the queue with the error attached — fix and click Process queue again.</span>
+              <span><b>{processErrors.length} {processErrors.length === 1 ? "entry" : "entries"} failed.</b> They stay in the list with the reason shown — fix them and save again.</span>
             </div>
           )}
 
@@ -1216,7 +1231,7 @@ export default function TransactionsPage() {
                         ? <span className="text-emerald-600 dark:text-emerald-400 inline-flex items-center gap-1"><CheckCircle2 className="w-3 h-3" /> done</span>
                         : processing && i === processIdx
                         ? <span className="text-cyan-600 dark:text-cyan-400 inline-flex items-center gap-1"><Loader2 className="w-3 h-3 animate-spin" /> running</span>
-                        : <span className="text-zinc-400">queued</span>}
+                        : <span className="text-zinc-400">waiting</span>}
                     </td>
                     <td className="px-5 py-2.5 text-right">
                       <button
@@ -1224,8 +1239,8 @@ export default function TransactionsPage() {
                         onClick={() => removeFromQueue(t.uid)}
                         disabled={processing}
                         className="text-zinc-400 hover:text-rose-500 disabled:opacity-40 p-1 -m-1"
-                        title="Remove from queue"
-                        aria-label="Remove from queue"
+                        title="Remove from the list"
+                        aria-label="Remove from the list"
                       >
                         <X className="w-4 h-4" />
                       </button>
@@ -1253,7 +1268,7 @@ export default function TransactionsPage() {
                 ? <span className="text-emerald-600 dark:text-emerald-400 inline-flex items-center gap-1"><CheckCircle2 className="w-3 h-3" /> done</span>
                 : processing && i === processIdx
                 ? <span className="text-cyan-600 dark:text-cyan-400 inline-flex items-center gap-1"><Loader2 className="w-3 h-3 animate-spin" /> running</span>
-                : <span className="text-zinc-400">queued</span>;
+                : <span className="text-zinc-400">waiting</span>;
               return (
                 <li key={t.uid} className={[
                   "px-4 py-3",
@@ -1266,7 +1281,7 @@ export default function TransactionsPage() {
                       onClick={() => removeFromQueue(t.uid)}
                       disabled={processing}
                       className="text-zinc-400 hover:text-rose-500 disabled:opacity-40 p-1 -m-1 flex-shrink-0"
-                      aria-label="Remove from queue"
+                      aria-label="Remove from the list"
                     >
                       <X className="w-4 h-4" />
                     </button>
@@ -1392,17 +1407,17 @@ export default function TransactionsPage() {
             )}
             {loaded && visibleTxns.length === 0 && (
               <tr><td colSpan={8} className="py-10 text-center text-sm text-zinc-500">
-                {logFilter || logQuery ? "No transactions match these filters." : "No transactions yet — queue your first entry above."}
+                {logFilter || logQuery ? "No transactions match these filters." : "No transactions yet — add your first entry above."}
               </td></tr>
             )}
             {loaded && visibleTxns.map((t) => {
               const it = itemById.get(t.item_id);
               const isReversal = !!t.reverses_id;
-              const alreadyReversed = txns.some((x) => x.reverses_id === t.id);
+              const alreadyReversed = reversedIds.has(t.id);
               const showDirHint = t.action === "Adjustment" || t.action === "Return" || t.action === "Transfer";
               return (
                 <tr key={t.id} className="border-t border-zinc-100 dark:border-zinc-800/60 hover:bg-zinc-50 dark:hover:bg-zinc-800/30">
-                  <td className="px-5 py-2.5 text-zinc-500 tnum">{(t.txn_date || "").slice(0, 10)}</td>
+                  <td className="px-5 py-2.5 text-zinc-500 tnum whitespace-nowrap">{fmtDate(t.txn_date)}</td>
                   <td className="px-3 py-2.5"><ActionBadge action={t.action} reversal={isReversal} /></td>
                   <td className="px-3 py-2.5">
                     {it ? <span>{it.model} <span className="text-zinc-500">· {it.size} · {it.colour}</span></span> : <span className="text-zinc-500">?</span>}
@@ -1453,21 +1468,21 @@ export default function TransactionsPage() {
           )}
           {loaded && visibleTxns.length === 0 && (
             <div className="py-10 text-center text-sm text-zinc-500">
-              {logFilter || logQuery ? "No transactions match these filters." : "No transactions yet — queue your first entry above."}
+              {logFilter || logQuery ? "No transactions match these filters." : "No transactions yet — add your first entry above."}
             </div>
           )}
           <ul className="divide-y divide-zinc-200/60 dark:divide-zinc-800/60">
             {loaded && visibleTxns.map((t) => {
               const it = itemById.get(t.item_id);
               const isReversal = !!t.reverses_id;
-              const alreadyReversed = txns.some((x) => x.reverses_id === t.id);
+              const alreadyReversed = reversedIds.has(t.id);
               const showDirHint = t.action === "Adjustment" || t.action === "Return" || t.action === "Transfer";
               const note = t.note || t.reason || t.invoice_no || "";
               return (
                 <li key={t.id} className="px-4 py-3">
                   <div className="flex items-center justify-between gap-2 mb-1">
                     <ActionBadge action={t.action} reversal={isReversal} />
-                    <span className="text-[11px] text-zinc-500 tnum">{(t.txn_date || "").slice(0, 10)}</span>
+                    <span className="text-[11px] text-zinc-500 tnum">{fmtDate(t.txn_date)}</span>
                   </div>
                   <div className="text-sm truncate mb-1">
                     {it ? <>{it.model} <span className="text-zinc-500">· {it.size} · {it.colour}</span></> : "?"}

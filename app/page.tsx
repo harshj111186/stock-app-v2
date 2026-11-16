@@ -5,6 +5,7 @@ import Link from "next/link";
 import {
   Boxes, Layers3, IndianRupee, PackageX, TrendingDown, BellRing,
   ChevronRight, Flame, LineChart, AlertOctagon, ArrowUpRight, AlertCircle,
+  ArrowDownToLine, ArrowUpFromLine, ArrowLeftRight, ClipboardCheck,
 } from "lucide-react";
 import { Shell } from "@/components/shell";
 import { useAuth } from "@/app/providers";
@@ -161,6 +162,29 @@ export default function Dashboard() {
         </h1>
         <p className="text-sm text-zinc-500 mt-1">Live snapshot of Rye Electricals — straight from the ledger.</p>
       </div>
+
+      {/* Quick actions — the four everyday jobs, one tap from the home screen. */}
+      {(profile?.role === "admin" || profile?.role === "staff") && (
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5 mb-5 md:mb-6">
+          {[
+            { href: "/transactions?action=Sale", label: "Record a sale", hint: "Stock going out", icon: ArrowUpFromLine },
+            { href: "/transactions?action=Purchase", label: "Record a purchase", hint: "Stock coming in", icon: ArrowDownToLine },
+            { href: "/transactions?action=Transfer", label: "Move stock", hint: "Between godowns", icon: ArrowLeftRight },
+            { href: "/reconciliation", label: "Count stock", hint: "Check shelf vs system", icon: ClipboardCheck },
+          ].map((a) => (
+            <Link key={a.href} href={a.href}
+              className="group flex items-center gap-3 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 px-3.5 py-3 min-h-[60px] hover:border-cyan-400 dark:hover:border-cyan-500/60 active:bg-zinc-50 dark:active:bg-zinc-800 transition-colors">
+              <span className="flex-shrink-0 w-9 h-9 rounded-lg bg-cyan-500/10 text-cyan-600 dark:text-cyan-400 inline-flex items-center justify-center">
+                <a.icon className="w-4 h-4" />
+              </span>
+              <span className="min-w-0">
+                <span className="block text-sm font-medium leading-tight truncate">{a.label}</span>
+                <span className="block text-[11px] text-zinc-500 leading-tight mt-0.5 truncate">{a.hint}</span>
+              </span>
+            </Link>
+          ))}
+        </div>
+      )}
 
       {data.error && (
         <div className="mb-4 text-sm text-rose-600 dark:text-rose-300 bg-rose-500/10 border border-rose-500/30 rounded-md p-2.5 flex items-start gap-2">

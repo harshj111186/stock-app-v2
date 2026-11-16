@@ -208,7 +208,12 @@ export function Providers({ children }: { children: ReactNode }) {
 
   // Public demo mode: render the app directly with a mock admin profile, past
   // all auth/PIN gates. Data comes from the mock client (no real DB).
-  if (isDemo()) {
+  // `!loading` matters: the very first client render must match the static
+  // HTML (which was built with loading=true → the spinner). Deciding "demo"
+  // during that first render made React throw away and rebuild the whole page
+  // (hydration error #418) on every demo visit; the bootstrap effect above
+  // flips `loading` off immediately for demo, so this costs one frame.
+  if (!loading && isDemo()) {
     const demoSignOut = async () => {
       exitDemo();
       window.location.assign(process.env.NODE_ENV === "production" ? "/stock-app-v2/login" : "/login");
@@ -218,7 +223,7 @@ export function Providers({ children }: { children: ReactNode }) {
         {children}
         <DemoHowItWorks />
         {/* bottom-20 on mobile clears the 56px tab bar (it used to sit on top of it) */}
-        <div className="fixed bottom-20 md:bottom-3 left-1/2 -translate-x-1/2 z-[9999] flex items-center gap-2.5 rounded-full border border-amber-400/50 bg-amber-500/15 backdrop-blur px-3.5 py-1.5 text-xs text-amber-700 dark:text-amber-200 shadow-lg">
+        <div className="fixed bottom-20 md:bottom-3 left-1/2 -translate-x-1/2 z-[9999] flex items-center gap-2.5 whitespace-nowrap rounded-full border border-amber-400/50 bg-amber-500/15 backdrop-blur px-3.5 py-1.5 text-xs text-amber-700 dark:text-amber-200 shadow-lg">
           <span className="inline-flex items-center gap-1.5"><span className="w-1.5 h-1.5 rounded-full bg-amber-500" />Demo mode · sample data</span>
           <button onClick={() => { try { window.dispatchEvent(new Event("demo:hiw")); } catch {} }} className="font-medium underline underline-offset-2 hover:text-amber-900 dark:hover:text-amber-100">How it works</button>
           <button onClick={demoSignOut} className="font-medium underline underline-offset-2 hover:text-amber-900 dark:hover:text-amber-100">Exit</button>

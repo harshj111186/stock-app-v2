@@ -1,10 +1,10 @@
 "use client";
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Printer, ClipboardCheck, CheckCircle2, AlertCircle,
-  RotateCcw, Loader2, Filter, Eye, EyeOff, Users, ShieldCheck,
+  RotateCcw, Loader2, Filter, Eye, Users, ShieldCheck,
   UserCircle2, Clock, Lock, LockOpen, CheckCheck, AlertTriangle, UserPlus,
-  Minus, Plus, History, Download, X, Eraser,
+  Minus, Plus, History, Download, X, Eraser, Equal, Pencil, ChevronDown, ListChecks,
 } from "lucide-react";
 import { Shell } from "@/components/shell";
 import { sb, fetchAllRows, type Item } from "@/lib/supabase";
@@ -73,6 +73,10 @@ const FIELDS_RAW: Record<Field, keyof Pick<DBDraft, "case_size_raw" | "a_cases_r
 };
 
 type LastReconciled = { at: string; userName: string | null };
+
+// My-count quick filters (chips): everything · not counted yet · counted ·
+// counted but different from the system · disagrees with another counter.
+type MyFilter = "all" | "todo" | "counted" | "differs" | "conflicts";
 
 // ─── helpers ─────────────────────────────────────────────────────────────
 function parseExpr(raw: string): number | null {
@@ -178,12 +182,15 @@ function SysChip({ label = "SYS", children, className }: { label?: string; child
 
 // The single coloured signal — render ONLY when a side was counted & valid.
 function DiffPill({ diff }: { diff: number }) {
+  // Green is reserved for "matches". Extra stock is still a difference to
+  // explain (amber); missing stock is the loud one (rose).
   const cls = diff === 0
-    ? "bg-zinc-100 dark:bg-zinc-800 text-zinc-500 dark:text-zinc-400"
+    ? "bg-emerald-500/15 text-emerald-700 dark:text-emerald-300"
     : diff > 0
-      ? "bg-emerald-500/15 text-emerald-700 dark:text-emerald-300"
+      ? "bg-amber-500/15 text-amber-700 dark:text-amber-300"
       : "bg-rose-500/15 text-rose-700 dark:text-rose-300";
-  const txt = diff === 0 ? "In balance" : `${diff > 0 ? "+" : "−"}${fmtN(Math.abs(diff))} pcs`;
+  // Plain words — "2 short" / "5 extra" read faster than a signed number.
+  const txt = diff === 0 ? "Matches" : `${fmtN(Math.abs(diff))} ${diff > 0 ? "extra" : "short"}`;
   return <span className={cn("inline-flex items-center rounded-full px-2 py-0.5 text-xs font-semibold tabular-nums whitespace-nowrap", cls)}>{txt}</span>;
 }
 
@@ -201,8 +208,8 @@ function LedgerRow({ label, value, tone = "ref", trailing }: { label: string; va
   return (
     <div className="flex items-baseline justify-between gap-2">
       <span className="text-[10px] uppercase tracking-wide text-zinc-500 flex-shrink-0">{label}</span>
-      <span className="flex items-baseline gap-2 min-w-0 justify-end">
-        <span className={cn("text-[11px] tabular-nums", tone === "you" ? "font-medium text-zinc-800 dark:text-zinc-100" : "text-zinc-500 dark:text-zinc-400")}>{value}</span>
+      <span className="flex flex-wrap items-baseline gap-x-2 gap-y-1 min-w-0 justify-end">
+        <span className={cn("text-[11px] tabular-nums whitespace-nowrap", tone === "you" ? "font-medium text-zinc-800 dark:text-zinc-100" : "text-zinc-500 dark:text-zinc-400")}>{value}</span>
         {trailing}
       </span>
     </div>
@@ -300,9 +307,12 @@ export default function ReconciliationPage() {
   const [q, setQ] = useState("");
   const [brand, setBrand] = useState("");
   const [cat, setCat] = useState("");
-  const [showOnlyChanged, setShowOnlyChanged] = useState(false);
-  // Reviewer-only: collapse the list to items that currently have a conflict.
-  const [conflictsOnly, setConflictsOnly] = useState(false);
+  // My-count quick filter (the chips under the search box). The matching item
+  // ids are SNAPSHOTTED when a chip is tapped — a live filter would yank a row
+  // out from under the counter mid-typing (an item stops being "to count" on
+  // its first keystroke). Tapping the same chip again re-takes the snapshot.
+  const [myFilter, setMyFilter] = useState<MyFilter>("all");
+  const [pinnedIds, setPinnedIds] = useState<Set<string> | null>(null);
 
   // Commit + toast state
   const [processing, setProcessing] = useState(false);
@@ -1152,34 +1162,25 @@ export default function ReconciliationPage() {
     return itemsEnriched.filter(i => {
       if (brand && i.brand !== brand) return false;
       if (cat && i.categoryName !== cat) return false;
-      if (showOnlyChanged) {
-        const drs = draftsByItem.get(i.id) || [];
-        if (mode === "my") {
-          // Only my drafts on this item
-          const mine = drs.find(d => d.user_id === profile?.id);
-          if (!mine || isDraftEmpty(mine)) return false;
-        } else {
-          if (drs.length === 0) return false;
-        }
-      }
-      // "Conflicts only" — My-count toggle. Scoped to My mode: the toggle is
-      // hidden in Reviewer (the two-step wizard drives that list), and the
-      // reviewer step memos derive from `filtered`, so a stale conflictsOnly=true
-      // left on from My count would otherwise silently empty Step 2.
-      if (conflictsOnly && mode === "my") {
-        const drs = draftsByItem.get(i.id) || [];
-        if (!computeItemConflict(i, drs).any) return false;
-      }
+      // The chips are My-count only: the Reviewer's two-step wizard drives its
+      // own list (its step memos derive from `filtered`), so a chip left on
+      // must never silently empty Step 1 / Step 2.
+      if (mode === "my" && myFilter !== "all" && pinnedIds && !pinnedIds.has(i.id)) return false;
       const hay = `${i.brand || ""} ${i.model} ${i.size} ${i.colour} ${i.categoryName || ""} ${i.subcategory || ""} ${i.item_code}`;
       if (!matchesQuery(hay, q)) return false;
       return true;
     });
-  }, [itemsEnriched, q, brand, cat, showOnlyChanged, conflictsOnly, draftsByItem, mode, profile?.id, computeItemConflict]);
+  }, [itemsEnriched, q, brand, cat, mode, myFilter, pinnedIds]);
 
   // ─── derived: header stats ─────────────────────────────────────────────
   const stats = useMemo(() => {
     let myStaged = 0, anyStaged = 0, conflicts = 0, invalid = 0;
+    let myShortPcs = 0, myExtraPcs = 0;
     const usersWithDrafts = new Set<string>();
+    // Item ids per My-count chip — the chip counts AND the snapshot a tap pins.
+    const ids: Record<Exclude<MyFilter, "all">, Set<string>> = {
+      todo: new Set(), counted: new Set(), differs: new Set(), conflicts: new Set(),
+    };
     items.forEach(i => {
       const app = appStock.get(i.id);
       if (!app) return;
@@ -1187,14 +1188,24 @@ export default function ReconciliationPage() {
       if (drs.length > 0) anyStaged++;
       drs.forEach(d => usersWithDrafts.add(d.user_id));
       const mine = drs.find(d => d.user_id === profile?.id);
-      if (mine && !isDraftEmpty(mine)) myStaged++;
+      if (mine && !isDraftEmpty(mine)) {
+        myStaged++;
+        ids.counted.add(i.id);
+        const rd = computeDiff(i, app, mine);
+        if (!rd.invalid && (rd.A.diff !== 0 || rd.B.diff !== 0)) {
+          ids.differs.add(i.id);
+          for (const d of [rd.A.diff, rd.B.diff]) { if (d < 0) myShortPcs += -d; else myExtraPcs += d; }
+        }
+      } else {
+        ids.todo.add(i.id);
+      }
       // Count invalid PER ITEM (any counter's entry not a valid number → +1),
       // consistent with conflicts/staged which are also per item.
       if (drs.some(d => computeDiff(i, app, d).invalid)) invalid++;
       const c = computeItemConflict(i, drs);
-      if (c.any) conflicts++;
+      if (c.any) { conflicts++; ids.conflicts.add(i.id); }
     });
-    return { myStaged, anyStaged, conflicts, invalid, usersWithDrafts };
+    return { myStaged, anyStaged, conflicts, invalid, usersWithDrafts, ids, myShortPcs, myExtraPcs };
   }, [items, appStock, draftsByItem, computeDiff, computeItemConflict, profile?.id]);
 
   // ─── Reviewer two-step wizard: the two item lists ───────────────────────
@@ -1211,18 +1222,59 @@ export default function ReconciliationPage() {
   // to push to stock). Excludes conflicts (handled in Step 1) and no-change /
   // invalid items (nothing to adjust). Uses mergeAgreed so the list matches
   // exactly what "Make adjustments" would commit.
-  const reviewerStep2Items = useMemo(() => {
-    if (!isAdmin) return [];
-    return filtered.filter(i => {
+  // Ids shown on Step 2 during THIS visit to the step. An item the reviewer
+  // edits until it equals the system (or passes through a matching value while
+  // typing, e.g. "1" on the way to "12") must stay on screen — a card that
+  // vanishes under the cursor is worse than one that now reads "Matches".
+  const step2Seen = useRef<Set<string>>(new Set());
+  const reviewerStep2 = useMemo(() => {
+    if (!isAdmin) return { list: [] as typeof filtered, differ: 0 };
+    let differ = 0;
+    const list = filtered.filter(i => {
       const app = appStock.get(i.id);
       if (!app) return false;
       const nonEmpty = (draftsByItem.get(i.id) || []).filter(d => !isDraftEmpty(d));
       if (nonEmpty.length === 0) return false;
       if (computeItemConflict(i, nonEmpty).any) return false;
       const rd = computeDiff(i, app, mergeAgreed(emptyDraft, nonEmpty, i.id));
-      return rd.hasAnyChange && !rd.invalid;
+      if (!rd.hasAnyChange || rd.invalid) return false;
+      // Only what actually differs. A count that equals the system needs no
+      // decision (it used to be listed here under "differs from system");
+      // those are summarised in `step2Summary` and still close out on commit.
+      if (rd.A.diff !== 0 || rd.B.diff !== 0 || rd.caseSizeChanged) { differ++; return true; }
+      return step2Seen.current.has(i.id);
     });
-  }, [isAdmin, filtered, appStock, draftsByItem, computeItemConflict, computeDiff, emptyDraft]);
+    return { list, differ };
+    // mode / reviewerStep are deps so the list is rebuilt (without the kept
+    // matches) each time the reviewer comes back to the step.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isAdmin, filtered, appStock, draftsByItem, computeItemConflict, computeDiff, emptyDraft, mode, reviewerStep]);
+  const reviewerStep2Items = reviewerStep2.list;
+  useEffect(() => {
+    if (mode === "reviewer" && reviewerStep === 2) {
+      for (const i of reviewerStep2Items) step2Seen.current.add(i.id);
+    } else {
+      step2Seen.current.clear();
+    }
+  }, [mode, reviewerStep, reviewerStep2Items]);
+
+  // Step 2 at a glance: how many agreed counts simply match the system, and
+  // the total pieces short / extra across the ones that don't.
+  const step2Summary = useMemo(() => {
+    let matching = 0, shortPcs = 0, extraPcs = 0;
+    if (!isAdmin) return { matching, shortPcs, extraPcs };
+    for (const i of items) {
+      const app = appStock.get(i.id);
+      if (!app) continue;
+      const nonEmpty = (draftsByItem.get(i.id) || []).filter(d => !isDraftEmpty(d));
+      if (nonEmpty.length === 0 || computeItemConflict(i, nonEmpty).any) continue;
+      const rd = computeDiff(i, app, mergeAgreed(emptyDraft, nonEmpty, i.id));
+      if (rd.invalid || !rd.hasAnyChange) continue;
+      if (rd.A.diff === 0 && rd.B.diff === 0 && !rd.caseSizeChanged) { matching++; continue; }
+      for (const d of [rd.A.diff, rd.B.diff]) { if (d < 0) shortPcs += -d; else extraPcs += d; }
+    }
+    return { matching, shortPcs, extraPcs };
+  }, [isAdmin, items, appStock, draftsByItem, computeItemConflict, computeDiff, emptyDraft]);
 
   const reviewerListItems = reviewerStep === 1 ? reviewerStep1Items : reviewerStep2Items;
 
@@ -1845,6 +1897,50 @@ export default function ReconciliationPage() {
     if (success) showToast("ok", isMe ? "Your count is cleared." : `${name}'s count is cleared${wasDone ? " and unfrozen" : ""}.`);
   }, [clearingUid, processing, applyingItemId, profile?.id, doneByUser, confirm, clearAllForUser]);
 
+  // ─── My-count chips ─────────────────────────────────────────────────────
+  // Tapping a chip pins the items that match RIGHT NOW (see `pinnedIds`).
+  const pickMyFilter = (f: MyFilter) => {
+    setMyFilter(f);
+    setPinnedIds(f === "all" ? null : new Set(stats.ids[f]));
+  };
+  // The pinned list no longer equals the live one (the counter has typed
+  // since) → offer "Refresh list" instead of silently reshuffling rows.
+  const listStale = useMemo(() => {
+    if (myFilter === "all" || !pinnedIds) return false;
+    const live = stats.ids[myFilter];
+    if (live.size !== pinnedIds.size) return true;
+    for (const id of live) if (!pinnedIds.has(id)) return true;
+    return false;
+  }, [myFilter, pinnedIds, stats.ids]);
+
+  // Stable identity for the memoised rows (the inline arrow re-created this on
+  // every render, which would defeat the memo); the ref keeps it current.
+  const resetMyRowImpl = (itemId: string) => {
+    if (!profile?.id || !canCount) return;
+    void (async () => {
+      const ok = await confirm({
+        title: "Clear this item's count?",
+        body: "Your entered values for this item are deleted. This can't be undone.",
+        danger: true,
+        confirmLabel: "Clear",
+      });
+      if (ok && profile?.id) void deleteDraft(profile.id, itemId);
+    })();
+  };
+  const resetMyRowRef = useRef(resetMyRowImpl);
+  resetMyRowRef.current = resetMyRowImpl;
+  const resetMyRow = useCallback((itemId: string) => resetMyRowRef.current(itemId), []);
+  const noopSetField = useCallback(() => {}, []);
+
+  // "How it works" strip — shown until dismissed on this device.
+  const [guideHidden, setGuideHidden] = useState<boolean>(() => {
+    try { return localStorage.getItem("recon.guideHidden") === "1"; } catch { return false; }
+  });
+  const hideGuide = () => {
+    setGuideHidden(true);
+    try { localStorage.setItem("recon.guideHidden", "1"); } catch {}
+  };
+
   // ─── render ────────────────────────────────────────────────────────────
   return (
     <Shell title="Reconciliation">
@@ -1853,6 +1949,7 @@ export default function ReconciliationPage() {
           loaded={loaded}
           totalItems={items.length}
           mode={mode}
+          setMode={setMode}
           isAdmin={isAdmin}
           stats={stats}
         />
@@ -1861,12 +1958,14 @@ export default function ReconciliationPage() {
           q={q} setQ={setQ}
           brand={brand} setBrand={setBrand}
           cat={cat} setCat={setCat}
-          showOnlyChanged={showOnlyChanged} setShowOnlyChanged={setShowOnlyChanged}
-          conflictsOnly={conflictsOnly} setConflictsOnly={setConflictsOnly}
-          conflictCount={stats.conflicts}
           brands={brands} cats={cats}
+          totalItems={items.length}
+          myFilter={myFilter} onMyFilter={pickMyFilter}
+          counts={{ todo: stats.ids.todo.size, counted: stats.ids.counted.size, differs: stats.ids.differs.size, conflicts: stats.ids.conflicts.size }}
+          listStale={listStale}
+          shortPcs={stats.myShortPcs} extraPcs={stats.myExtraPcs}
           shownCount={mode === "reviewer" ? reviewerListItems.length : filtered.length}
-          mode={mode} setMode={setMode} isAdmin={isAdmin}
+          mode={mode} isAdmin={isAdmin}
           reviewerStep={reviewerStep}
           usersWithDrafts={stats.usersWithDrafts.size}
           myDone={myDone}
@@ -1886,6 +1985,10 @@ export default function ReconciliationPage() {
           processing={processing}
           progress={progress}
         />
+
+        {loaded && !guideHidden && canCount && mode === "my" && (
+          <GuideStrip isAdmin={isAdmin} onHide={hideGuide} />
+        )}
 
         {mode === "my" && myDone && (
           <div className="mb-4 flex items-center gap-3 rounded-lg border border-emerald-500/40 bg-emerald-500/10 px-4 py-2.5">
@@ -1920,7 +2023,8 @@ export default function ReconciliationPage() {
             step={reviewerStep}
             setStep={setReviewerStep}
             conflicts={stats.conflicts}
-            step2Count={reviewerStep2Items.length}
+            step2Count={reviewerStep2.differ}
+            summary={step2Summary}
           />
         )}
 
@@ -1928,7 +2032,11 @@ export default function ReconciliationPage() {
           <SkeletonBody />
         ) : mode === "my" ? (
           filtered.length === 0 ? (
-            <EmptyState clearFilters={() => { setQ(""); setBrand(""); setCat(""); setShowOnlyChanged(false); setConflictsOnly(false); }} />
+            <EmptyState
+              myFilter={myFilter}
+              hasSearch={!!(q || brand || cat)}
+              clearFilters={() => { setQ(""); setBrand(""); setCat(""); pickMyFilter("all"); }}
+            />
           ) : (
           <MyView
             items={filtered}
@@ -1940,20 +2048,9 @@ export default function ReconciliationPage() {
             // so don't render live inputs that can't save.
             frozen={myDone || !canCount}
             computeDiff={computeDiff}
-            setField={canCount ? setField : () => {}}
+            setField={canCount ? setField : noopSetField}
             commitRow={commitRow}
-            resetMyRow={(itemId) => {
-              if (!profile?.id || !canCount) return;
-              void (async () => {
-                const ok = await confirm({
-                  title: "Reset this item's count?",
-                  body: "Your entered values for this item are deleted. This can't be undone.",
-                  danger: true,
-                  confirmLabel: "Reset",
-                });
-                if (ok && profile?.id) void deleteDraft(profile.id, itemId);
-              })();
-            }}
+            resetMyRow={resetMyRow}
             errorsByItem={errorsByItem(errors)}
             otherUsersByItem={(itemId) => {
               const drs = draftsByItem.get(itemId) || [];
@@ -1973,6 +2070,7 @@ export default function ReconciliationPage() {
             items={reviewerListItems}
             step={reviewerStep}
             totalConflicts={stats.conflicts}
+            matchingCount={step2Summary.matching}
             hasActiveFilters={!!(q || brand || cat)}
             clearFilters={() => { setQ(""); setBrand(""); setCat(""); }}
             onGotoStep={setReviewerStep}
@@ -2004,6 +2102,51 @@ export default function ReconciliationPage() {
             applyingItemId={applyingItemId}
             errorsByItem={errorsByItem(errors)}
           />
+        )}
+
+        {/* The "what next" card at the END of the list — on a phone the
+            toolbar's Done button has long scrolled away by the time the
+            counter reaches the last item. */}
+        {loaded && mode === "my" && canCount && filtered.length > 0 && (
+          <div className="mt-4 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-4 flex flex-wrap items-center gap-3">
+            <div className="flex-1 min-w-[200px]">
+              <div className="text-sm font-medium">
+                {myDone
+                  ? "Your count is marked done"
+                  : stats.ids.todo.size === 0
+                    ? "Every item is counted"
+                    : `${fmtN(stats.ids.counted.size)} of ${fmtN(items.length)} items counted · ${fmtN(stats.ids.todo.size)} to go`}
+              </div>
+              <div className="text-xs text-zinc-500 mt-0.5">
+                {myDone
+                  ? (isAdmin ? "Open Reviewer to compare the counts and update the stock." : "The admin can now review it. Tap Resume editing if you find more.")
+                  : "Finished? Mark your count done so it can be reviewed. Anything you left blank is then read as “none found”."}
+              </div>
+            </div>
+            {!myDone && stats.ids.todo.size > 0 && myFilter !== "todo" && (
+              <button type="button" onClick={() => { pickMyFilter("todo"); window.scrollTo({ top: 0 }); document.querySelector("main > div.flex-1")?.scrollTo({ top: 0 }); }}
+                className="inline-flex items-center gap-1.5 rounded-md px-3 min-h-10 text-sm border border-zinc-200 dark:border-zinc-700 text-zinc-700 dark:text-zinc-200 hover:border-zinc-300 dark:hover:border-zinc-600">
+                <ListChecks className="w-4 h-4" /> Show what&apos;s left
+              </button>
+            )}
+            {myDone && isAdmin ? (
+              <button type="button" onClick={() => setMode("reviewer")}
+                className="inline-flex items-center gap-1.5 rounded-md px-3.5 min-h-10 text-sm font-medium bg-cyan-500 hover:bg-cyan-400 text-white">
+                <ShieldCheck className="w-4 h-4" /> Open Reviewer
+              </button>
+            ) : (
+              <button type="button" onClick={toggleDone} disabled={doneSaving}
+                className={cn(
+                  "inline-flex items-center gap-1.5 rounded-md px-3.5 min-h-10 text-sm font-medium disabled:opacity-60",
+                  myDone
+                    ? "border border-emerald-500/50 text-emerald-700 dark:text-emerald-300 hover:bg-emerald-500/10"
+                    : "bg-emerald-600 hover:bg-emerald-500 text-white"
+                )}>
+                {doneSaving ? <Loader2 className="w-4 h-4 animate-spin" /> : myDone ? <LockOpen className="w-4 h-4" /> : <CheckCheck className="w-4 h-4" />}
+                {myDone ? "Resume editing" : "Mark my count done"}
+              </button>
+            )}
+          </div>
         )}
 
         <HintCard isAdmin={isAdmin} mode={mode} />
@@ -2267,8 +2410,7 @@ export default function ReconciliationPage() {
         q && `search “${q}”`,
         brand && `brand ${brand}`,
         cat && `category ${cat}`,
-        showOnlyChanged && "only staged",
-        conflictsOnly && "conflicts only",
+        mode === "my" && myFilter !== "all" && ({ todo: "not counted yet", counted: "counted", differs: "differs from system", conflicts: "conflicts" } as const)[myFilter],
       ].filter(Boolean) as string[]} />
     </Shell>
   );
@@ -2290,44 +2432,71 @@ function errorsByItem(errors: Array<{ itemId: string; godown?: "A" | "B"; messag
 
 // ─── header ──────────────────────────────────────────────────────────────
 function Header({
-  loaded, totalItems, mode, isAdmin, stats,
+  loaded, totalItems, mode, setMode, isAdmin, stats,
 }: {
   loaded: boolean;
   totalItems: number;
   mode: "my" | "reviewer";
+  setMode: (m: "my" | "reviewer") => void;
   isAdmin: boolean;
   stats: { myStaged: number; anyStaged: number; conflicts: number; invalid: number; usersWithDrafts: Set<string> };
 }) {
+  const conflicts = stats.conflicts;
   return (
-    <div className="mb-6">
-      <div className="flex items-center gap-3 mb-1">
+    <div className="mb-4">
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-2 mb-1.5">
         <h1 className="text-xl sm:text-2xl font-semibold tracking-tight">Reconciliation</h1>
-        <span className={cn(
-          "px-2 py-0.5 rounded text-[10px] uppercase tracking-wider font-medium",
-          isAdmin && mode === "reviewer"
-            ? "bg-violet-500/15 text-violet-700 dark:text-violet-300"
-            : "bg-cyan-500/15 text-cyan-700 dark:text-cyan-300"
-        )}>
-          {isAdmin && mode === "reviewer" ? "Reviewer" : "My count"}
-        </span>
+        {isAdmin ? (
+          <div className="inline-flex bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-md overflow-hidden">
+            <button
+              type="button"
+              onClick={() => setMode("my")}
+              className={cn(
+                "inline-flex items-center gap-1.5 px-3 py-1.5 min-h-9 text-sm",
+                mode === "my"
+                  ? "bg-cyan-500/15 text-cyan-700 dark:text-cyan-300 font-medium"
+                  : "text-zinc-600 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800"
+              )}
+              aria-pressed={mode === "my"}
+            >
+              <UserCircle2 className="w-3.5 h-3.5" /> My count
+            </button>
+            <button
+              type="button"
+              onClick={() => setMode("reviewer")}
+              className={cn(
+                "inline-flex items-center gap-1.5 px-3 py-1.5 min-h-9 text-sm border-l border-zinc-200 dark:border-zinc-800",
+                mode === "reviewer"
+                  ? "bg-violet-500/15 text-violet-700 dark:text-violet-300 font-medium"
+                  : "text-zinc-600 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800"
+              )}
+              aria-pressed={mode === "reviewer"}
+              title="Compare everyone's counts, then update the stock"
+            >
+              <ShieldCheck className="w-3.5 h-3.5" /> Reviewer
+              {conflicts > 0 && (
+                <span className="px-1.5 rounded-full bg-rose-500 text-white text-[10px] font-semibold tabular-nums">{conflicts}</span>
+              )}
+            </button>
+          </div>
+        ) : (
+          <span className="px-2 py-0.5 rounded text-[10px] uppercase tracking-wider font-medium bg-cyan-500/15 text-cyan-700 dark:text-cyan-300">My count</span>
+        )}
       </div>
       <p className="text-sm text-zinc-500 tabular-nums">
-        {!loaded ? "Loading…" : (
+        {!loaded ? "Loading…" : mode === "my" ? (
+          <>
+            Count what is physically on the shelf — the app compares it with the system for you.
+            {stats.invalid > 0 && (
+              <> · <span className="text-rose-600 dark:text-rose-400 font-medium" title="an entry isn't a valid number yet">{fmtN(stats.invalid)} need{stats.invalid === 1 ? "s" : ""} fixing</span></>
+            )}
+          </>
+        ) : (
           <>
             {fmtN(totalItems)} items ·{" "}
-            {mode === "my" ? (
-              <>
-                <span className={stats.myStaged ? "text-amber-600 dark:text-amber-400 font-medium" : ""}>
-                  {fmtN(stats.myStaged)} in my draft
-                </span>
-              </>
-            ) : (
-              <>
-                <span className={stats.anyStaged ? "text-amber-600 dark:text-amber-400 font-medium" : ""}>
-                  {fmtN(stats.anyStaged)} item{stats.anyStaged === 1 ? "" : "s"} staged across {stats.usersWithDrafts.size} user{stats.usersWithDrafts.size === 1 ? "" : "s"}
-                </span>
-              </>
-            )}
+            <span className={stats.anyStaged ? "text-amber-600 dark:text-amber-400 font-medium" : ""}>
+              {fmtN(stats.anyStaged)} counted by {stats.usersWithDrafts.size} {stats.usersWithDrafts.size === 1 ? "person" : "people"}
+            </span>
             {stats.conflicts > 0 && (
               <> · <span className="text-rose-600 dark:text-rose-400 font-medium">{fmtN(stats.conflicts)} conflict{stats.conflicts === 1 ? "" : "s"}</span></>
             )}
@@ -2342,239 +2511,255 @@ function Header({
 }
 
 // ─── toolbar ─────────────────────────────────────────────────────────────
+// One My-count filter chip. `count` updates live; the LIST only changes when
+// a chip is tapped (see the snapshot note beside `pinnedIds`).
+function FilterChip({
+  label, count, active, tone = "zinc", onClick,
+}: {
+  label: string; count: number; active: boolean;
+  tone?: "zinc" | "emerald" | "amber" | "rose";
+  onClick: () => void;
+}) {
+  const on = {
+    zinc: "bg-cyan-500/15 border-cyan-500/50 text-cyan-700 dark:text-cyan-300",
+    emerald: "bg-emerald-500/15 border-emerald-500/50 text-emerald-700 dark:text-emerald-300",
+    amber: "bg-amber-500/15 border-amber-500/50 text-amber-700 dark:text-amber-300",
+    rose: "bg-rose-500/15 border-rose-500/50 text-rose-700 dark:text-rose-300",
+  }[tone];
+  const dot = { zinc: "bg-zinc-400", emerald: "bg-emerald-500", amber: "bg-amber-500", rose: "bg-rose-500" }[tone];
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-pressed={active}
+      className={cn(
+        "flex-shrink-0 inline-flex items-center gap-1.5 rounded-full border px-3 min-h-9 text-[13px] transition-colors whitespace-nowrap",
+        active
+          ? on + " font-medium"
+          : "bg-white dark:bg-zinc-900 border-zinc-200 dark:border-zinc-800 text-zinc-600 dark:text-zinc-300 hover:border-zinc-300 dark:hover:border-zinc-700"
+      )}
+    >
+      <span className={cn("w-1.5 h-1.5 rounded-full", dot)} />
+      {label}
+      <span className="tabular-nums font-semibold">{fmtN(count)}</span>
+    </button>
+  );
+}
+
 function Toolbar({
   q, setQ, brand, setBrand, cat, setCat,
-  showOnlyChanged, setShowOnlyChanged,
-  conflictsOnly, setConflictsOnly, conflictCount,
   brands, cats, shownCount,
-  mode, setMode, isAdmin, reviewerStep, usersWithDrafts,
+  mode, isAdmin, reviewerStep, usersWithDrafts,
   myDone, canCount, onToggleDone, doneSaving,
   myStaged, onClearMine, onCounters,
   onPrint, onHistory, onCommit, canCommit, processing, progress,
+  totalItems, myFilter, onMyFilter, counts, listStale, shortPcs, extraPcs,
 }: {
   q: string; setQ: (s: string) => void;
   brand: string; setBrand: (s: string) => void;
   cat: string; setCat: (s: string) => void;
-  showOnlyChanged: boolean; setShowOnlyChanged: (b: boolean) => void;
-  conflictsOnly: boolean; setConflictsOnly: (b: boolean) => void;
-  conflictCount: number;
   brands: string[]; cats: string[]; shownCount: number;
-  mode: "my" | "reviewer"; setMode: (m: "my" | "reviewer") => void;
+  mode: "my" | "reviewer";
   isAdmin: boolean; reviewerStep: 1 | 2; usersWithDrafts: number;
   myDone: boolean; canCount: boolean; onToggleDone: () => void; doneSaving: boolean;
   myStaged: number; onClearMine: () => void; onCounters: () => void;
   onPrint: () => void; onHistory: () => void; onCommit: () => void;
   canCommit: boolean; processing: boolean;
   progress: { done: number; total: number };
+  totalItems: number;
+  myFilter: MyFilter; onMyFilter: (f: MyFilter) => void;
+  counts: { todo: number; counted: number; differs: number; conflicts: number };
+  listStale: boolean; shortPcs: number; extraPcs: number;
 }) {
   const [filtersOpen, setFiltersOpen] = useState(false);
-  return (
-    // Sticky so the search + filters stay reachable while scrolling the
-    // long item list. Negative margins let the background span the full
-    // content width; px puts the padding back.
-    <div className="space-y-2 mb-4 sticky top-0 z-20 -mx-4 sm:-mx-6 md:-mx-8 px-4 sm:px-6 md:px-8 pt-1 pb-2.5 bg-zinc-50 dark:bg-zinc-950 border-b border-zinc-200/70 dark:border-zinc-800/70">
-      <div className="flex flex-wrap gap-2 items-center">
-        <SearchBox
-          value={q}
-          onChange={setQ}
-          placeholder="Search — brand, model, colour, size…"
-          className="flex-1 min-w-[180px]"
-        />
+  const [moreOpen, setMoreOpen] = useState(false);
+  const pct = totalItems > 0 ? Math.round((counts.counted / totalItems) * 100) : 0;
 
-        {/* Mobile: filters live in a sheet */}
-        <FilterButton activeCount={(brand ? 1 : 0) + (cat ? 1 : 0) + (showOnlyChanged ? 1 : 0)} onClick={() => setFiltersOpen(true)} />
+  const plainBtn = "inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 min-h-9 text-sm bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 text-zinc-700 dark:text-zinc-200 hover:border-zinc-300 dark:hover:border-zinc-700 transition-colors";
+  const showClear = mode === "my" && canCount && !myDone && myStaged > 0;
+  const countersLabel = `${usersWithDrafts} ${usersWithDrafts === 1 ? "person" : "people"} counting`;
 
-        {/* Desktop: inline filters */}
-        <div className="hidden md:flex md:items-center md:gap-2">
-          <select value={brand} onChange={(e) => setBrand(e.target.value)} aria-label="Filter by brand"
-            className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-md px-3 py-1.5 text-sm focus:outline-none focus:border-cyan-500">
-            <option value="">All brands</option>
-            {brands.map(b => <option key={b} value={b}>{b}</option>)}
-          </select>
-          <select value={cat} onChange={(e) => setCat(e.target.value)} aria-label="Filter by category"
-            className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-md px-3 py-1.5 text-sm focus:outline-none focus:border-cyan-500">
-            <option value="">All categories</option>
-            {cats.map(c => <option key={c} value={c}>{c}</option>)}
-          </select>
-          <button
-            type="button"
-            onClick={() => setShowOnlyChanged(!showOnlyChanged)}
-            className={cn(
-              "inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm border transition-colors",
-              showOnlyChanged
-                ? "bg-amber-500/15 border-amber-500/50 text-amber-700 dark:text-amber-300"
-                : "bg-white dark:bg-zinc-900 border-zinc-200 dark:border-zinc-800 text-zinc-600 dark:text-zinc-300 hover:border-zinc-300 dark:hover:border-zinc-700"
-            )}
-            aria-pressed={showOnlyChanged}
-          >
-            {showOnlyChanged ? <Eye className="w-3.5 h-3.5" /> : <EyeOff className="w-3.5 h-3.5" />}
-            {showOnlyChanged ? (mode === "my" ? "Only mine" : "Only staged") : "All items"}
-          </button>
-        </div>
-        <span className="text-xs text-zinc-500 self-center tabular-nums ml-auto md:ml-0">{fmtN(shownCount)} shown</span>
-      </div>
+  // Secondary actions: inline on desktop, tucked behind "More" on phones so
+  // the count list starts higher up the screen.
+  const secondary: { key: string; label: string; icon: typeof Printer; onClick: () => void; show: boolean; danger?: boolean; title?: string }[] = [
+    { key: "clear", label: "Clear all", icon: Eraser, onClick: onClearMine, show: showClear, danger: true, title: "Delete all your entered counts and start fresh" },
+    { key: "counters", label: countersLabel, icon: Users, onClick: onCounters, show: isAdmin, title: "Every counter's progress — view or clear a counter's entries" },
+    { key: "print", label: "Print count sheet", icon: Printer, onClick: onPrint, show: true, title: "Print a blank count sheet for a paper stock-take" },
+    { key: "history", label: "Count history", icon: History, onClick: onHistory, show: isAdmin, title: "Every counter's saved entries from past counts" },
+  ];
 
-      <div className="flex flex-wrap items-center gap-2">
-        {isAdmin && (
-          <div className="inline-flex bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-md overflow-hidden">
-            <button
-              type="button"
-              onClick={() => setMode("my")}
-              className={cn(
-                "inline-flex items-center gap-1.5 px-3 py-1.5 text-sm",
-                mode === "my"
-                  ? "bg-cyan-500/15 text-cyan-700 dark:text-cyan-300"
-                  : "text-zinc-600 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800"
-              )}
-              aria-pressed={mode === "my"}
-            >
-              <UserCircle2 className="w-3.5 h-3.5" /> My count
-            </button>
-            <button
-              type="button"
-              onClick={() => setMode("reviewer")}
-              className={cn(
-                "inline-flex items-center gap-1.5 px-3 py-1.5 text-sm border-l border-zinc-200 dark:border-zinc-800",
-                mode === "reviewer"
-                  ? "bg-violet-500/15 text-violet-700 dark:text-violet-300"
-                  : "text-zinc-600 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800"
-              )}
-              aria-pressed={mode === "reviewer"}
-            >
-              <ShieldCheck className="w-3.5 h-3.5" /> Reviewer
-            </button>
-          </div>
-        )}
-
-        {/* Jump straight to the items where a count disagrees with a teammate.
-            My count only — in Reviewer the two-step wizard drives the list
-            (Step 1 IS the conflicts), so this would fight the step filter. */}
-        {mode === "my" && (
-          <button
-            type="button"
-            onClick={() => setConflictsOnly(!conflictsOnly)}
-            className={cn(
-              "inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm border transition-colors",
-              conflictsOnly
-                ? "bg-rose-500/15 border-rose-500/50 text-rose-700 dark:text-rose-300"
-                : conflictCount > 0
-                  ? "bg-white dark:bg-zinc-900 border-rose-300/60 dark:border-rose-500/30 text-rose-600 dark:text-rose-300 hover:border-rose-400"
-                  : "bg-white dark:bg-zinc-900 border-zinc-200 dark:border-zinc-800 text-zinc-500 hover:border-zinc-300 dark:hover:border-zinc-700"
-            )}
-            aria-pressed={conflictsOnly}
-            title="Show only items where a count disagrees"
-          >
-            <AlertTriangle className="w-3.5 h-3.5" />
-            {conflictsOnly ? "Conflicts only" : "Conflicts"}
-            {conflictCount > 0 && (
-              <span className="ml-0.5 px-1.5 rounded-full bg-rose-500 text-white text-[10px] font-semibold tabular-nums">{conflictCount}</span>
-            )}
-          </button>
-        )}
-
-        {/* My count: freeze/unfreeze my entries. Marking done turns any item I
-            leave blank but a teammate filled into a flagged conflict.
-            Hidden for viewers — they can't count, so a done flag from them
-            would only turn other counters' items into false conflicts. */}
-        {mode === "my" && canCount && (
-          <button
-            type="button"
-            onClick={onToggleDone}
-            disabled={doneSaving}
-            className={cn(
-              "inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm border transition-colors disabled:opacity-60",
-              myDone
-                ? "bg-emerald-500/15 border-emerald-500/50 text-emerald-700 dark:text-emerald-300"
-                : "bg-white dark:bg-zinc-900 border-zinc-200 dark:border-zinc-800 text-zinc-700 dark:text-zinc-200 hover:border-emerald-400 dark:hover:border-emerald-500/40"
-            )}
-            aria-pressed={myDone}
-            title={myDone ? "Resume editing your count" : "Freeze my count as done"}
-          >
-            {doneSaving
-              ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
-              : myDone ? <Lock className="w-3.5 h-3.5" /> : <CheckCheck className="w-3.5 h-3.5" />}
-            {myDone ? "Done (frozen)" : "Mark my count done"}
-          </button>
-        )}
-
-        {/* Start fresh: delete every entry I've made. A confirm popup is the
-            real gate — nothing wipes on a stray tap. Hidden while frozen
-            (resume first) and with nothing entered. */}
-        {mode === "my" && canCount && !myDone && myStaged > 0 && (
-          <button
-            type="button"
-            onClick={onClearMine}
-            className="inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm border bg-white dark:bg-zinc-900 border-zinc-200 dark:border-zinc-800 text-zinc-700 dark:text-zinc-200 hover:border-rose-400 hover:text-rose-600 dark:hover:border-rose-500/40 dark:hover:text-rose-400 transition-colors"
-            title="Delete all your entered counts and start fresh"
-          >
-            <Eraser className="w-3.5 h-3.5" /> Clear all
-          </button>
-        )}
-
-        {/* Admins: the chip opens the Counters panel (per-counter progress +
-            Clear all). For staff it stays a passive count. */}
-        {isAdmin ? (
-          <button
-            type="button"
-            onClick={onCounters}
-            className="inline-flex items-center gap-1.5 text-[11px] text-zinc-500 px-2 py-1.5 rounded-md bg-zinc-50 dark:bg-zinc-800/50 border border-zinc-200 dark:border-zinc-800 hover:border-zinc-300 dark:hover:border-zinc-600 hover:text-zinc-700 dark:hover:text-zinc-300 transition-colors"
-            title="Every counter's progress — view or clear a counter's entries"
-          >
-            <Users className="w-3 h-3" />
-            {usersWithDrafts} {usersWithDrafts === 1 ? "user counting" : "users counting"}
-          </button>
-        ) : (
-          <div className="inline-flex items-center gap-1.5 text-[11px] text-zinc-500 px-2 py-1.5 rounded-md bg-zinc-50 dark:bg-zinc-800/50 border border-zinc-200 dark:border-zinc-800">
-            <Users className="w-3 h-3" />
-            {usersWithDrafts} {usersWithDrafts === 1 ? "user counting" : "users counting"}
-          </div>
-        )}
-
+  const actions = (
+    <div className="flex flex-wrap items-center gap-2">
+      {/* My count: freeze/unfreeze my entries. Marking done turns any item I
+          leave blank but a teammate filled into a flagged conflict.
+          Hidden for viewers — they can't count, so a done flag from them
+          would only turn other counters' items into false conflicts. */}
+      {mode === "my" && canCount && (
         <button
           type="button"
-          onClick={onPrint}
-          className="inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 text-zinc-700 dark:text-zinc-200 hover:border-zinc-300 dark:hover:border-zinc-700"
-          title="Print a blank count sheet"
+          onClick={onToggleDone}
+          disabled={doneSaving}
+          className={cn(
+            "inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 min-h-9 text-sm border transition-colors disabled:opacity-60",
+            myDone
+              ? "bg-emerald-500/15 border-emerald-500/50 text-emerald-700 dark:text-emerald-300"
+              : "bg-white dark:bg-zinc-900 border-emerald-500/50 text-emerald-700 dark:text-emerald-300 hover:bg-emerald-500/10"
+          )}
+          aria-pressed={myDone}
+          title={myDone ? "Resume editing your count" : "Freeze my count as done"}
         >
-          <Printer className="w-3.5 h-3.5" /> Print PDF
+          {doneSaving
+            ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
+            : myDone ? <Lock className="w-3.5 h-3.5" /> : <CheckCheck className="w-3.5 h-3.5" />}
+          {myDone ? "Done (frozen)" : "Mark my count done"}
         </button>
+      )}
 
-        {isAdmin && (
-          <button
-            type="button"
-            onClick={onHistory}
-            className="inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 text-zinc-700 dark:text-zinc-200 hover:border-zinc-300 dark:hover:border-zinc-700"
-            title="Every counter's saved entries from past commits"
-          >
-            <History className="w-3.5 h-3.5" /> Count history
-          </button>
+      {/* Staff see how many people are counting (admins get the same number
+          as a button that opens the Counters panel, in `secondary`). */}
+      {!isAdmin && (
+        <div className="inline-flex items-center gap-1.5 text-[11px] text-zinc-500 px-2 py-1.5 rounded-md bg-zinc-50 dark:bg-zinc-800/50 border border-zinc-200 dark:border-zinc-800">
+          <Users className="w-3 h-3" />
+          {countersLabel}
+        </div>
+      )}
+
+      {/* Desktop: secondary actions inline */}
+      {secondary.filter(a => a.show).map(a => (
+        <button key={a.key} type="button" onClick={a.onClick} title={a.title}
+          className={cn(plainBtn, "hidden md:inline-flex", a.danger && "hover:border-rose-400 hover:text-rose-600 dark:hover:border-rose-500/40 dark:hover:text-rose-400")}>
+          <a.icon className="w-3.5 h-3.5" /> {a.label}
+        </button>
+      ))}
+
+      {/* Phone: the same actions behind one "More" button */}
+      <div className="relative md:hidden">
+        <button type="button" onClick={() => setMoreOpen(o => !o)} aria-expanded={moreOpen} aria-haspopup="menu" className={plainBtn}>
+          More <ChevronDown className={cn("w-3.5 h-3.5 transition-transform", moreOpen && "rotate-180")} />
+        </button>
+        {moreOpen && (
+          <>
+            <div className="fixed inset-0 z-30" onClick={() => setMoreOpen(false)} aria-hidden="true" />
+            <div role="menu" className="absolute left-0 top-full mt-1 z-40 min-w-[220px] rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 shadow-lg p-1">
+              {secondary.filter(a => a.show).map(a => (
+                <button key={a.key} type="button" role="menuitem"
+                  onClick={() => { setMoreOpen(false); a.onClick(); }}
+                  className={cn("w-full flex items-center gap-2.5 rounded-lg px-3 min-h-11 text-sm text-left text-zinc-700 dark:text-zinc-200 active:bg-zinc-100 dark:active:bg-zinc-800", a.danger && "text-rose-600 dark:text-rose-400")}>
+                  <a.icon className="w-4 h-4 flex-shrink-0" /> {a.label}
+                </button>
+              ))}
+            </div>
+          </>
+        )}
+      </div>
+
+      <div className="flex-1 min-w-0" />
+
+      {/* "Make adjustments" pushes counts to system stock — a Step 2 action.
+          In Reviewer it only appears on Step 2 (after staff are reconciled);
+          in My count an admin can still commit their own count as before. */}
+      {isAdmin && (mode === "my" || reviewerStep === 2) && (
+        <button
+          type="button"
+          onClick={onCommit}
+          disabled={!canCommit}
+          title="Update the system stock to match the counts"
+          className="inline-flex items-center gap-2 rounded-md px-3.5 py-1.5 min-h-9 text-sm font-medium bg-cyan-500 hover:bg-cyan-400 text-white transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+        >
+          {processing
+            ? <><Loader2 className="w-3.5 h-3.5 animate-spin" /> {progress.done}/{progress.total}…</>
+            : <><CheckCircle2 className="w-3.5 h-3.5" /> Make adjustments</>
+          }
+        </button>
+      )}
+    </div>
+  );
+
+  return (
+    <>
+      {/* Phone: the action buttons scroll away with the page so only the
+          search + chips stay pinned (the old 5-row sticky toolbar covered a
+          third of the screen while counting). */}
+      <div className="md:hidden mb-2.5">{actions}</div>
+
+      {/* Sticky so search + filters stay reachable while scrolling the long
+          item list. Negative margins let the background span the full content
+          width; px puts the padding back. */}
+      <div className="space-y-2 mb-4 sticky top-0 z-20 -mx-4 sm:-mx-6 md:-mx-8 px-4 sm:px-6 md:px-8 pt-1 pb-2.5 bg-zinc-50 dark:bg-zinc-950 border-b border-zinc-200/70 dark:border-zinc-800/70">
+        <div className="flex flex-wrap gap-2 items-center">
+          <SearchBox
+            value={q}
+            onChange={setQ}
+            placeholder="Search — brand, model, colour, size…"
+            className="flex-1 min-w-[180px]"
+          />
+
+          {/* Mobile: filters live in a sheet */}
+          <FilterButton activeCount={(brand ? 1 : 0) + (cat ? 1 : 0)} onClick={() => setFiltersOpen(true)} />
+
+          {/* Desktop: inline filters */}
+          <div className="hidden md:flex md:items-center md:gap-2">
+            <select value={brand} onChange={(e) => setBrand(e.target.value)} aria-label="Filter by brand"
+              className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-md px-3 py-1.5 text-sm focus:outline-none focus:border-cyan-500">
+              <option value="">All brands</option>
+              {brands.map(b => <option key={b} value={b}>{b}</option>)}
+            </select>
+            <select value={cat} onChange={(e) => setCat(e.target.value)} aria-label="Filter by category"
+              className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-md px-3 py-1.5 text-sm focus:outline-none focus:border-cyan-500">
+              <option value="">All categories</option>
+              {cats.map(c => <option key={c} value={c}>{c}</option>)}
+            </select>
+          </div>
+          <span className="text-xs text-zinc-500 self-center tabular-nums ml-auto md:ml-0">{fmtN(shownCount)} shown</span>
+        </div>
+
+        {/* My count: progress + one-tap filters */}
+        {mode === "my" && (
+          <>
+            <div className="flex items-center gap-1.5 overflow-x-auto no-scrollbar -mx-4 px-4 sm:-mx-6 sm:px-6 md:mx-0 md:px-0">
+              <FilterChip label="All" count={totalItems} active={myFilter === "all"} onClick={() => onMyFilter("all")} />
+              <FilterChip label="To count" count={counts.todo} active={myFilter === "todo"} onClick={() => onMyFilter("todo")} />
+              <FilterChip label="Counted" count={counts.counted} active={myFilter === "counted"} tone="emerald" onClick={() => onMyFilter("counted")} />
+              <FilterChip label="Differs from system" count={counts.differs} active={myFilter === "differs"} tone="amber" onClick={() => onMyFilter("differs")} />
+              {(counts.conflicts > 0 || myFilter === "conflicts") && (
+                <FilterChip label="Conflicts" count={counts.conflicts} active={myFilter === "conflicts"} tone="rose" onClick={() => onMyFilter("conflicts")} />
+              )}
+              {listStale && (
+                <button type="button" onClick={() => onMyFilter(myFilter)}
+                  className="flex-shrink-0 inline-flex items-center gap-1 px-2 min-h-9 text-xs text-cyan-600 dark:text-cyan-400 hover:underline whitespace-nowrap"
+                  title="Your entries changed which items belong in this list">
+                  <RotateCcw className="w-3 h-3" /> Refresh list
+                </button>
+              )}
+            </div>
+            <div className="flex items-center gap-3">
+              <div className="flex-1 h-1.5 rounded-full bg-zinc-200 dark:bg-zinc-800 overflow-hidden" role="progressbar" aria-valuemin={0} aria-valuemax={totalItems} aria-valuenow={counts.counted} aria-label="Items counted">
+                <div className="h-full rounded-full bg-emerald-500 transition-[width] duration-300" style={{ width: `${pct}%` }} />
+              </div>
+              <span className="text-[11px] text-zinc-500 tabular-nums whitespace-nowrap">
+                <span className="font-semibold text-zinc-700 dark:text-zinc-200">{fmtN(counts.counted)} of {fmtN(totalItems)}</span> counted
+                {(shortPcs > 0 || extraPcs > 0) && (
+                  <span className="hidden sm:inline">
+                    {" · "}
+                    {shortPcs > 0 && <span className="text-rose-600 dark:text-rose-400">{fmtN(shortPcs)} pcs short</span>}
+                    {shortPcs > 0 && extraPcs > 0 && ", "}
+                    {extraPcs > 0 && <span className="text-amber-600 dark:text-amber-400">{fmtN(extraPcs)} pcs extra</span>}
+                  </span>
+                )}
+              </span>
+            </div>
+          </>
         )}
 
-        <div className="flex-1 min-w-0" />
-
-        {/* "Make adjustments" pushes counts to system stock — a Step 2 action.
-            In Reviewer it only appears on Step 2 (after staff are reconciled);
-            in My count an admin can still commit their own count as before. */}
-        {isAdmin && (mode === "my" || reviewerStep === 2) && (
-          <button
-            type="button"
-            onClick={onCommit}
-            disabled={!canCommit}
-            className="inline-flex items-center gap-2 rounded-md px-3.5 py-1.5 text-sm font-medium bg-cyan-500 hover:bg-cyan-400 text-white transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
-          >
-            {processing
-              ? <><Loader2 className="w-3.5 h-3.5 animate-spin" /> {progress.done}/{progress.total}…</>
-              : <><CheckCircle2 className="w-3.5 h-3.5" /> Make adjustments</>
-            }
-          </button>
-        )}
+        {/* Desktop: actions stay pinned with the filters */}
+        <div className="hidden md:block">{actions}</div>
       </div>
 
       {/* Mobile filters sheet */}
       <FilterSheet
         open={filtersOpen}
         onClose={() => setFiltersOpen(false)}
-        onClear={() => { setBrand(""); setCat(""); setShowOnlyChanged(false); }}
+        onClear={() => { setBrand(""); setCat(""); }}
       >
         <SheetField label="Brand">
           <select value={brand} onChange={(e) => setBrand(e.target.value)} className="w-full bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-cyan-500">
@@ -2588,22 +2773,8 @@ function Toolbar({
             {cats.map(c => <option key={c} value={c}>{c}</option>)}
           </select>
         </SheetField>
-        <button
-          type="button"
-          onClick={() => setShowOnlyChanged(!showOnlyChanged)}
-          className={cn(
-            "w-full inline-flex items-center justify-center gap-1.5 rounded-md px-3 py-2.5 text-sm border transition-colors",
-            showOnlyChanged
-              ? "bg-amber-500/15 border-amber-500/50 text-amber-700 dark:text-amber-300"
-              : "bg-white dark:bg-zinc-800 border-zinc-200 dark:border-zinc-700 text-zinc-600 dark:text-zinc-300"
-          )}
-          aria-pressed={showOnlyChanged}
-        >
-          {showOnlyChanged ? <Eye className="w-3.5 h-3.5" /> : <EyeOff className="w-3.5 h-3.5" />}
-          {showOnlyChanged ? (mode === "my" ? "Showing only mine" : "Showing only staged") : "Show all items"}
-        </button>
       </FilterSheet>
-    </div>
+    </>
   );
 }
 
@@ -2628,12 +2799,13 @@ function StepNum({ n, active, done, locked }: { n: number; active: boolean; done
 }
 
 function ReviewerSteps({
-  step, setStep, conflicts, step2Count,
+  step, setStep, conflicts, step2Count, summary,
 }: {
   step: 1 | 2;
   setStep: (s: 1 | 2) => void;
   conflicts: number;
   step2Count: number;
+  summary: { matching: number; shortPcs: number; extraPcs: number };
 }) {
   const step2Locked = conflicts > 0;
   return (
@@ -2695,8 +2867,8 @@ function ReviewerSteps({
                 {step2Locked
                   ? "Locked until staff agree"
                   : step2Count > 0
-                    ? `${fmtN(step2Count)} differ${step2Count === 1 ? "s" : ""} from system`
-                    : "Counts match the system"}
+                    ? `${fmtN(step2Count)} differ${step2Count === 1 ? "s" : ""} from system${summary.matching > 0 ? ` · ${fmtN(summary.matching)} match` : ""}`
+                    : summary.matching > 0 ? `All ${fmtN(summary.matching)} counted match the system` : "Counts match the system"}
               </div>
             </div>
             {!step2Locked && step2Count > 0 && (
@@ -2721,6 +2893,20 @@ function ReviewerSteps({
           >
             Continue to Step 2 →
           </button>
+        </div>
+      )}
+      {/* Step 2 summary — the whole stock-take result in one line. */}
+      {step === 2 && conflicts === 0 && (step2Count > 0 || summary.matching > 0) && (
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-1 rounded-lg border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 px-4 py-2.5 text-sm tabular-nums">
+          <span className="inline-flex items-center gap-1.5 text-emerald-700 dark:text-emerald-300">
+            <CheckCircle2 className="w-4 h-4" /> <strong>{fmtN(summary.matching)}</strong> match the system
+          </span>
+          <span className={cn("inline-flex items-center gap-1.5", step2Count > 0 ? "text-amber-700 dark:text-amber-300" : "text-zinc-500")}>
+            <AlertTriangle className="w-4 h-4" /> <strong>{fmtN(step2Count)}</strong> differ
+          </span>
+          {summary.shortPcs > 0 && <span className="text-rose-600 dark:text-rose-400"><strong>{fmtN(summary.shortPcs)}</strong> pcs short</span>}
+          {summary.extraPcs > 0 && <span className="text-amber-600 dark:text-amber-400"><strong>{fmtN(summary.extraPcs)}</strong> pcs extra</span>}
+          <span className="text-xs text-zinc-500 basis-full sm:basis-auto sm:ml-auto">Make adjustments updates the stock and closes this count.</span>
         </div>
       )}
       {/* No "on Step 2 with conflicts" banner needed — the page clamps the step
@@ -2775,9 +2961,52 @@ type MyViewProps = {
 };
 
 // Render EXACTLY ONE of the two layouts (never both mounted + CSS-hidden).
+// Each item is a memoised <MyItem>: a keystroke re-renders only the row being
+// typed in, not all ~170 rows (which made typing lag on slower phones).
 function MyView(props: MyViewProps) {
   const isDesktop = useMediaQuery("(min-width: 768px)");
-  return isDesktop ? <DesktopTable {...props} /> : <MobileCards {...props} />;
+  const { items, appStock, drafts, lastRecon, currentUserId, errorsByItem, otherUsersByItem, conflictByItem } = props;
+  const rows = items.map(i => {
+    const app = appStock.get(i.id);
+    if (!app) return null;
+    return (
+      <MyItem
+        key={i.id}
+        desktop={isDesktop}
+        i={i}
+        app={app}
+        d={drafts.get(dkey(currentUserId, i.id))}
+        others={otherUsersByItem(i.id)}
+        conflict={conflictByItem(i.id)}
+        last={lastRecon.get(i.id)}
+        frozen={props.frozen}
+        doneByUser={props.doneByUser}
+        currentUserId={currentUserId}
+        computeDiff={props.computeDiff}
+        setField={props.setField}
+        commitRow={props.commitRow}
+        resetMyRow={props.resetMyRow}
+        errors={errorsByItem.get(i.id)}
+      />
+    );
+  });
+  if (!isDesktop) return <div className="space-y-3">{rows}</div>;
+  return (
+    <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg overflow-x-auto">
+      <table className="w-full text-sm min-w-[860px]">
+        <thead className="bg-zinc-50 dark:bg-zinc-900/50 border-b border-zinc-200 dark:border-zinc-800">
+          <tr className="text-zinc-500 text-[11px] uppercase tracking-wider">
+            <th className="text-left px-3 py-2.5 font-medium">Item</th>
+            <th className="text-center px-2 py-2.5 font-medium w-[110px]">Case size</th>
+            <th className="text-left px-2 py-2.5 font-medium w-[300px]">Godown A</th>
+            <th className="text-left px-2 py-2.5 font-medium w-[300px]">Godown B</th>
+            <th className="w-8" />
+          </tr>
+        </thead>
+        <tbody>{rows}</tbody>
+      </table>
+    </div>
+  );
 }
 
 function makeEmptyDraft(uid: string, iid: string): DBDraft {
@@ -2791,13 +3020,26 @@ function makeEmptyDraft(uid: string, iid: string): DBDraft {
   };
 }
 
-// Status rail colour shared by every card/row so state reads at a glance.
-function statusRail(rd: RowDiffType, conflict: ItemConflictType | null, others: number, frozen: boolean): string {
-  if (frozen) return "border-l-emerald-500";
+// Status rail colour shared by every card/row so state reads at a glance:
+// rose = needs fixing · amber = counted, differs from system · emerald =
+// counted, matches · violet = a teammate has counted it · grey = not counted.
+function statusRail(rd: RowDiffType, conflict: ItemConflictType | null, others: number): string {
   if (rd.invalid || conflict?.any) return "border-l-rose-500";
-  if (rd.hasAnyChange) return "border-l-amber-500";
+  if (rd.A.diff !== 0 || rd.B.diff !== 0 || rd.caseSizeChanged) return "border-l-amber-500";
+  if (rd.hasAnyChange) return "border-l-emerald-500";
   if (others > 0) return "border-l-cyan-500";
   return "border-l-zinc-200 dark:border-l-zinc-800";
+}
+
+// The item's state in words (colour alone isn't enough).
+function StatusChip({ rd, conflict }: { rd: RowDiffType; conflict: ItemConflictType | null }) {
+  const base = "inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] uppercase tracking-wide font-medium whitespace-nowrap";
+  if (rd.invalid) return <span className={cn(base, "bg-rose-500/15 text-rose-700 dark:text-rose-300")}><AlertCircle className="w-3 h-3" /> Fix entry</span>;
+  if (conflict?.any) return <span className={cn(base, "bg-rose-500/15 text-rose-700 dark:text-rose-300")}><AlertTriangle className="w-3 h-3" /> Conflict</span>;
+  if (!rd.hasAnyChange) return null;
+  if (rd.A.diff !== 0 || rd.B.diff !== 0) return <span className={cn(base, "bg-amber-500/15 text-amber-700 dark:text-amber-300")}>Differs from system</span>;
+  if (rd.caseSizeChanged && !rd.A.userTouched && !rd.B.userTouched) return <span className={cn(base, "bg-amber-500/15 text-amber-700 dark:text-amber-300")}>Case size changed</span>;
+  return <span className={cn(base, "bg-emerald-500/15 text-emerald-700 dark:text-emerald-300")}><CheckCircle2 className="w-3 h-3" /> Matches system</span>;
 }
 
 // Build the per-godown peer rows (other counters' totals + delta vs mine).
@@ -2817,7 +3059,7 @@ function buildPeers(others: DBDraft[], g: Godown, itemCs: number, mySide: RowDif
 // ─── GodownPanel — the System→You→Diff atom, reused on every surface ──────
 function GodownPanel({
   g, appSide, side, csOld, csNew, cRaw, lRaw,
-  onCases, onLoose, onBlur, stepper, compact, frozen, peers, ariaPrefix,
+  onCases, onLoose, onBlur, onSame, stepper, compact, frozen, peers, ariaPrefix,
 }: {
   g: Godown;
   appSide: AppStock;
@@ -2825,19 +3067,23 @@ function GodownPanel({
   csOld: number; csNew: number;
   cRaw: string; lRaw: string;
   onCases: (v: string) => void; onLoose: (v: string) => void; onBlur: () => void;
+  // One tap = "what's on the shelf is exactly what the system says".
+  onSame?: () => void;
   stepper: boolean; compact: boolean; frozen: boolean;
   peers: { name: string; pcs: number; delta: number | null; done: boolean }[];
   ariaPrefix: string;
 }) {
   const touched = side.userTouched;
-  const rail = g === "A" ? "border-l-cyan-500/70" : "border-l-violet-500/70";
-  const head = g === "A" ? "text-cyan-700 dark:text-cyan-300" : "text-violet-700 dark:text-violet-300";
+  // A = brand violet (`cyan-*` is remapped to it), B = teal — the two godowns
+  // used to wear two near-identical violets and were easy to mix up.
+  const rail = g === "A" ? "border-l-cyan-500/70" : "border-l-teal-500/80";
+  const head = g === "A" ? "text-cyan-700 dark:text-cyan-300" : "text-teal-700 dark:text-teal-300";
   const tone: "neutral" | "amber" | "rose" = touched ? (side.valid ? "amber" : "rose") : "neutral";
   // One box filled, sibling blank on a counted godown → make the implied 0 explicit.
   const onlyCases = cRaw.trim() !== "" && lRaw.trim() === "";
   const onlyLoose = lRaw.trim() !== "" && cRaw.trim() === "";
   // The diff (and the commit) compare at the NEW case size — show the system
-  // reference re-based the same way, so "SYS · You · Diff" always reconciles
+  // reference re-based the same way, so "System · You · Diff" always reconciles
   // visually when the counter edited the case size.
   const csEdited = csNew !== csOld;
   const sysPcs = csEdited ? pieces(csNew, appSide.cases, appSide.loose) : side.appPieces;
@@ -2845,183 +3091,320 @@ function GodownPanel({
   // ignored by the maths, so don't offer the box (existing text stays
   // editable so it can be cleared).
   const casesDisabled = frozen || (csNew <= 0 && cRaw.trim() === "");
+  // "Same as system" needs whole, non-negative system numbers it can type in.
+  const canSame = !!onSame && !frozen && !touched
+    && appSide.cases >= 0 && appSide.loose >= 0 && (csNew > 0 || appSide.cases === 0);
+  const sameBtn = canSame && (
+    <button
+      type="button"
+      onClick={onSame}
+      aria-label={`${ariaPrefix} godown ${g}: same as system`}
+      className={cn(
+        "inline-flex items-center gap-1.5 text-zinc-600 dark:text-zinc-300 transition-colors",
+        compact
+          ? "text-[11px] rounded px-1 -mx-1 hover:text-emerald-700 dark:hover:text-emerald-300 hover:bg-emerald-500/10"
+          : "w-full justify-center min-h-10 rounded-lg border border-dashed border-zinc-300 dark:border-zinc-700 text-[13px] active:bg-emerald-500/10 active:border-emerald-500/60"
+      )}
+    >
+      <Equal className={compact ? "w-3 h-3" : "w-3.5 h-3.5"} /> Same as system
+    </button>
+  );
+  const casesNote = csNew <= 0 && cRaw.trim() === "" && !frozen && (
+    <span className="block text-[9px] text-amber-600 dark:text-amber-400 mt-0.5">no case size — count loose</span>
+  );
+  const casesInput = (
+    <ExprInput value={cRaw} onChange={onCases} onBlur={onBlur} stepper={stepper && !casesDisabled} compact={compact} disabled={casesDisabled}
+      tone={tone} ariaLabel={`${ariaPrefix} godown ${g} cases`} />
+  );
+  const looseInput = (
+    <ExprInput value={lRaw} onChange={onLoose} onBlur={onBlur} stepper={stepper} compact={compact} disabled={frozen}
+      tone={tone} ariaLabel={`${ariaPrefix} godown ${g} loose`} />
+  );
   return (
     <div className={cn("rounded-xl border-l-4 bg-zinc-50/70 dark:bg-zinc-800/40 p-2.5", rail)}>
-      <div className="flex items-center justify-between gap-2 mb-2">
-        <span className={cn("text-[11px] font-semibold uppercase tracking-wider", head)}>Godown {g}</span>
-        <SysChip label="SYS">
-          {fmtN(sysPcs)} pcs{csEdited && <span className="text-zinc-400"> · was {fmtN(side.appPieces)}</span>}
-        </SysChip>
+      <div className="flex items-baseline justify-between gap-2 mb-2">
+        <span className={cn("text-[11px] font-semibold uppercase tracking-wider flex-shrink-0", head)}>Godown {g}</span>
+        <span className="text-[11px] tabular-nums text-zinc-500 dark:text-zinc-400 text-right min-w-0 truncate">
+          System{" "}
+          <span className="font-semibold text-zinc-700 dark:text-zinc-200">{fmtN(sysPcs)} pcs</span>
+          {csEdited
+            ? <span className="text-zinc-400 dark:text-zinc-500"> · was {fmtN(side.appPieces)}</span>
+            : csOld > 0 && <span className="text-zinc-400 dark:text-zinc-500"> · {fmtN(appSide.cases)}×{csOld} + {fmtN(appSide.loose)}</span>}
+        </span>
       </div>
-      <div className={cn(compact ? "grid grid-cols-2 gap-2" : "space-y-2")}>
-        <div>
-          <span className="block text-[10px] uppercase tracking-wide text-zinc-500 mb-0.5">Cases</span>
-          <ExprInput value={cRaw} onChange={onCases} onBlur={onBlur} stepper={stepper && !casesDisabled} compact={compact} disabled={casesDisabled}
-            tone={tone} ariaLabel={`${ariaPrefix} godown ${g} cases`} />
-          {csNew <= 0 && cRaw.trim() === "" && !frozen && (
-            <span className="block text-[9px] text-amber-600 dark:text-amber-400 mt-0.5">no case size — count loose</span>
+      {compact ? (
+        // Desktop: "Cases [ ] Loose [ ]" on ONE line — the label sits beside
+        // its box, so a row is roughly half the height it used to be.
+        <div className="grid grid-cols-2 gap-2">
+          <label className="flex items-start gap-1.5 min-w-0">
+            <span className="flex-shrink-0 text-[10px] uppercase tracking-wide text-zinc-500 leading-9">Cases</span>
+            <span className="flex-1 min-w-0">{casesInput}{casesNote}</span>
+          </label>
+          <label className="flex items-start gap-1.5 min-w-0">
+            <span className="flex-shrink-0 text-[10px] uppercase tracking-wide text-zinc-500 leading-9">Loose</span>
+            <span className="flex-1 min-w-0">{looseInput}</span>
+          </label>
+        </div>
+      ) : (
+        // Phone: label beside the stepper (not above it) — one row per box.
+        <div className="space-y-1.5">
+          <div className="flex items-center gap-2">
+            <span className="w-11 flex-shrink-0 text-[10px] uppercase tracking-wide text-zinc-500">Cases</span>
+            <div className="flex-1 min-w-0">{casesInput}{casesNote}</div>
+          </div>
+          <div className="flex items-center gap-2">
+            <span className="w-11 flex-shrink-0 text-[10px] uppercase tracking-wide text-zinc-500">Loose</span>
+            <div className="flex-1 min-w-0">{looseInput}</div>
+          </div>
+        </div>
+      )}
+      {(touched || canSame || frozen || peers.length > 0) && (
+        <div className={cn("space-y-1", compact ? "mt-1.5" : "mt-2")}>
+          {sameBtn}
+          {touched && side.valid && (
+            <LedgerRow
+              label="Counted"
+              tone="you"
+              value={breakupStr(csNew, side.physCases, side.physLoose)}
+              trailing={<DiffPill diff={side.diff} />}
+            />
           )}
+          {touched && !side.valid && (
+            <div className="text-[11px] text-rose-600 dark:text-rose-400">Numbers only — for example 5, or 5+1 to add as you find more.</div>
+          )}
+          {!touched && frozen && <div className="text-[11px] italic text-zinc-400">not counted</div>}
+          {touched && side.valid && (onlyCases || onlyLoose) && (
+            <div className="text-[10px] text-zinc-500">{onlyCases ? "loose: 0 — none counted" : "cases: 0 — none counted"}</div>
+          )}
+          {peers.map((p, idx) => <PeerLine key={idx} {...p} />)}
         </div>
-        <div>
-          <span className="block text-[10px] uppercase tracking-wide text-zinc-500 mb-0.5">Loose</span>
-          <ExprInput value={lRaw} onChange={onLoose} onBlur={onBlur} stepper={stepper} compact={compact} disabled={frozen}
-            tone={tone} ariaLabel={`${ariaPrefix} godown ${g} loose`} />
-        </div>
-      </div>
-      <div className="mt-2 pt-2 border-t border-zinc-200/70 dark:border-zinc-700/50 space-y-1">
-        <LedgerRow label="In system" value={breakupStr(csOld, appSide.cases, appSide.loose)} />
-        <LedgerRow
-          label="You count"
-          tone="you"
-          value={touched && side.valid ? breakupStr(csNew, side.physCases, side.physLoose) : <span className="italic text-zinc-400">not counted</span>}
-          trailing={touched && side.valid ? <DiffPill diff={side.diff} /> : undefined}
-        />
-        {touched && side.valid && (onlyCases || onlyLoose) && (
-          <div className="text-[10px] text-zinc-500">{onlyCases ? "loose: 0 — none counted" : "cases: 0 — none counted"}</div>
-        )}
-        {peers.map((p, idx) => <PeerLine key={idx} {...p} />)}
-      </div>
+      )}
     </div>
   );
 }
 
-// ─── DesktopTable (My view) ──────────────────────────────────────────────
-function DesktopTable({
-  items, appStock, drafts, lastRecon, currentUserId, frozen,
-  computeDiff, setField, commitRow, resetMyRow, errorsByItem,
-  otherUsersByItem, conflictByItem, doneByUser,
-}: MyViewProps) {
-  return (
-    <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg overflow-x-auto">
-      <table className="w-full text-sm min-w-[860px]">
-        <thead className="bg-zinc-50 dark:bg-zinc-900/50 border-b border-zinc-200 dark:border-zinc-800">
-          <tr className="text-zinc-500 text-[11px] uppercase tracking-wider">
-            <th className="text-left px-3 py-2.5 font-medium">Item</th>
-            <th className="text-center px-2 py-2.5 font-medium w-[110px]">Case size</th>
-            <th className="text-left px-2 py-2.5 font-medium w-[300px]">Godown A</th>
-            <th className="text-left px-2 py-2.5 font-medium w-[300px]">Godown B</th>
-            <th className="w-8" />
-          </tr>
-        </thead>
-        <tbody>
-          {items.map(i => {
-            const app = appStock.get(i.id);
-            if (!app) return null;
-            const my = drafts.get(dkey(currentUserId, i.id)) ?? makeEmptyDraft(currentUserId, i.id);
-            const rd = computeDiff(i, app, my);
-            const others = otherUsersByItem(i.id);
-            const conflict = conflictByItem(i.id);
-            const last = lastRecon.get(i.id);
-            return (
-              <MyDesktopRow
-                key={i.id}
-                i={i} app={app} d={my} rd={rd}
-                others={others}
-                conflict={conflict}
-                last={last}
-                frozen={frozen}
-                doneByUser={doneByUser}
-                onChange={(field, value) => setField(currentUserId, i.id, field, value)}
-                onBlur={() => commitRow(currentUserId, i.id)}
-                onReset={() => resetMyRow(i.id)}
-                errors={errorsByItem.get(i.id)}
-              />
-            );
-          })}
-        </tbody>
-      </table>
-    </div>
-  );
-}
-
-function MyDesktopRow({
-  i, app, d, rd, others, conflict, last, frozen, doneByUser, onChange, onBlur, onReset, errors,
-}: {
+// ─── MyItem — one item in My count (desktop table row OR phone card) ──────
+type MyItemProps = {
+  desktop: boolean;
   i: Item & { categoryName: string | null };
   app: { A: AppStock; B: AppStock };
-  d: DBDraft;
-  rd: RowDiffType;
+  d: DBDraft | undefined;
   others: DBDraft[];
   conflict: ItemConflictType | null;
   last?: LastReconciled;
   frozen: boolean;
   doneByUser: DoneMap;
-  onChange: (field: Field, value: string) => void;
-  onBlur: () => void;
-  onReset: () => void;
+  currentUserId: string;
+  computeDiff: (i: Item, app: { A: AppStock; B: AppStock }, d: DBDraft) => RowDiffType;
+  setField: (uid: string, iid: string, f: Field, v: string) => void;
+  commitRow: (uid: string, iid: string) => void;
+  resetMyRow: (itemId: string) => void;
   errors?: string[];
-}) {
-  const myTouched = rd.hasAnyChange;
-  const hasErr = (errors?.length ?? 0) > 0;
+};
+
+// Value-equality for the memo. The poll replaces every draft / stock / done
+// object with a fresh copy every few seconds, so identity alone would
+// re-render every row each time; compare what a row actually displays.
+function sameDraftValues(a: DBDraft | undefined, b: DBDraft | undefined): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  return a.id === b.id && a.user_id === b.user_id
+    && a.case_size_raw === b.case_size_raw
+    && a.a_cases_raw === b.a_cases_raw && a.a_loose_raw === b.a_loose_raw
+    && a.b_cases_raw === b.b_cases_raw && a.b_loose_raw === b.b_loose_raw
+    && a.user_name === b.user_name && a.user_email === b.user_email;
+}
+const sameStockSide = (a: AppStock, b: AppStock) =>
+  a.cases === b.cases && a.loose === b.loose && a.hasStockRow === b.hasStockRow;
+function myItemPropsEqual(p: MyItemProps, n: MyItemProps): boolean {
+  if (p.desktop !== n.desktop || p.i !== n.i || p.frozen !== n.frozen || p.currentUserId !== n.currentUserId) return false;
+  if (p.computeDiff !== n.computeDiff || p.setField !== n.setField || p.commitRow !== n.commitRow || p.resetMyRow !== n.resetMyRow) return false;
+  if (p.last?.at !== n.last?.at || p.last?.userName !== n.last?.userName) return false;
+  if (!sameStockSide(p.app.A, n.app.A) || !sameStockSide(p.app.B, n.app.B)) return false;
+  if (!sameDraftValues(p.d, n.d)) return false;
+  if (p.others.length !== n.others.length) return false;
+  for (let k = 0; k < p.others.length; k++) {
+    const a = p.others[k], b = n.others[k];
+    if (!sameDraftValues(a, b)) return false;
+    if (!!p.doneByUser.get(a.user_id)?.done !== !!n.doneByUser.get(b.user_id)?.done) return false;
+  }
+  const pc = p.conflict, nc = n.conflict;
+  if (!!pc !== !!nc) return false;
+  if (pc && nc && (pc.any !== nc.any || pc.a !== nc.a || pc.b !== nc.b || pc.case_size !== nc.case_size || pc.reason !== nc.reason)) return false;
+  if ((p.errors ?? []).join("|") !== (n.errors ?? []).join("|")) return false;
+  return true;
+}
+
+const MyItem = memo(function MyItem({
+  desktop, i, app, d, others, conflict, last, frozen, doneByUser,
+  currentUserId, computeDiff, setField, commitRow, resetMyRow, errors,
+}: MyItemProps) {
+  // Phone only: the case-size editor stays folded away until asked for —
+  // it rarely changes and used to cost every card a full row.
+  const [csOpen, setCsOpen] = useState(false);
+  const my = d ?? makeEmptyDraft(currentUserId, i.id);
+  const rd = computeDiff(i, app, my);
   const itemCs = i.case_size || 0;
-  const rail = statusRail(rd, conflict, others.length, frozen);
+  const rail = statusRail(rd, conflict, others.length);
+  const hasErr = (errors?.length ?? 0) > 0;
+  const onChange = (field: Field, value: string) => setField(currentUserId, i.id, field, value);
+  const onBlur = () => commitRow(currentUserId, i.id);
+  // Type the system's own numbers into this godown, then save like a blur.
+  const fillSame = (g: Godown) => {
+    const s = app[g];
+    if (rd.csNew > 0) setField(currentUserId, i.id, g === "A" ? "a_cases" : "b_cases", String(s.cases));
+    setField(currentUserId, i.id, g === "A" ? "a_loose" : "b_loose", String(s.loose));
+    commitRow(currentUserId, i.id);
+  };
+  const panel = (g: Godown, phone: boolean) => (
+    <GodownPanel g={g} appSide={app[g]} side={rd[g]} csOld={rd.csOld} csNew={rd.csNew}
+      cRaw={g === "A" ? my.a_cases_raw : my.b_cases_raw} lRaw={g === "A" ? my.a_loose_raw : my.b_loose_raw}
+      onCases={(v) => onChange(g === "A" ? "a_cases" : "b_cases", v)}
+      onLoose={(v) => onChange(g === "A" ? "a_loose" : "b_loose", v)}
+      onBlur={onBlur} onSame={() => fillSame(g)}
+      stepper={phone} compact={!phone} frozen={frozen}
+      peers={buildPeers(others, g, itemCs, rd[g], doneByUser)} ariaPrefix={i.model} />
+  );
+
+  if (desktop) {
+    return (
+      <Fragment>
+        <tr className="border-t border-zinc-200/50 dark:border-zinc-800/50 align-top">
+          <td className={cn("px-3 py-3 border-l-4", rail)}>
+            <div className="flex items-start gap-2 min-w-0">
+              {i.brand && (
+                <span className="bg-cyan-500/15 text-cyan-600 dark:text-cyan-300 px-1.5 py-0.5 rounded text-[10px] uppercase tracking-wider font-medium flex-shrink-0 mt-0.5">
+                  {i.brand}
+                </span>
+              )}
+              <div className="min-w-0">
+                <div className="text-sm font-medium truncate">{i.model}</div>
+                <div className="text-[11px] text-zinc-500 truncate">
+                  {[i.size, i.colour, i.categoryName].filter(Boolean).join(" · ")}
+                </div>
+                <div className="mt-1 empty:hidden"><StatusChip rd={rd} conflict={conflict} /></div>
+                <RowMeta last={last} others={others} conflict={conflict} doneByUser={doneByUser} />
+              </div>
+            </div>
+          </td>
+          <td className="px-2 py-3 align-top">
+            <ExprInput
+              value={my.case_size_raw}
+              prefill={String(rd.csOld)}
+              onChange={(v) => onChange("case_size", v)}
+              onBlur={onBlur}
+              disabled={frozen}
+              compact
+              tone={rd.caseSizeChanged ? "amber" : (!rd.caseSizeValid ? "rose" : "neutral")}
+              ariaLabel={`Case size for ${i.model}`}
+            />
+            {rd.caseSizeChanged && <div className="mt-1 flex justify-center"><SysChip label="WAS">{rd.csOld}</SysChip></div>}
+          </td>
+          <td className="px-2 py-3 align-top">{panel("A", false)}</td>
+          <td className="px-2 py-3 align-top">{panel("B", false)}</td>
+          <td className="px-2 py-3 align-top">
+            {rd.hasAnyChange && !frozen && (
+              <button type="button" onClick={() => resetMyRow(i.id)} className="text-zinc-400 hover:text-rose-500 p-1.5" title="Clear this item's count" aria-label="Clear this item's count">
+                <RotateCcw className="w-3.5 h-3.5" />
+              </button>
+            )}
+          </td>
+        </tr>
+        {hasErr && (
+          <tr className="bg-rose-500/5">
+            <td colSpan={5} className="px-3 py-2 text-[11px] text-rose-700 dark:text-rose-300 border-l-4 border-l-rose-500">
+              <div className="flex items-start gap-1.5">
+                <AlertCircle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
+                <div>{errors!.join(" · ")}</div>
+              </div>
+            </td>
+          </tr>
+        )}
+      </Fragment>
+    );
+  }
+
+  const showCsEditor = !frozen && (csOpen || !rd.caseSizeValid);
   return (
-    <Fragment>
-      <tr className="border-t border-zinc-200/50 dark:border-zinc-800/50 align-top">
-        <td className={cn("px-3 py-3 border-l-4", rail)}>
-          <div className="flex items-start gap-2 min-w-0">
+    <div className={cn("bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 border-l-4 rounded-2xl p-3.5 shadow-sm", rail)}>
+      {/* Header */}
+      <div className="flex items-start justify-between gap-2 mb-2.5">
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2 mb-0.5 flex-wrap">
             {i.brand && (
-              <span className="bg-cyan-500/15 text-cyan-600 dark:text-cyan-300 px-1.5 py-0.5 rounded text-[10px] uppercase tracking-wider font-medium flex-shrink-0 mt-0.5">
+              <span className="bg-cyan-500/15 text-cyan-600 dark:text-cyan-300 px-1.5 py-0.5 rounded text-[10px] uppercase tracking-wider font-medium flex-shrink-0">
                 {i.brand}
               </span>
             )}
-            <div className="min-w-0">
-              <div className="text-sm font-medium truncate">{i.model}</div>
-              <div className="text-[11px] text-zinc-500 truncate">
-                {[i.size, i.colour, i.categoryName].filter(Boolean).join(" · ")}
-              </div>
-              <RowMeta last={last} others={others} conflict={conflict} doneByUser={doneByUser} />
-            </div>
+            <span className="text-base font-semibold truncate">{i.model}</span>
+            {frozen && <DoneBadge />}
           </div>
-        </td>
-        <td className="px-2 py-3 align-top">
-          <ExprInput
-            value={d.case_size_raw}
-            prefill={String(rd.csOld)}
-            onChange={(v) => onChange("case_size", v)}
-            onBlur={onBlur}
-            disabled={frozen}
-            compact
-            tone={rd.caseSizeChanged ? "amber" : (!rd.caseSizeValid ? "rose" : "neutral")}
-            ariaLabel={`Case size for ${i.model}`}
-          />
-          {rd.caseSizeChanged && <div className="mt-1 flex justify-center"><SysChip label="WAS">{rd.csOld}</SysChip></div>}
-        </td>
-        <td className="px-2 py-3 align-top">
-          <GodownPanel g="A" appSide={app.A} side={rd.A} csOld={rd.csOld} csNew={rd.csNew}
-            cRaw={d.a_cases_raw} lRaw={d.a_loose_raw}
-            onCases={(v) => onChange("a_cases", v)} onLoose={(v) => onChange("a_loose", v)} onBlur={onBlur}
-            stepper={false} compact frozen={frozen}
-            peers={buildPeers(others, "A", itemCs, rd.A, doneByUser)} ariaPrefix={i.model} />
-        </td>
-        <td className="px-2 py-3 align-top">
-          <GodownPanel g="B" appSide={app.B} side={rd.B} csOld={rd.csOld} csNew={rd.csNew}
-            cRaw={d.b_cases_raw} lRaw={d.b_loose_raw}
-            onCases={(v) => onChange("b_cases", v)} onLoose={(v) => onChange("b_loose", v)} onBlur={onBlur}
-            stepper={false} compact frozen={frozen}
-            peers={buildPeers(others, "B", itemCs, rd.B, doneByUser)} ariaPrefix={i.model} />
-        </td>
-        <td className="px-2 py-3 align-top">
-          {myTouched && !frozen && (
-            <button type="button" onClick={onReset} className="text-zinc-400 hover:text-rose-500 p-1.5" title="Reset row" aria-label="Reset row">
-              <RotateCcw className="w-3.5 h-3.5" />
+          <div className="text-xs text-zinc-500 truncate">
+            {[i.size, i.colour, i.categoryName].filter(Boolean).join(" · ")}
+          </div>
+          <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+            {/* Case size — a quiet chip; tap to change it (rare). */}
+            <button
+              type="button"
+              onClick={() => setCsOpen(o => !o)}
+              disabled={frozen}
+              aria-expanded={showCsEditor}
+              aria-label={`Change case size for ${i.model}`}
+              className={cn(
+                "inline-flex items-center gap-1 rounded-md px-2 min-h-7 text-[11px] tabular-nums border",
+                rd.caseSizeChanged
+                  ? "bg-amber-500/15 border-amber-500/40 text-amber-700 dark:text-amber-300"
+                  : "bg-zinc-50 dark:bg-zinc-800/60 border-zinc-200 dark:border-zinc-700 text-zinc-600 dark:text-zinc-300"
+              )}
+            >
+              {rd.csNew > 0 ? `Case of ${fmtN(rd.csNew)}` : "No case size"}
+              {!frozen && <Pencil className="w-3 h-3 text-zinc-400" />}
             </button>
-          )}
-        </td>
-      </tr>
-      {hasErr && (
-        <tr className="bg-rose-500/5">
-          <td colSpan={5} className="px-3 py-2 text-[11px] text-rose-700 dark:text-rose-300 border-l-4 border-l-rose-500">
-            <div className="flex items-start gap-1.5">
-              <AlertCircle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
-              <div>{errors!.join(" · ")}</div>
-            </div>
-          </td>
-        </tr>
+            {rd.caseSizeChanged && <SysChip label="WAS">{rd.csOld}</SysChip>}
+            <StatusChip rd={rd} conflict={conflict} />
+          </div>
+          <RowMeta last={last} others={others} conflict={conflict} doneByUser={doneByUser} />
+        </div>
+        {rd.hasAnyChange && !frozen && (
+          <button onClick={() => resetMyRow(i.id)} className="text-zinc-400 hover:text-rose-500 min-w-11 min-h-11 -mr-2 -mt-1 inline-flex items-center justify-center flex-shrink-0" aria-label="Clear this item's count">
+            <RotateCcw className="w-4 h-4" />
+          </button>
+        )}
+      </div>
+
+      {/* Case-size editor — pre-filled with the system value. */}
+      {showCsEditor && (
+        <div className="grid grid-cols-[1fr_auto] items-center gap-2 mb-2.5 rounded-lg bg-zinc-50/70 dark:bg-zinc-800/40 px-3 py-2">
+          <span className="text-[11px] text-zinc-500">Pieces in one case</span>
+          <div className="w-[148px]">
+            <ExprInput
+              value={my.case_size_raw}
+              prefill={String(rd.csOld)}
+              onChange={(v) => onChange("case_size", v)}
+              onBlur={onBlur}
+              stepper
+              tone={rd.caseSizeChanged ? "amber" : (!rd.caseSizeValid ? "rose" : "neutral")}
+              ariaLabel={`Case size for ${i.model}`}
+            />
+          </div>
+        </div>
       )}
-    </Fragment>
+
+      {/* Two full-width godown panels stacked (steppers need the width) */}
+      <div className="space-y-2.5">
+        {panel("A", true)}
+        {panel("B", true)}
+      </div>
+
+      {hasErr && (
+        <div className="mt-3 text-[11px] text-rose-700 dark:text-rose-300 flex items-start gap-1.5">
+          <AlertCircle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
+          <div>{errors!.join(" · ")}</div>
+        </div>
+      )}
+    </div>
   );
-}
+}, myItemPropsEqual);
 
 function RowMeta({ last, others, conflict, doneByUser }: { last?: LastReconciled; others: DBDraft[]; conflict: ItemConflictType | null; doneByUser: DoneMap }) {
   const lines: React.ReactNode[] = [];
@@ -3051,7 +3434,7 @@ function RowMeta({ last, others, conflict, doneByUser }: { last?: LastReconciled
   if (last) {
     lines.push(
       <span key="last" className="inline-flex items-center gap-1 text-[10px] text-zinc-400">
-        <Clock className="w-3 h-3" /> Last: {timeAgo(last.at)}{last.userName ? ` by ${last.userName}` : ""}
+        <Clock className="w-3 h-3" /> Last counted {timeAgo(last.at)}{last.userName ? ` by ${last.userName}` : ""}
       </span>
     );
   }
@@ -3093,19 +3476,36 @@ function ExprInput({
     // on the literal brand colour instead of a near-miss raw violet.
     !disabled && tone === "neutral" && "border-zinc-200 dark:border-zinc-700 focus:ring-cyan-500/40 focus:border-cyan-500"
   );
+  // Enter (the "Next" key on a phone's number pad) jumps to the next count
+  // box, Shift+Enter to the previous — like moving down a column in Excel.
+  // Case-size boxes are skipped as targets: they're pre-filled and rarely change.
+  const onKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key !== "Enter") return;
+    e.preventDefault();
+    const all = Array.from(document.querySelectorAll<HTMLInputElement>("input[data-expr]:not(:disabled)"));
+    const step = e.shiftKey ? -1 : 1;
+    let idx = all.indexOf(e.currentTarget) + step;
+    while (idx >= 0 && idx < all.length && all[idx].dataset.expr !== "count") idx += step;
+    const next = all[idx];
+    if (next) { next.focus(); next.select(); } else e.currentTarget.blur();
+  };
   const field = (
     <div className="flex-1 flex flex-col gap-0.5 min-w-0">
-      <input type="text" inputMode="numeric" value={displayValue} placeholder={placeholder}
+      <input type="text" inputMode="numeric" enterKeyHint="next" value={displayValue} placeholder={placeholder}
+        data-expr={prefill !== undefined ? "case-size" : "count"}
         onChange={(e) => onChange(e.target.value)}
         onBlur={onBlur}
+        onKeyDown={onKeyDown}
         onFocus={usingPrefill ? (e) => e.currentTarget.select() : undefined}
         disabled={disabled}
         className={cls} aria-label={ariaLabel} />
-      {/* Reserved caption slot for the running-total sum — fixed height so it
-          can never clip or shift the row (the old absolute overlay did both). */}
-      <span className="min-h-[12px] text-center text-[10px] leading-none text-zinc-500 tabular-nums">
-        {showsTotal ? `= ${fmtN(parsed!)}` : ""}
-      </span>
+      {/* Caption for the running-total sum ("5+1" → "= 6") — only rendered
+          when there is a sum, so plain numbers don't pay a blank row. */}
+      {showsTotal && (
+        <span className="min-h-[12px] text-center text-[10px] leading-none text-zinc-500 tabular-nums">
+          = {fmtN(parsed!)}
+        </span>
+      )}
     </div>
   );
   if (!stepper) return field;
@@ -3136,108 +3536,13 @@ function ExprInput({
   );
 }
 
-// ─── mobile cards (My view) ──────────────────────────────────────────────
-function MobileCards({
-  items, appStock, drafts, lastRecon, currentUserId, frozen,
-  computeDiff, setField, commitRow, resetMyRow, errorsByItem,
-  otherUsersByItem, conflictByItem, doneByUser,
-}: MyViewProps) {
-  return (
-    <div className="space-y-3">
-      {items.map(i => {
-        const app = appStock.get(i.id);
-        if (!app) return null;
-        const my = drafts.get(dkey(currentUserId, i.id)) ?? makeEmptyDraft(currentUserId, i.id);
-        const rd = computeDiff(i, app, my);
-        const others = otherUsersByItem(i.id);
-        const conflict = conflictByItem(i.id);
-        const last = lastRecon.get(i.id);
-        const errs = errorsByItem.get(i.id);
-        const itemCs = i.case_size || 0;
-        const rail = statusRail(rd, conflict, others.length, frozen);
-        return (
-          <div key={i.id} className={cn("bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 border-l-4 rounded-2xl p-4 shadow-sm", rail)}>
-            {/* Header */}
-            <div className="flex items-start justify-between gap-2 mb-3">
-              <div className="min-w-0 flex-1">
-                <div className="flex items-center gap-2 mb-0.5 flex-wrap">
-                  {i.brand && (
-                    <span className="bg-cyan-500/15 text-cyan-600 dark:text-cyan-300 px-1.5 py-0.5 rounded text-[10px] uppercase tracking-wider font-medium flex-shrink-0">
-                      {i.brand}
-                    </span>
-                  )}
-                  <span className="text-base font-semibold truncate">{i.model}</span>
-                  {frozen && <DoneBadge />}
-                </div>
-                <div className="text-xs text-zinc-500 truncate">
-                  {[i.size, i.colour, i.categoryName].filter(Boolean).join(" · ")}
-                </div>
-                <RowMeta last={last} others={others} conflict={conflict} doneByUser={doneByUser} />
-              </div>
-              {rd.hasAnyChange && !frozen && (
-                <button onClick={() => resetMyRow(i.id)} className="text-zinc-400 hover:text-rose-500 min-w-11 min-h-11 -mr-2 -mt-1 inline-flex items-center justify-center flex-shrink-0" aria-label="Reset this item">
-                  <RotateCcw className="w-4 h-4" />
-                </button>
-              )}
-            </div>
-
-            {/* Case-size strip — pre-filled with the system value (it rarely
-                changes); only the "was N" reference appears once it's changed. */}
-            <div className="grid grid-cols-[1fr_auto] items-center gap-2 mb-3 rounded-lg bg-zinc-50/70 dark:bg-zinc-800/40 px-3 py-2">
-              <div className="flex items-center gap-2 min-w-0">
-                <span className="text-[10px] uppercase tracking-wider text-zinc-500">Case size</span>
-                {rd.caseSizeChanged && <SysChip label="WAS">{rd.csOld}</SysChip>}
-              </div>
-              <div className="w-[148px]">
-                <ExprInput
-                  value={my.case_size_raw}
-                  prefill={String(rd.csOld)}
-                  onChange={(v) => setField(currentUserId, i.id, "case_size", v)}
-                  onBlur={() => commitRow(currentUserId, i.id)}
-                  disabled={frozen}
-                  stepper
-                  tone={rd.caseSizeChanged ? "amber" : (!rd.caseSizeValid ? "rose" : "neutral")}
-                  ariaLabel={`Case size for ${i.model}`}
-                />
-              </div>
-            </div>
-
-            {/* Two full-width godown panels stacked (steppers need the width) */}
-            <div className="space-y-3">
-              <GodownPanel g="A" appSide={app.A} side={rd.A} csOld={rd.csOld} csNew={rd.csNew}
-                cRaw={my.a_cases_raw} lRaw={my.a_loose_raw}
-                onCases={(v) => setField(currentUserId, i.id, "a_cases", v)} onLoose={(v) => setField(currentUserId, i.id, "a_loose", v)}
-                onBlur={() => commitRow(currentUserId, i.id)}
-                stepper compact={false} frozen={frozen}
-                peers={buildPeers(others, "A", itemCs, rd.A, doneByUser)} ariaPrefix={i.model} />
-              <GodownPanel g="B" appSide={app.B} side={rd.B} csOld={rd.csOld} csNew={rd.csNew}
-                cRaw={my.b_cases_raw} lRaw={my.b_loose_raw}
-                onCases={(v) => setField(currentUserId, i.id, "b_cases", v)} onLoose={(v) => setField(currentUserId, i.id, "b_loose", v)}
-                onBlur={() => commitRow(currentUserId, i.id)}
-                stepper compact={false} frozen={frozen}
-                peers={buildPeers(others, "B", itemCs, rd.B, doneByUser)} ariaPrefix={i.model} />
-            </div>
-
-            {errs && errs.length > 0 && (
-              <div className="mt-3 text-[11px] text-rose-700 dark:text-rose-300 flex items-start gap-1.5">
-                <AlertCircle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
-                <div>{errs.join(" · ")}</div>
-              </div>
-            )}
-          </div>
-        );
-      })}
-    </div>
-  );
-}
-
 // ─── ReviewerView (admin only) ───────────────────────────────────────────
 // Two-step wizard body. Step 1 lists items where staff disagree (resolve via
 // inline edit / clear / "keep only this count"); Step 2 lists items whose agreed
 // count differs from the system (push to stock). The page decides which item
 // list to pass; this view renders the cards + the per-step empty state.
 function ReviewerView({
-  items, step, totalConflicts, hasActiveFilters, clearFilters, onGotoStep, onKeepOnly,
+  items, step, totalConflicts, matchingCount, hasActiveFilters, clearFilters, onGotoStep, onKeepOnly,
   appStock, draftsByItem, lastRecon, computeDiff, computeItemConflict,
   setField, commitRow, deleteDraft, currentUserId, doneByUser,
   people, onAddCounter, onApplyItem, applyingItemId, errorsByItem,
@@ -3245,6 +3550,7 @@ function ReviewerView({
   items: (Item & { categoryName: string | null })[];
   step: 1 | 2;
   totalConflicts: number;
+  matchingCount: number;
   hasActiveFilters: boolean;
   clearFilters: () => void;
   onGotoStep: (s: 1 | 2) => void;
@@ -3270,6 +3576,7 @@ function ReviewerView({
       <ReviewerEmpty
         step={step}
         totalConflicts={totalConflicts}
+        matchingCount={matchingCount}
         hasActiveFilters={hasActiveFilters}
         clearFilters={clearFilters}
         onGotoStep={onGotoStep}
@@ -3292,18 +3599,20 @@ function ReviewerView({
         const ready = nonEmpty.length > 0 && !conflict?.any;
         // Step 2 items all differ from the system (that's why they're listed),
         // so amber = "needs adjustment"; Step 1 keeps the conflict/ready rail.
-        const rail = conflict?.any
-          ? "border-l-rose-500"
-          : step === 2
-            ? "border-l-amber-500"
-            : ready ? "border-l-emerald-500" : "border-l-zinc-200 dark:border-l-zinc-800";
-        const cs = i.case_size || 0;
-        const last = lastRecon.get(i.id);
-        const errs = errorsByItem.get(i.id);
         // Step 2 only: the single agreed count vs system, for the summary line.
         const agreed = step === 2 && nonEmpty.length > 0
           ? computeDiff(i, app, mergeAgreed(makeEmptyDraft("", i.id), nonEmpty, i.id))
           : null;
+        // Listed on Step 2 but edited until it equals the system.
+        const nowMatches = !!agreed && agreed.A.diff === 0 && agreed.B.diff === 0 && !agreed.caseSizeChanged;
+        const rail = conflict?.any
+          ? "border-l-rose-500"
+          : step === 2
+            ? (nowMatches ? "border-l-emerald-500" : "border-l-amber-500")
+            : ready ? "border-l-emerald-500" : "border-l-zinc-200 dark:border-l-zinc-800";
+        const cs = i.case_size || 0;
+        const last = lastRecon.get(i.id);
+        const errs = errorsByItem.get(i.id);
         // "Keep only this count" is offered on any conflicted item — it resolves
         // a disagreement (multiple counters) OR a done-misser to the chosen
         // counter's numbers without touching stock.
@@ -3330,6 +3639,10 @@ function ReviewerView({
                   <span className="inline-flex items-center gap-1 bg-rose-500/15 text-rose-700 dark:text-rose-300 px-2 py-0.5 rounded text-[10px] uppercase tracking-wider font-medium flex-shrink-0">
                     <AlertTriangle className="w-3 h-3" /> Conflict
                   </span>
+                ) : step === 2 && nowMatches ? (
+                  <span className="inline-flex items-center gap-1 bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 px-2 py-0.5 rounded text-[10px] uppercase tracking-wider font-medium flex-shrink-0">
+                    <CheckCircle2 className="w-3 h-3" /> Matches system
+                  </span>
                 ) : step === 2 ? (
                   <span className="inline-flex items-center gap-1 bg-amber-500/15 text-amber-700 dark:text-amber-300 px-2 py-0.5 rounded text-[10px] uppercase tracking-wider font-medium flex-shrink-0">
                     Differs from system
@@ -3343,7 +3656,7 @@ function ReviewerView({
               <div className="mt-2 flex flex-wrap items-center gap-1.5">
                 <span className="text-[9px] uppercase tracking-wider text-zinc-400 font-semibold">In system</span>
                 <SysChip label="A" className="text-cyan-700 dark:text-cyan-300">{breakupStr(cs, app.A.cases, app.A.loose)}</SysChip>
-                <SysChip label="B" className="text-violet-700 dark:text-violet-300">{breakupStr(cs, app.B.cases, app.B.loose)}</SysChip>
+                <SysChip label="B" className="text-teal-700 dark:text-teal-300">{breakupStr(cs, app.B.cases, app.B.loose)}</SysChip>
                 <SysChip label="CS">{cs}</SysChip>
                 {last && <span className="text-[10px] text-zinc-400 ml-auto">Last: {timeAgo(last.at)}{last.userName ? ` by ${last.userName}` : ""}</span>}
               </div>
@@ -3360,7 +3673,7 @@ function ReviewerView({
                     : <span className="text-zinc-400 italic">unchanged</span>}
                 </span>
                 <span className="inline-flex items-center gap-1.5 text-[11px] tabular-nums">
-                  <span className="text-violet-700 dark:text-violet-300 font-semibold">B</span>
+                  <span className="text-teal-700 dark:text-teal-300 font-semibold">B</span>
                   {agreed.B.userTouched && agreed.B.valid
                     ? <><span className="text-zinc-600 dark:text-zinc-300">{fmtN(agreed.B.physPieces)} pcs</span><DiffPill diff={agreed.B.diff} /></>
                     : <span className="text-zinc-400 italic">unchanged</span>}
@@ -3436,10 +3749,11 @@ function ReviewerView({
 
 // Per-step empty state for the reviewer wizard.
 function ReviewerEmpty({
-  step, totalConflicts, hasActiveFilters, clearFilters, onGotoStep,
+  step, totalConflicts, matchingCount, hasActiveFilters, clearFilters, onGotoStep,
 }: {
   step: 1 | 2;
   totalConflicts: number;
+  matchingCount: number;
   hasActiveFilters: boolean;
   clearFilters: () => void;
   onGotoStep: (s: 1 | 2) => void;
@@ -3471,11 +3785,20 @@ function ReviewerEmpty({
       </div>
     );
   }
+  if (matchingCount === 0) {
+    return (
+      <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg py-12 text-center">
+        <ClipboardCheck className="w-7 h-7 text-zinc-400 dark:text-zinc-600 mx-auto mb-3" strokeWidth={1.5} />
+        <div className="text-sm font-medium text-zinc-700 dark:text-zinc-200">Nothing counted yet</div>
+        <div className="text-xs text-zinc-500 mt-1 max-w-md mx-auto px-4">Items appear here once they have been counted and the counters agree. Enter counts in <strong>My count</strong> first.</div>
+      </div>
+    );
+  }
   return (
     <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg py-12 text-center">
       <CheckCircle2 className="w-7 h-7 text-emerald-500 mx-auto mb-3" strokeWidth={1.5} />
       <div className="text-sm font-medium text-zinc-700 dark:text-zinc-200">Counts match the system</div>
-      <div className="text-xs text-zinc-500 mt-1 max-w-md mx-auto px-4">Every agreed count equals what the system already shows — nothing to adjust. To zero stock that nobody counted, use <strong>Make adjustments</strong> and tick “zero what nobody found”.</div>
+      <div className="text-xs text-zinc-500 mt-1 max-w-md mx-auto px-4">Every agreed count equals what the system already shows. Press <strong>Make adjustments</strong> to close this count — it saves the counts to Count history and clears the entries. Its confirm box also offers “zero what nobody found” for a full stock-take.</div>
     </div>
   );
 }
@@ -3494,8 +3817,8 @@ function ReviewerGodown({
   appSide: AppStock;
 }) {
   const touched = side.userTouched;
-  const rail = g === "A" ? "border-l-cyan-500/70" : "border-l-violet-500/70";
-  const head = g === "A" ? "text-cyan-700 dark:text-cyan-300" : "text-violet-700 dark:text-violet-300";
+  const rail = g === "A" ? "border-l-cyan-500/70" : "border-l-teal-500/80";
+  const head = g === "A" ? "text-cyan-700 dark:text-cyan-300" : "text-teal-700 dark:text-teal-300";
   const tone: "neutral" | "amber" | "rose" = conflictCell ? "rose" : touched ? (side.valid ? "amber" : "rose") : "neutral";
   // Re-base the system reference at the edited case size (same rule as the
   // My-count panels) so SYS · Counted · Diff reconcile visually.
@@ -3505,9 +3828,10 @@ function ReviewerGodown({
     <div className={cn("rounded-lg border-l-4 bg-zinc-50/60 dark:bg-zinc-800/30 p-2", rail, conflictCell && "ring-1 ring-rose-500/40")}>
       <div className="flex items-center justify-between gap-1 mb-1.5">
         <span className={cn("text-[10px] font-semibold uppercase tracking-wider", conflictCell ? "text-rose-600 dark:text-rose-400" : head)}>Godown {g}</span>
-        <SysChip label="SYS">
-          {fmtN(sysPcs)} pcs{csEdited && <span className="text-zinc-400"> · was {fmtN(side.appPieces)}</span>}
-        </SysChip>
+        <span className="text-[11px] tabular-nums text-zinc-500 dark:text-zinc-400">
+          System <span className="font-semibold text-zinc-700 dark:text-zinc-200">{fmtN(sysPcs)} pcs</span>
+          {csEdited && <span className="text-zinc-400"> · was {fmtN(side.appPieces)}</span>}
+        </span>
       </div>
       <div className="grid grid-cols-2 gap-1.5">
         <div>
@@ -3629,9 +3953,14 @@ function tonefor(raw: string, valid: boolean, touched: boolean): "neutral" | "am
 // ─── hint card ───────────────────────────────────────────────────────────
 function HintCard({ isAdmin, mode }: { isAdmin: boolean; mode: "my" | "reviewer" }) {
   return (
-    <div className="mt-6 bg-zinc-50 dark:bg-zinc-900/50 border border-zinc-200 dark:border-zinc-800 rounded-lg p-4 text-xs text-zinc-600 dark:text-zinc-400 space-y-1.5">
-      <div className="flex items-center gap-1.5 text-zinc-700 dark:text-zinc-200 font-medium">
-        <Filter className="w-3.5 h-3.5" /> Tips
+    <details className="group mt-6 bg-zinc-50 dark:bg-zinc-900/50 border border-zinc-200 dark:border-zinc-800 rounded-lg text-xs text-zinc-600 dark:text-zinc-400">
+      <summary className="flex items-center gap-1.5 text-zinc-700 dark:text-zinc-200 font-medium cursor-pointer select-none px-4 min-h-11 list-none [&::-webkit-details-marker]:hidden">
+        <Filter className="w-3.5 h-3.5" /> Tips — how counting and reviewing work
+        <ChevronDown className="w-3.5 h-3.5 ml-auto transition-transform group-open:rotate-180" />
+      </summary>
+      <div className="px-4 pb-4 space-y-1.5">
+      <div>
+        <strong>Same as system:</strong> when the shelf matches the number shown, tap <strong>Same as system</strong> instead of typing it. On a computer, <strong>Enter</strong> jumps to the next box.
       </div>
       <div>
         <strong>Quick adds:</strong> on a phone, tap the <strong>−</strong>/<strong>+</strong> buttons beside each box to add or remove pieces as you find them — or type{" "}
@@ -3666,8 +3995,40 @@ function HintCard({ isAdmin, mode }: { isAdmin: boolean; mode: "my" | "reviewer"
         <strong>Case size</strong> edits are staged like the rest — nothing applies until <strong>Make adjustments</strong> runs. While editing, the totals on this page use the new case size for the math.
       </div>
       <div>
-        <strong>Print PDF</strong> gives you a blank count sheet for paper-based stocktake. Transcribe back to {mode === "my" ? "My count" : "your count"} when done.
+        <strong>Print count sheet</strong> gives you a blank sheet for a paper stock-take. Type it back into {mode === "my" ? "My count" : "your count"} when done.
       </div>
+      </div>
+    </details>
+  );
+}
+
+// ─── guide strip ─────────────────────────────────────────────────────────
+// The whole job in three steps, at the TOP where a first-time counter sees it.
+function GuideStrip({ isAdmin, onHide }: { isAdmin: boolean; onHide: () => void }) {
+  const steps = [
+    { t: "Count each item", d: "Type the cases and loose pieces you find — or tap Same as system when it matches." },
+    { t: "Mark my count done", d: "It freezes your numbers and saves a copy." },
+    isAdmin
+      ? { t: "Review and update stock", d: "In Reviewer: settle any disagreements, then Make adjustments." }
+      : { t: "Admin reviews", d: "The admin compares the counts and updates the stock." },
+  ];
+  return (
+    <div className="mb-4 rounded-xl border border-cyan-500/25 bg-cyan-500/5 px-3.5 py-3 relative">
+      <button type="button" onClick={onHide} aria-label="Hide these steps"
+        className="absolute right-1 top-1 min-w-9 min-h-9 inline-flex items-center justify-center text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-200">
+        <X className="w-4 h-4" />
+      </button>
+      <ol className="grid gap-2.5 sm:grid-cols-3 pr-7">
+        {steps.map((s, idx) => (
+          <li key={idx} className="flex items-start gap-2.5">
+            <span className="flex-shrink-0 w-5 h-5 mt-0.5 rounded-full bg-cyan-500 text-white text-[11px] font-semibold inline-flex items-center justify-center tabular-nums">{idx + 1}</span>
+            <span className="min-w-0">
+              <span className="block text-[13px] font-medium text-zinc-800 dark:text-zinc-100">{s.t}</span>
+              <span className="block text-[11px] text-zinc-500 leading-snug">{s.d}</span>
+            </span>
+          </li>
+        ))}
+      </ol>
     </div>
   );
 }
@@ -3682,12 +4043,21 @@ function SkeletonBody() {
     </div>
   );
 }
-function EmptyState({ clearFilters }: { clearFilters: () => void }) {
+function EmptyState({ clearFilters, myFilter, hasSearch }: { clearFilters: () => void; myFilter: MyFilter; hasSearch: boolean }) {
+  const msg = hasSearch || myFilter === "all"
+    ? "No items match the current filter."
+    : myFilter === "todo" ? "Nothing left to count — every item has an entry."
+    : myFilter === "counted" ? "You haven't counted anything yet."
+    : myFilter === "differs" ? "None of your counts differ from the system."
+    : "No conflicts — nobody's count disagrees with yours.";
+  const good = !hasSearch && (myFilter === "todo" || myFilter === "differs" || myFilter === "conflicts");
   return (
     <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg py-12 text-center">
-      <ClipboardCheck className="w-7 h-7 text-zinc-400 dark:text-zinc-600 mx-auto mb-3" strokeWidth={1.5} />
-      <div className="text-sm text-zinc-500">No items match the current filter.</div>
-      <button onClick={clearFilters} className="mt-3 text-xs text-cyan-600 dark:text-cyan-400 hover:underline">Clear filters</button>
+      {good
+        ? <CheckCircle2 className="w-7 h-7 text-emerald-500 mx-auto mb-3" strokeWidth={1.5} />
+        : <ClipboardCheck className="w-7 h-7 text-zinc-400 dark:text-zinc-600 mx-auto mb-3" strokeWidth={1.5} />}
+      <div className="text-sm text-zinc-500 px-4">{msg}</div>
+      <button onClick={clearFilters} className="mt-3 text-xs text-cyan-600 dark:text-cyan-400 hover:underline">Show all items</button>
     </div>
   );
 }

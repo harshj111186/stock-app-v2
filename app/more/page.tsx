@@ -20,12 +20,13 @@ type Row = {
 };
 
 const ROWS: Row[] = [
+  // The stock count is done on a phone, in the godown — keep it first.
+  { href: "/reconciliation", label: "Reconciliation", sub: "Count the shelf and compare with the system", icon: ClipboardCheck },
   { href: "/godown-a", label: "Godown A", sub: "Stock at warehouse A", icon: Warehouse },
   { href: "/godown-b", label: "Godown B", sub: "Stock at warehouse B", icon: Warehouse },
-  { href: "/reconciliation", label: "Reconciliation", sub: "Physical stock-take + paper count sheet", icon: ClipboardCheck },
-  { href: "/pricing",  label: "Pricing",  sub: "LP, stacked discounts, GST", icon: Receipt },
-  { href: "/categories", label: "Categories", sub: "Nested catalogue structure", icon: FolderTree, adminOnly: true },
-  { href: "/audit",    label: "Audit log", sub: "Every DB change, auto-logged", icon: ShieldCheck, adminOnly: true },
+  { href: "/pricing",  label: "Pricing",  sub: "List price, discounts, GST", icon: Receipt },
+  { href: "/categories", label: "Categories", sub: "Groups your items sit in", icon: FolderTree, adminOnly: true },
+  { href: "/audit",    label: "Audit log", sub: "Who changed what, and when", icon: ShieldCheck, adminOnly: true },
   { href: "/users",    label: "Users",    sub: "Manage staff and roles", icon: Users, adminOnly: true },
   { href: "/settings", label: "Settings", sub: "Account and preferences", icon: Settings },
 ];

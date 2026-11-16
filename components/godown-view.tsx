@@ -1,5 +1,5 @@
 "use client";
-import { Fragment, useCallback, useEffect, useState, useMemo } from "react";
+import { Fragment, useCallback, useEffect, useRef, useState, useMemo } from "react";
 import {
   ChevronRight, ChevronDown,
   LayoutGrid, Table as TableIcon, Package, AlertCircle,
@@ -98,6 +98,7 @@ export function GodownView({ godown }: { godown: Godown }) {
   const [view, setView] = useState<View>("grid");
   const [depth, setDepth] = useState<Depth>(2);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const firstVisit = useRef(false);
 
   const lsKey = `godown-${godown.toLowerCase()}`;
 
@@ -110,6 +111,8 @@ export function GodownView({ godown }: { godown: Godown }) {
       if (d !== null) setDepth(Number(d) as Depth);
       const e = localStorage.getItem(`${lsKey}.expanded`);
       if (e) setExpanded(new Set(JSON.parse(e)));
+      // Never opened on this device → start with every group open.
+      else firstVisit.current = true;
     } catch { /* ignore */ }
   }, [lsKey]);
   useEffect(() => { try { localStorage.setItem(`${lsKey}.view`, view); } catch {} }, [view, lsKey]);
@@ -217,7 +220,8 @@ export function GodownView({ godown }: { godown: Godown }) {
   const tree = useMemo(() => buildTree(filtered, depth), [filtered, depth]);
 
   // ─── expand helpers ────────────────────────────────────────────────────
-  const searching = q.trim().length > 0;
+  // Searching OR narrowing by brand / category / status opens every match.
+  const searching = q.trim().length > 0 || !!brand || !!cat || !!status;
   const isOpen = (key: string) => searching || expanded.has(key);
   const toggle = (key: string) => {
     setExpanded(prev => {
@@ -239,6 +243,13 @@ export function GodownView({ godown }: { godown: Godown }) {
   }, [tree]);
   const expandAll = () => setExpanded(new Set(allKeys));
   const collapseAll = () => setExpanded(new Set());
+  useEffect(() => {
+    // Not while a search / filter narrows the tree: that would remember only
+    // the filtered groups as open.
+    if (!firstVisit.current || searching || allKeys.size === 0) return;
+    firstVisit.current = false;
+    setExpanded(new Set(allKeys));
+  }, [allKeys, searching]);
 
   // ─── render ────────────────────────────────────────────────────────────
   return (

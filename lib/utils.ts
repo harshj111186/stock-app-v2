@@ -19,6 +19,23 @@ export const todayISO = () => {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 };
 
+// "16 Nov 2026" from a yyyy-mm-dd (or full timestamp) string. The date part
+// is parsed as LOCAL time — `new Date("2026-11-16")` is UTC and can show the
+// previous day. Falls back to the raw text if it isn't a date.
+export const fmtDate = (iso: string | null | undefined): string => {
+  if (!iso) return "";
+  const d = new Date(iso.slice(0, 10) + "T00:00:00");
+  if (isNaN(d.getTime())) return iso;
+  return d.toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" });
+};
+// "16 Nov 2026, 9:05 am" for a full timestamp.
+export const fmtDateTime = (iso: string | null | undefined): string => {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return iso;
+  return d.toLocaleString("en-IN", { day: "2-digit", month: "short", year: "numeric", hour: "numeric", minute: "2-digit", hour12: true });
+};
+
 // ─── stock-status rules (ONE definition app-wide) ──────────────────────
 // The audit found three diverging "low stock" rules (dashboard: reorder
 // sum, items page: flat ≤2, godown view: per-godown reorder). Canonical:

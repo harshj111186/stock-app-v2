@@ -110,6 +110,7 @@ export default function ItemsPage() {
   const [view, setView] = useState<View>("grid");
   const [depth, setDepth] = useState<Depth>(2);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const firstVisit = useRef(false);
 
   // manual override modal
   const [editingItem, setEditingItem] = useState<Combined | null>(null);
@@ -142,6 +143,9 @@ export default function ItemsPage() {
       if (d !== null && [0, 1, 2, 3].includes(Number(d))) setDepth(Number(d) as Depth);
       const e = localStorage.getItem("items.expanded");
       if (e) setExpanded(new Set(JSON.parse(e)));
+      // Never opened on this device → start with every group open (a wall of
+      // closed brand names shows no stock at all). Applied once the tree loads.
+      else firstVisit.current = true;
     } catch { /* ignore */ }
   }, []);
   // Deep-link filters + actions from the dashboard / command palette
@@ -295,8 +299,10 @@ export default function ItemsPage() {
   const tree = useMemo(() => buildTree(filtered, depth), [filtered, depth]);
 
   // ─── expand helpers ─────────────────────────────────────────────────────
-  // Searching auto-expands all matches so nothing stays hidden.
-  const searching = q.trim().length > 0;
+  // Searching OR narrowing by brand / category / status auto-expands every
+  // match so nothing stays hidden — tapping "Low 5" (or arriving from the
+  // dashboard's "Out of stock") used to show five closed brand headers.
+  const searching = q.trim().length > 0 || !!brand || !!cat || !!status;
   const isOpen = (key: string) => searching || expanded.has(key);
   const toggle = (key: string) => {
     if (searching) return; // search forces all open — don't mutate the persisted set invisibly
@@ -319,6 +325,13 @@ export default function ItemsPage() {
   }, [tree]);
   const expandAll = () => setExpanded(new Set(allKeys));
   const collapseAll = () => setExpanded(new Set());
+  useEffect(() => {
+    // Not while a search / filter narrows the tree (e.g. arriving on
+    // ?status=low): that would remember only the filtered groups as open.
+    if (!firstVisit.current || searching || allKeys.size === 0) return;
+    firstVisit.current = false;
+    setExpanded(new Set(allKeys));
+  }, [allKeys, searching]);
 
   // ─── render helpers ─────────────────────────────────────────────────────
   const statusBadge = (i: Combined) => {

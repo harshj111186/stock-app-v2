@@ -3,6 +3,20 @@ import { Shell } from "@/components/shell";
 import { useEffect, useState } from "react";
 import { sb } from "@/lib/supabase";
 import { useAuth } from "@/app/providers";
+import { fmtDateTime } from "@/lib/utils";
+
+// The database's own table / operation names, in shop words.
+const WHAT: Record<string, string> = {
+  transactions: "Stock entry",
+  godown_stock: "Stock level",
+  items: "Item details",
+  pricing: "Price",
+  categories: "Category",
+  user_profiles: "User account",
+};
+const whatLabel = (table: string) => WHAT[table] ?? table.replace(/_/g, " ");
+const opLabel = (op: "INSERT" | "UPDATE" | "DELETE") =>
+  op === "INSERT" ? "Added" : op === "DELETE" ? "Deleted" : "Changed";
 
 type AuditRow = {
   id: number;
@@ -61,7 +75,7 @@ export default function AuditPage() {
       <div className="mb-6">
         <h1 className="text-xl sm:text-2xl font-semibold tracking-tight">Audit log</h1>
         <p className="text-sm text-zinc-500 mt-1">
-          {loaded ? `${rows.length} most recent changes` : "Loading…"} — auto-recorded by the database.
+          {loaded ? `The ${rows.length} most recent changes` : "Loading…"} — recorded automatically; nobody can edit or delete this list.
         </p>
       </div>
       {/* Desktop table */}
@@ -70,10 +84,10 @@ export default function AuditPage() {
           <thead className="bg-zinc-50 dark:bg-zinc-900/50 border-b border-zinc-200 dark:border-zinc-800">
             <tr className="text-zinc-500 text-[11px] uppercase tracking-wider">
               <th className="text-left px-5 py-2.5 font-medium">When</th>
-              <th className="text-left px-3 py-2.5 font-medium">Table</th>
-              <th className="text-left px-3 py-2.5 font-medium">Op</th>
-              <th className="text-left px-3 py-2.5 font-medium">Row</th>
-              <th className="text-left px-5 py-2.5 font-medium">User</th>
+              <th className="text-left px-3 py-2.5 font-medium">What</th>
+              <th className="text-left px-3 py-2.5 font-medium">Change</th>
+              <th className="text-left px-3 py-2.5 font-medium">Record</th>
+              <th className="text-left px-5 py-2.5 font-medium">By</th>
             </tr>
           </thead>
           <tbody>
@@ -86,10 +100,10 @@ export default function AuditPage() {
             ))}
             {loaded && rows.map(r => (
               <tr key={r.id} className="border-t border-zinc-200/50 dark:border-zinc-800/50 hover:bg-zinc-50 dark:hover:bg-zinc-800/40">
-                <td className="px-5 py-2.5 text-zinc-500 tnum">{new Date(r.occurred_at).toLocaleString("en-IN")}</td>
-                <td className="px-3 py-2.5">{r.table_name}</td>
+                <td className="px-5 py-2.5 text-zinc-500 tnum whitespace-nowrap">{fmtDateTime(r.occurred_at)}</td>
+                <td className="px-3 py-2.5">{whatLabel(r.table_name)}</td>
                 <td className="px-3 py-2.5">
-                  <span className={`px-2 py-0.5 rounded text-[11px] ${opColour(r.operation)}`}>{r.operation}</span>
+                  <span className={`px-2 py-0.5 rounded text-[11px] ${opColour(r.operation)}`}>{opLabel(r.operation)}</span>
                 </td>
                 <td className="px-3 py-2.5"><code className="text-[11px] text-zinc-500">{(r.row_id || "").slice(0, 8)}</code></td>
                 <td className="px-5 py-2.5 text-xs text-zinc-600 dark:text-zinc-300">{nameOf(r.user_id)}</td>
@@ -115,12 +129,12 @@ export default function AuditPage() {
           {loaded && rows.map(r => (
             <li key={r.id} className="px-4 py-3">
               <div className="flex items-center justify-between gap-2 mb-1">
-                <span className={`px-2 py-0.5 rounded text-[11px] ${opColour(r.operation)}`}>{r.operation}</span>
-                <span className="text-[11px] text-zinc-500 tnum">{new Date(r.occurred_at).toLocaleString("en-IN")}</span>
+                <span className={`px-2 py-0.5 rounded text-[11px] ${opColour(r.operation)}`}>{opLabel(r.operation)}</span>
+                <span className="text-[11px] text-zinc-500 tnum">{fmtDateTime(r.occurred_at)}</span>
               </div>
-              <div className="text-sm">{r.table_name}</div>
+              <div className="text-sm">{whatLabel(r.table_name)}</div>
               <div className="flex items-center justify-between text-[11px] text-zinc-500 mt-0.5">
-                <span>Row <code className="text-zinc-500">{(r.row_id || "").slice(0, 8)}</code></span>
+                <span>Record <code className="text-zinc-500">{(r.row_id || "").slice(0, 8)}</code></span>
                 <span>By {nameOf(r.user_id)}</span>
               </div>
             </li>

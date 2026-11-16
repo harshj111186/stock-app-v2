@@ -230,6 +230,90 @@ If you must touch one of these files: **read first, edit surgically, never repla
 
 ## 11. Changelog (latest first — add new entries at the top)
 
+### 2026-11-16 — Ease-of-use pass: stock count made faster to do and to review; plain words elsewhere
+
+**User ask (Harsh):** "make the stock manager a bit easy to use and user friendly … easy to reconcile for
+users too … make the visibility pretty good." Whole app walked in demo mode on desktop + phone first
+(screenshots: `Documents\Claude\_qa-tools\stock-app-ux-2026-11-16\before\`, `after\`, `prod\`).
+**Client code only — no SQL, no Edge Function.** The stock-writing code (`makeAdjustments`, `commitOne`,
+`apply_reconciliation`, draft save/delete/poll, conflict rules, `mergeAgreed`) is untouched.
+
+**Reconciliation — My count (`app/reconciliation/page.tsx`)**
+- **Progress + one-tap filter chips** under the search box: `All · To count · Counted · Differs from
+  system · Conflicts` with live numbers, a green progress bar, "N of M counted" and the pieces short /
+  extra so far. Replaces the old "All items / Only mine" and "Conflicts" toggles (`showOnlyChanged` /
+  `conflictsOnly` state deleted).
+  ⚠ The chip's item list is a **snapshot** (`myFilter` + `pinnedIds`), taken when the chip is tapped —
+  a live filter pulled a row out from under the counter on the first keystroke (an item stops being
+  "to count" the moment you type). When entries change the membership a **Refresh list** link appears;
+  tapping the same chip again re-takes the snapshot. The chips never touch the Reviewer lists.
+- **"Same as system"** on every untouched godown panel: one tap types the system's own cases + loose
+  (then saves like a blur). Matters because a full count ("zero what nobody found") needs an entry on
+  every godown — before this the counter retyped ~330 identical numbers. Hidden when frozen, when the
+  panel already has an entry, or when system stock is negative. No stock is written (a count that
+  equals the system makes `apply_reconciliation` log nothing).
+- **Rows are far shorter.** Desktop row ≈135 px (was ≈210): labels sit beside the boxes, the "In
+  system" line merged into the panel header (`System 312 pcs · 15×20 + 12`), the blank caption row
+  under each box is gone (it only appears for a `5+1` sum). Phone card: case size folded into a
+  "Case of 20 ✎" chip (tap to edit), Cases/Loose labels beside the steppers.
+- **Phone toolbar no longer eats the screen**: only search + chips + progress stay pinned; the action
+  buttons scroll away and the secondary ones (Clear all, people counting, Print count sheet, Count
+  history) sit behind **More**. The mode switch (My count / Reviewer) moved up beside the title.
+- **Words instead of signs**: "2 short" / "5 extra" / "Matches" (was "−2 pcs" / "+5 pcs" / "In
+  balance"); a status chip per item (Matches system · Differs from system · Conflict · Fix entry);
+  rail colours now mean rose = fix, amber = differs, emerald = counted and matches.
+- **Godown B is teal** everywhere on this page. `cyan-*` is remapped to the brand violet, so A (cyan)
+  and B (violet) were two near-identical violets.
+- **Enter jumps to the next count box** (Shift+Enter back; `data-expr` on the inputs; the phone number
+  pad shows "Next"). Case-size boxes are skipped as targets.
+- **3-step guide strip** at the top (dismissible, `localStorage recon.guideHidden`) and a **"what
+  next" card at the end of the list** (N of M counted · Show what's left · Mark my count done) — on a
+  phone the toolbar's Done button is far above by the last item. The old Tips card is now a folded
+  `<details>` (it sat fully open under ~170 items).
+- **Typing is lighter**: each item is a memoised `MyItem` with a value comparator
+  (`myItemPropsEqual`), so a keystroke re-renders one row, not all ~170. `resetMyRow` got a stable
+  ref wrapper for this. If you add a prop to `MyItem`, add it to the comparator.
+
+**Reconciliation — Reviewer**
+- **Step 2 now lists only what really differs.** It used to list every counted item under "differs
+  from system", including the ones that matched. Matching ones are counted in a new summary line
+  ("22 match the system · 2 differ · 15 pcs short · 3 pcs extra") — `step2Summary`. "Make adjustments"
+  is unchanged and still closes ALL counted items (it walks `items`, not the step list).
+- Step-2 empty state now says to press Make adjustments to close the count (saves to Count history,
+  clears the entries) instead of "nothing to adjust".
+
+**Elsewhere**
+- **Dashboard**: four quick actions — Record a sale / Record a purchase / Move stock / Count stock.
+  `/transactions?action=Sale|Purchase|Transfer|…` opens that tab (wins over the remembered tab).
+- **Transactions**: jargon removed ("batch entry: queue first…", "All stock math runs in Postgres
+  atomically. Direction: +1 (in)") → "Adds 32 units to Godown A" / "Takes … out of" / "Moves … from A
+  to B". Queue wording: "Add Sale to list", "Not saved yet · N entries", "Save N to stock", banner
+  "Stock has not changed yet". Phone tabs show icon over word (the five used to overlap). Log dates
+  read "16 Nov 2026" (`fmtDate` in `lib/utils`). `alreadyReversed` is a `Set` lookup (was
+  `txns.some()` per row per render).
+- **Items + Godown A/B**: brand / category / status filters now open the groups like search does
+  (tapping "Low 5", or arriving from the dashboard's "Out of stock", showed closed brand headers); a
+  device that has never opened the page starts with every group open.
+- **Audit log**: What / Change / Record / By with "Stock entry · Added" instead of
+  "transactions · INSERT"; dates via `fmtDateTime`.
+- **Phone More menu**: Reconciliation first; plainer sub-lines.
+- **Demo mode**: `providers.tsx` demo branch is `if (!loading && isDemo())` — deciding "demo" during
+  the first client render made React rebuild the whole page (hydration error #418) on every demo
+  visit. Real sign-ins never reach that branch.
+
+**Verified** in demo mode (mock DB, never the real one) on the dev server AND on the production export
+served under `/stock-app-v2`: 38 scripted checks green on desktop + phone
+(`_qa-tools\stock-app-ux-2026-11-16\recon.mjs`, `recon2.mjs`, `txn.mjs`; `serve-out.mjs` serves
+`out/`): Same as system, progress, Enter, chips + pinned list, mark done, Reviewer step 2, a
+teammate's conflicting count reaching My count, roll-up, `5+1`, Clear all, quick action → Sale →
+list → save. `tsc` + `next build` clean (`/reconciliation` 32.5 kB).
+An independent code review of the diff found three small defects, all fixed before shipping: a
+Step-2 card vanished while the reviewer edited it into a match (now kept for the visit via the
+`step2Seen` ref and relabelled "Matches system"), the Step-2 empty state claimed "counts match" when
+nothing was counted, and a first visit through a filtered link remembered only the filtered groups
+as open. DiffPill colours: green = matches, amber = extra, rose = short.
+**Not proven on a real phone in the godown** (touch feel of the steppers / chips).
+
 ### 2026-07-13 — Reconciliation: "Clear all" for My count + admin Counters panel (per-staff wipe)
 
 **User ask:** a staffer mid-count who wants to start fresh should be able to wipe ALL their inputs in
