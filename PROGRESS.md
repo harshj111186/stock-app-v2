@@ -312,6 +312,8 @@ Step-2 card vanished while the reviewer edited it into a match (now kept for the
 `step2Seen` ref and relabelled "Matches system"), the Step-2 empty state claimed "counts match" when
 nothing was counted, and a first visit through a filtered link remembered only the filtered groups
 as open. DiffPill colours: green = matches, amber = extra, rose = short.
+**LIVE 16 Nov 2026 ~15:20 IST** — commit `1faf7b7`, Actions run 43842919240 green; the same 38 checks
+re-run green against https://harshj111186.github.io/stock-app-v2/?demo=1 after the deploy.
 **Not proven on a real phone in the godown** (touch feel of the steppers / chips).
 
 ### 2026-07-13 — Reconciliation: "Clear all" for My count + admin Counters panel (per-staff wipe)
